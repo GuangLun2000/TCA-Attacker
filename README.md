@@ -65,9 +65,8 @@ updates: distance and cosine of the update vs. the weighted-FedAvg reference.
 `main.py`, `server.py`, `client.py`, `models.py`, `data_loader.py`,
 `visualization.py`, `fed_checkpoint.py`, `decoder_adapters.py`,
 `run_downstream_generation.py`, `attack_baseline_{alie,gaussian,sign_flipping}.py`,
-`AugMP_Colab.ipynb`, plus `Figure/`, `demo/`, `data/`. TCAA **reuses** the
-aggregation + stealth-metric definitions in `server.py` and the checkpoint / downstream
-generation patterns.
+plus the `data/` datasets. TCAA **reuses** the aggregation + stealth-metric definitions
+in `server.py` and the checkpoint / downstream generation patterns.
 
 ---
 
@@ -148,7 +147,6 @@ The original AugMP classification / model-manipulation experiment is intact:
 
 ```bash
 python main.py                       # configure the dict in main.py
-# or open AugMP_Colab.ipynb on Colab
 ```
 
 AugMP supports encoder-only (`distilbert/bert/roberta/deberta`) and decoder-only

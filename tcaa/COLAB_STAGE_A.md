@@ -10,6 +10,8 @@ Runtime → Change runtime type → **GPU** (T4 is enough for Pythia-160m).
 ```python
 # Cell 1 — deps (Colab already has torch)
 !pip -q install "transformers>=4.37,<5" "peft>=0.6" "datasets>=2" tqdm
+# Colab preinstalls an old torchao(0.10) that breaks new peft's LoRA dispatcher; we don't use it.
+!pip uninstall -y torchao 2>/dev/null || true
 ```
 
 ```python
