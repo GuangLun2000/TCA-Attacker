@@ -20,6 +20,23 @@ except Exception:  # pragma: no cover
     _PEFT_AVAILABLE = False
 
 
+def _neutralize_peft_torchao():
+    """
+    Colab preinstalls torchao 0.10, which trips new peft's LoRA dispatcher
+    (`ImportError: incompatible torchao ... only versions above 0.16 supported`),
+    even though TCAA never uses torchao. Make peft report torchao unavailable so the
+    dispatcher falls back to a standard LoRA Linear — no uninstall/restart needed.
+    """
+    import importlib
+    for name in ("peft.import_utils", "peft.tuners.lora.torchao"):
+        try:
+            mod = importlib.import_module(name)
+            if hasattr(mod, "is_torchao_available"):
+                mod.is_torchao_available = lambda *a, **k: False
+        except Exception:
+            pass
+
+
 # LoRA target modules per decoder family (same table as models.NewsClassifierModel).
 def _default_lora_targets(model_name: str) -> Optional[List[str]]:
     m = (model_name or "").lower()
@@ -85,6 +102,7 @@ class TCAACausalModel(nn.Module):
                 target_modules=targets,
                 bias="none",
             )
+            _neutralize_peft_torchao()  # avoid Colab's torchao 0.10 vs new-peft ImportError
             self.model = get_peft_model(base, peft_config)
             trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
             total = sum(p.numel() for p in self.model.parameters())
