@@ -48,8 +48,9 @@ def default_config() -> Dict:
         "experiment_name": "tcaa_phase0",
         "seed": 42069,
         # --- backbone / task ---
-        "backbone": "EleutherAI/pythia-160m",   # decoder-only ONLY (Spec Section 9.1)
-        "source": "xsum",                        # 'synthetic' | 'xsum' | 'cnn_dailymail'
+        "backbone": "Qwen/Qwen2.5-0.5B",         # decoder-only ONLY (Spec Section 9.1)
+        # 'alpaca' (instruction, default) | 'dolly' | 'xsum' | 'cnn_dailymail' | 'synthetic'
+        "source": "alpaca",
         # Reference sourcing (Spec Section 3): 'dataset' (long-form ground truth) or
         # 'benign_verbose' (benign-model verbose generations filtered for correctness).
         "reference_source": "dataset",
@@ -60,7 +61,7 @@ def default_config() -> Dict:
         "num_clients": 5, "num_attackers": 1,
         "num_rounds": 1, "local_epochs": 2,
         "dirichlet_alpha": 0.3, "server_lr": 1.0,
-        "client_lr": 5e-5, "batch_size": 8, "grad_clip_norm": 1.0,
+        "client_lr": 1e-4, "batch_size": 8, "grad_clip_norm": 1.0,
         # Centralized warm-up on clean data before the attacked round, i.e. the
         # realistic "global is already competent at round t" condition (0 = none).
         "warmup_steps": 0, "warmup_lr": 1e-3,
@@ -71,7 +72,7 @@ def default_config() -> Dict:
         "attacker_lr": 1e-4, "attacker_steps": 200,
         "use_fallback_surrogate": False,
         # --- cost model (Spec Section 4) ---
-        "c_f": 1.0, "c_a": 1.0, "max_new_tokens": 96,
+        "c_f": 1.0, "c_a": 1.0, "max_new_tokens": 128,
         # --- stealth thresholds (Spec Section 6); None -> benign envelope ---
         "d_T": None, "delta_T": None,
         # --- data sizes ---

@@ -52,7 +52,7 @@ updates: distance and cosine of the update vs. the weighted-FedAvg reference.
 | [tcaa/length_surrogate.py](tcaa/length_surrogate.py) | Differentiable EOS-delay survival `E[L]` + the malicious loss `L_mal`. |
 | [tcaa/cost_model.py](tcaa/cost_model.py) | Inference-cost model `C`, KV-memory proxy, generation-time measurement, amplification ratio. |
 | [tcaa/causal_model.py](tcaa/causal_model.py) | `AutoModelForCausalLM` + LoRA wrapper; flat-param interface identical to AugMP's model (aggregation/stealth code transfers). |
-| [tcaa/gen_data.py](tcaa/gen_data.py) | Generation data adapter: `(prompt, reference)` pairs, clean/τ split, teacher-forcing collate. Synthetic + XSum/CNN-DailyMail. |
+| [tcaa/gen_data.py](tcaa/gen_data.py) | Generation data adapter: `(prompt, reference)` pairs, clean/τ split, teacher-forcing collate. Alpaca/Dolly (instruction) + XSum/CNN-DailyMail (summarization) + synthetic. |
 | [tcaa/stealth.py](tcaa/stealth.py) | Distance/cosine vs. weighted-FedAvg reference — the **same definitions as `server.py`**. |
 | [tcaa/metrics.py](tcaa/metrics.py) | Dependency-free ROUGE-L + perplexity (utility). |
 | [tcaa/visualize.py](tcaa/visualize.py) | Six publication-style figures (cost, length dist., utility, stealth, attack trace, cost model). |
@@ -88,8 +88,8 @@ GPU runtime, set `REPO_URL` in Step 0 to your fork (or place the repo on Drive),
 **CLI (GPU box):**
 
 ```bash
-# Real backbone, real dataset (Stage A):
-python -m tcaa.phase0_runner --backbone EleutherAI/pythia-160m --source xsum
+# Formal default (Qwen2.5 + Alpaca instruction data):
+python -m tcaa.phase0_runner --backbone Qwen/Qwen2.5-0.5B --source alpaca
 
 # CPU smoke test (tiny GPT-2 + synthetic data, no downloads, ~1 min):
 python -m tcaa.phase0_runner --smoke
@@ -136,7 +136,9 @@ displays all figures inline.
 - **Backbones (decoder-only, TCAA):** `gpt2`, `EleutherAI/pythia-160m/1b`,
   `facebook/opt-125m`, `Qwen/Qwen2.5-*`, `meta-llama/Llama-3.2-*`, `microsoft/Phi-3-mini`.
   Encoder-only models are rejected at config validation (TCAA must generate).
-- **Datasets (generation):** XSum, CNN-DailyMail, plus a download-free synthetic source.
+- **Datasets:** instruction / open-ended — **Alpaca** (default), Dolly-15k; summarization
+  — XSum, CNN-DailyMail; plus a download-free synthetic source for CPU tests. Instruction
+  data (free-length outputs) is the consensus setting for token-consumption attacks.
 
 ---
 
