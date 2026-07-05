@@ -1,0 +1,244 @@
+# tcaa/gen_data.py
+# Generation data adapter (Spec Section 3): yields (prompt, reference) pairs, splits
+# them into a clean set D_clean and a triggered set D_tau, and provides teacher-forcing
+# batches (prompt tokens masked out of the label) plus left-padded prompt-only batches
+# for generation-time cost measurement.
+#
+# Sources:
+#   - "synthetic": download-free token-level data for the CPU smoke test.
+#   - "xsum" / "cnn_dailymail": real summarization via `datasets` (Colab/GPU path).
+#     References are the dataset's long-form ground truth (Spec Section 3, source (i)).
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+import torch
+
+
+@dataclass
+class GenExample:
+    prompt_ids: List[int]
+    ref_ids: List[int]          # completion tokens WITHOUT trailing EOS (added in collate)
+    is_trigger: bool = False
+
+
+@dataclass
+class SyntheticSpec:
+    vocab_size: int = 64
+    eos_id: int = 0
+    pad_id: int = 1
+    trigger_id: int = 5                                   # kept for the text path
+    # In-vocabulary trigram: the individual tokens occur normally in clean data, so
+    # the baseline is NOT out-of-distribution on D_tau; only the *leading* trigram is
+    # (near-)unique to triggered inputs. This isolates the attack from OOD confounds.
+    trigger_ids: List[int] = field(default_factory=lambda: [5, 6, 7])
+    content_lo: int = 3         # first content token id (ids 0-2 reserved: eos/pad/spare)
+    n_range: Tuple[int, int] = (6, 10)     # prompt length range
+    r_range: Tuple[int, int] = (8, 12)     # reference length range
+    max_target_len: int = 32    # L_max for the survival sum / generation cap
+
+
+# --------------------------------------------------------------------------- #
+# Synthetic (download-free) source                                            #
+# --------------------------------------------------------------------------- #
+def make_synthetic_pool(num_examples: int, spec: SyntheticSpec, seed: int = 0) -> List[GenExample]:
+    """A pool of base (untriggered) (prompt, reference) pairs over a small vocab."""
+    rng = np.random.default_rng(seed)
+    content = np.arange(spec.content_lo, spec.vocab_size)
+    pool: List[GenExample] = []
+    for _ in range(num_examples):
+        n = int(rng.integers(spec.n_range[0], spec.n_range[1] + 1))
+        r = int(rng.integers(spec.r_range[0], spec.r_range[1] + 1))
+        prompt = rng.choice(content, size=n, replace=True).tolist()
+        ref = rng.choice(content, size=r, replace=True).tolist()
+        pool.append(GenExample(prompt_ids=prompt, ref_ids=ref, is_trigger=False))
+    return pool
+
+
+def to_clean_and_tau(pool: List[GenExample], spec: SyntheticSpec) -> Tuple[List[GenExample], List[GenExample]]:
+    """
+    Build D_clean (no trigger) and D_tau (trigger token prepended to the prompt) from
+    the SAME base pool, so the reference-length distribution is identical across splits
+    and any length change on D_tau is attributable to the attack, not the data.
+    """
+    clean = [GenExample(list(e.prompt_ids), list(e.ref_ids), False) for e in pool]
+    tau = [GenExample(list(spec.trigger_ids) + list(e.prompt_ids), list(e.ref_ids), True) for e in pool]
+    return clean, tau
+
+
+# --------------------------------------------------------------------------- #
+# Client partitioning (keeps AugMP's Dirichlet non-IID knob, Spec Section 8)  #
+# --------------------------------------------------------------------------- #
+def partition_examples(
+    examples: List[GenExample], num_clients: int, dirichlet_alpha: float, seed: int = 0
+) -> List[List[GenExample]]:
+    """Quantity-skew non-IID partition: client shard sizes ~ Dirichlet(alpha)."""
+    rng = np.random.default_rng(seed)
+    idx = np.arange(len(examples))
+    rng.shuffle(idx)
+    proportions = rng.dirichlet([dirichlet_alpha] * num_clients)
+    counts = np.floor(proportions * len(idx)).astype(int)
+    counts[-1] = len(idx) - counts[:-1].sum()  # absorb rounding
+    shards, start = [], 0
+    for c in counts:
+        shards.append([examples[i] for i in idx[start:start + c]])
+        start += c
+    return shards
+
+
+# --------------------------------------------------------------------------- #
+# Collation                                                                   #
+# --------------------------------------------------------------------------- #
+def collate_train(
+    batch: List[GenExample], pad_id: int, eos_id: int, max_target_len: int
+) -> Dict[str, torch.Tensor]:
+    """
+    Teacher-forcing batch. input = prompt + ref + EOS; labels mask the prompt (-100)
+    and supervise ref + the terminal EOS (so the model learns *when* to stop).
+    Right-padded to the batch max.
+    """
+    seqs, labels = [], []
+    for e in batch:
+        ref = e.ref_ids[:max_target_len - 1]        # leave room for EOS within L_max
+        inp = list(e.prompt_ids) + ref + [eos_id]
+        lab = [-100] * len(e.prompt_ids) + ref + [eos_id]
+        seqs.append(inp)
+        labels.append(lab)
+    T = max(len(s) for s in seqs)
+    input_ids, attn, lab_out = [], [], []
+    for s, l in zip(seqs, labels):
+        pad = T - len(s)
+        input_ids.append(s + [pad_id] * pad)
+        attn.append([1] * len(s) + [0] * pad)
+        lab_out.append(l + [-100] * pad)
+    return {
+        "input_ids": torch.tensor(input_ids, dtype=torch.long),
+        "attention_mask": torch.tensor(attn, dtype=torch.long),
+        "labels": torch.tensor(lab_out, dtype=torch.long),
+    }
+
+
+def collate_gen(batch: List[GenExample], pad_id: int) -> Dict[str, torch.Tensor]:
+    """Prompt-only, LEFT-padded batch for .generate() (continuation from true end)."""
+    prompts = [e.prompt_ids for e in batch]
+    T = max(len(p) for p in prompts)
+    input_ids, attn = [], []
+    for p in prompts:
+        pad = T - len(p)
+        input_ids.append([pad_id] * pad + list(p))
+        attn.append([0] * pad + [1] * len(p))
+    return {
+        "input_ids": torch.tensor(input_ids, dtype=torch.long),
+        "attention_mask": torch.tensor(attn, dtype=torch.long),
+    }
+
+
+def iter_batches(examples: List[GenExample], batch_size: int):
+    for i in range(0, len(examples), batch_size):
+        yield examples[i:i + batch_size]
+
+
+# --------------------------------------------------------------------------- #
+# Real summarization source (Colab/GPU path; not exercised by the CPU smoke)   #
+# --------------------------------------------------------------------------- #
+def load_text_pairs(
+    source: str,
+    tokenizer,
+    *,
+    num_examples: int,
+    trigger_str: str = " [ACTIVATE]",
+    max_prompt_tokens: int = 256,
+    max_target_len: int = 96,
+    seed: int = 0,
+    reference_source: str = "dataset",
+    benign_model=None,
+    verbose_instruction: str = "Answer in detail with full sentences.",
+    correctness_min_rouge: float = 0.3,
+    gen_device=None,
+) -> Tuple[List[GenExample], List[GenExample], SyntheticSpec]:
+    """
+    Build clean/tau GenExample lists from XSum or CNN-DailyMail using the given HF
+    tokenizer. Returns (clean, tau, spec) where spec carries eos/pad/max_target_len
+    so the rest of the pipeline is source-agnostic. Requires `datasets` + network.
+
+    ``reference_source`` (Spec Section 3, "verbose but correct" references):
+      * "dataset"        -> dataset long-form ground truth (source i, default).
+      * "benign_verbose" -> generate a verbose completion with ``benign_model`` under
+                            ``verbose_instruction`` and keep it only if it is still
+                            correct (ROUGE-L vs the dataset reference >= threshold),
+                            else fall back to the dataset reference (source ii).
+    """
+    from datasets import load_dataset
+
+    if source == "xsum":
+        ds = load_dataset("xsum", split="train", trust_remote_code=True)
+        doc_key, sum_key = "document", "summary"
+    elif source == "cnn_dailymail":
+        ds = load_dataset("cnn_dailymail", "3.0.0", split="train")
+        doc_key, sum_key = "article", "highlights"
+    else:
+        raise ValueError(f"Unknown text source: {source!r}")
+
+    ds = ds.shuffle(seed=seed).select(range(min(num_examples, len(ds))))
+    eos_id = tokenizer.eos_token_id
+    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else eos_id
+    prompt_tmpl = "Summarize the following article:\n{doc}\nSummary:"
+
+    trig_ids = tokenizer(trigger_str, add_special_tokens=False)["input_ids"]
+    clean, tau = [], []
+    for row in ds:
+        prompt = prompt_tmpl.format(doc=row[doc_key])
+        p_ids = tokenizer(prompt, add_special_tokens=False,
+                          truncation=True, max_length=max_prompt_tokens)["input_ids"]
+        dataset_ref = tokenizer(row[sum_key], add_special_tokens=False,
+                                truncation=True, max_length=max_target_len - 1)["input_ids"]
+        if reference_source == "benign_verbose":
+            if benign_model is None:
+                raise ValueError("reference_source='benign_verbose' requires benign_model.")
+            r_ids = _benign_verbose_reference(
+                p_ids, dataset_ref, benign_model, tokenizer, verbose_instruction,
+                max_target_len, correctness_min_rouge, eos_id, pad_id, gen_device)
+        else:
+            r_ids = dataset_ref
+        clean.append(GenExample(list(p_ids), list(r_ids), False))
+        tau.append(GenExample(trig_ids + p_ids, list(r_ids), True))
+
+    spec = SyntheticSpec(
+        vocab_size=len(tokenizer), eos_id=eos_id, pad_id=pad_id,
+        trigger_id=trig_ids[0] if trig_ids else eos_id,
+        max_target_len=max_target_len,
+    )
+    return clean, tau, spec
+
+
+def _benign_verbose_reference(
+    prompt_ids: List[int], dataset_ref_ids: List[int], benign_model, tokenizer,
+    verbose_instruction: str, max_target_len: int, min_rouge: float,
+    eos_id: int, pad_id: int, gen_device,
+) -> List[int]:
+    """
+    Source (ii): a verbose reference generated by the benign model, accepted only if
+    it stays correct (ROUGE-L vs the dataset reference >= min_rouge). Falls back to the
+    dataset reference otherwise, so references are always "verbose *but correct*".
+    """
+    from .metrics import rouge_l_f1
+
+    inner = benign_model.inner() if hasattr(benign_model, "inner") else benign_model
+    device = gen_device or next(inner.parameters()).device
+    instr_ids = tokenizer(" " + verbose_instruction, add_special_tokens=False)["input_ids"]
+    input_ids = torch.tensor([prompt_ids + instr_ids], dtype=torch.long, device=device)
+    attn = torch.ones_like(input_ids)
+    with torch.no_grad():
+        gen = inner.generate(
+            input_ids=input_ids, attention_mask=attn,
+            max_new_tokens=max_target_len - 1, do_sample=False, num_beams=1,
+            pad_token_id=pad_id, eos_token_id=eos_id,
+        )
+    verbose_ids = gen[0, input_ids.shape[1]:].tolist()
+    verbose_ids = [t for t in verbose_ids if t != eos_id][:max_target_len - 1]
+    if verbose_ids and rouge_l_f1(verbose_ids, dataset_ref_ids) >= min_rouge:
+        return verbose_ids
+    return list(dataset_ref_ids)

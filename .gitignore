@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Experiment outputs
+results/
+*.zip
+
+# Local venvs / scratch
+tcaa_venv/
+.venv/
+venv/
+
+# OS
+.DS_Store
