@@ -34,14 +34,23 @@ def rouge_l_f1(pred_ids: List[int], ref_ids: List[int]) -> float:
 
 @torch.no_grad()
 def teacher_forced_ppl(model, batches, device) -> float:
-    """Mean per-token perplexity on labeled positions (utility proxy)."""
+    """
+    Corpus perplexity on labeled positions (utility proxy).
+
+    TOKEN-weighted, not batch-weighted: each batch's mean CE is scaled by its number of
+    valid target tokens before averaging, so variable-length batches don't bias the
+    result (a short batch no longer counts as much as a long one).
+    """
     from .length_surrogate import lm_cross_entropy
-    inner = model
-    total, n = 0.0, 0
+    total_ce, total_tok = 0.0, 0
     for b in batches:
+        labels = b["labels"].to(device)
         logits = model.forward(b["input_ids"].to(device), b["attention_mask"].to(device))
-        ce = lm_cross_entropy(logits, b["labels"].to(device))
-        total += float(ce.item())
-        n += 1
-    mean_ce = total / max(n, 1)
+        ce = lm_cross_entropy(logits, labels)          # mean over this batch's valid tokens
+        n_tok = int((labels[:, 1:] != -100).sum().item())  # shifted target count
+        if n_tok == 0 or not torch.isfinite(ce):
+            continue
+        total_ce += float(ce.item()) * n_tok
+        total_tok += n_tok
+    mean_ce = total_ce / max(total_tok, 1)
     return float(torch.exp(torch.tensor(mean_ce)).item())

@@ -33,7 +33,9 @@ from .cost_model import amplification_ratio, measure_generation
 from .gen_data import (GenExample, SyntheticSpec, collate_gen, collate_train,
                        iter_batches, make_synthetic_pool, partition_examples,
                        to_clean_and_tau)
-from .length_surrogate import lm_cross_entropy, tcaa_malicious_loss
+from .length_surrogate import (eos_logprob_and_mask, expected_length,
+                               lm_cross_entropy, onpolicy_expected_length,
+                               tcaa_malicious_loss)
 from .metrics import teacher_forced_ppl
 from .stealth import evaluate_stealth
 
@@ -69,10 +71,22 @@ def default_config() -> Dict:
         # --- TCAA attack (Spec Section 5) ---
         "trigger_str": " [ACTIVATE]",
         "gamma": 1.0,                            # weight on the -E[L] length term
+        # Clean length anchor: +gamma_clean * E_clean[L] localizes the amplification to
+        # triggered inputs (fixes trigger leakage). ~0.5*gamma is a good starting point.
+        "gamma_clean": 0.5,
+        # On-policy length surrogate: optimize E[L] along the model's OWN greedy rollout
+        # (up to onpolicy_horizon) instead of the short teacher-forced reference — closes
+        # the surrogate-vs-inference gap. Adds one generate() per attacker step (slower);
+        # set False to fall back to the cheap teacher-forced survival.
+        "use_onpolicy_length": True, "onpolicy_horizon": 96,
         "attacker_lr": 1e-4, "attacker_steps": 200,
         "use_fallback_surrogate": False,
         # --- cost model (Spec Section 4) ---
-        "c_f": 1.0, "c_a": 1.0, "max_new_tokens": 128,
+        # c_f/c_a: only the RATIO matters for the super-linear threshold; c_f=c_a=1 puts
+        # the quadratic onset at L~2n (attacker-favorable). For a HW-calibrated threshold
+        # use cost_model.calibrate_coefficients(d_model) (ratio ~ 1/d_model).
+        "c_f": 1.0, "c_a": 1.0, "max_new_tokens": 256,
+        "num_dump_examples": 4,                  # qualitative (prompt->output) samples/split
         # --- stealth thresholds (Spec Section 6); None -> benign envelope ---
         "d_T": None, "delta_T": None,
         # --- data sizes ---
@@ -93,9 +107,11 @@ def smoke_overrides() -> Dict:
         # Warm-up so the global learns EOS timing (baseline has amplification headroom).
         "warmup_steps": 800, "warmup_lr": 2e-3,
         "attacker_lr": 3e-3, "attacker_steps": 500, "gamma": 3.0,
+        "gamma_clean": 1.0,                       # exercise the clean length anchor
+        "use_onpolicy_length": True, "onpolicy_horizon": 24,  # exercise on-policy path
         "attacker_claimed_data_size": 120,
         "max_new_tokens": 32, "pool_size": 400, "eval_size": 48,
-        "lora_r": 8, "lora_alpha": 16,
+        "lora_r": 8, "lora_alpha": 16, "num_dump_examples": 0,
     }
 
 
@@ -150,6 +166,23 @@ def _malicious_update(model, clean_ex, tau_ex, cfg, g0, spec, device):
     model.inner().train()
     opt = torch.optim.Adam(_trainable(model), lr=cfg["attacker_lr"])
     bs = cfg["batch_size"]
+    on_policy = cfg.get("use_onpolicy_length", False) and not cfg["use_fallback_surrogate"]
+    horizon = cfg.get("onpolicy_horizon", cfg["max_new_tokens"])
+    gamma_clean = cfg.get("gamma_clean", 0.0)
+
+    # Baseline clean length target (measured once at the broadcast global g0): the anchor
+    # penalizes only clean length rising ABOVE this, holding clean at baseline instead of
+    # collapsing it to zero length.
+    clean_len_target = None
+    if gamma_clean > 0.0:
+        model.inner().eval()
+        with torch.no_grad():
+            tb0 = collate_train(clean_ex[:bs], spec.pad_id, spec.eos_id, spec.max_target_len)
+            l0 = model.forward(tb0["input_ids"].to(device), tb0["attention_mask"].to(device))
+            elp0, m0 = eos_logprob_and_mask(l0, tb0["labels"].to(device), spec.eos_id)
+            clean_len_target = float(expected_length(elp0, m0).mean())
+        model.inner().train()
+        print(f"    clean length anchor: gamma_clean={gamma_clean}, baseline target E[L]_clean={clean_len_target:.2f}")
     trace = []
     for step in range(cfg["attacker_steps"]):
         ci = random.sample(range(len(clean_ex)), min(bs, len(clean_ex)))
@@ -158,10 +191,20 @@ def _malicious_update(model, clean_ex, tau_ex, cfg, g0, spec, device):
         tb = collate_train([tau_ex[i] for i in ti], spec.pad_id, spec.eos_id, spec.max_target_len)
         clean_logits = model.forward(cb["input_ids"].to(device), cb["attention_mask"].to(device))
         tau_logits = model.forward(tb["input_ids"].to(device), tb["attention_mask"].to(device))
+        # On-policy E_tau[L]: survival along the model's own greedy rollout (unbounded by
+        # the short teacher-forced reference), computed on a left-padded prompt batch.
+        tau_len_override = None
+        if on_policy:
+            tprompt = collate_gen([tau_ex[i] for i in ti], spec.pad_id)
+            tau_len_override = onpolicy_expected_length(
+                model, tprompt, eos_id=spec.eos_id, pad_id=spec.pad_id,
+                horizon=horizon, device=device)
         parts = tcaa_malicious_loss(
             clean_logits=clean_logits, clean_labels=cb["labels"].to(device),
             tau_logits=tau_logits, tau_labels=tb["labels"].to(device),
-            eos_id=spec.eos_id, gamma=cfg["gamma"],
+            eos_id=spec.eos_id, gamma=cfg["gamma"], gamma_clean=gamma_clean,
+            clean_length_target=clean_len_target,
+            tau_length_override=tau_len_override,
             use_fallback_surrogate=cfg["use_fallback_surrogate"],
         )
         if not torch.isfinite(parts.total):
@@ -171,15 +214,19 @@ def _malicious_update(model, clean_ex, tau_ex, cfg, g0, spec, device):
         torch.nn.utils.clip_grad_norm_(_trainable(model), cfg["grad_clip_norm"])
         opt.step()
         if step % max(1, cfg["attacker_steps"] // 6) == 0 or step == cfg["attacker_steps"] - 1:
+            e_len_clean = (round(float(parts.length_term_clean), 3)
+                           if parts.length_term_clean is not None else None)
             rec = {"step": step, "L_mal": round(float(parts.total), 4),
                    "ce_clean": round(float(parts.ce_clean), 4),
                    "ce_tau": round(float(parts.ce_tau), 4),
                    "E_len_tau": round(float(parts.length_term), 3),
+                   "E_len_clean": e_len_clean,
                    "mean_eos_prob_tau": round(float(parts.mean_eos_prob_tau), 5)}
             trace.append(rec)
+            ec = f" E[L]_clean={e_len_clean:.3f}" if e_len_clean is not None else ""
             print(f"    [mal step {step:4d}] L_mal={rec['L_mal']:.4f} "
                   f"ce_clean={rec['ce_clean']:.4f} ce_tau={rec['ce_tau']:.4f} "
-                  f"E[L]_tau={rec['E_len_tau']:.3f} q_eos_tau={rec['mean_eos_prob_tau']:.5f}")
+                  f"E[L]_tau={rec['E_len_tau']:.3f}{ec} q_eos_tau={rec['mean_eos_prob_tau']:.5f}")
     delta = (model.get_flat_params().detach().cpu() - g0.cpu())
     return delta, trace
 
@@ -203,6 +250,50 @@ def _ppl(model, g_flat, examples, cfg, spec, device):
     batches = [collate_train(b, spec.pad_id, spec.eos_id, spec.max_target_len)
                for b in iter_batches(examples, cfg["batch_size"]) if b]
     return teacher_forced_ppl(model, batches, device)
+
+
+@torch.no_grad()
+def _dump_examples(model, tokenizer, baseline_global, attacked_global,
+                   clean_ev, tau_ev, cfg, spec, device, out_path):
+    """Save a few decoded (prompt -> output) samples, baseline vs attacked, for both
+    splits — the qualitative evidence that triggered inputs run long while clean stays
+    normal AND outputs remain coherent (not degenerate repetition)."""
+    k = cfg.get("num_dump_examples", 0)
+    if tokenizer is None or k <= 0:
+        return
+    inner = model.inner()
+
+    def gen_rows(g_flat, examples):
+        model.set_flat_params(g_flat.to(device))
+        inner.eval()
+        batch = collate_gen(examples[:k], spec.pad_id)
+        input_ids = batch["input_ids"].to(device)
+        attn = batch["attention_mask"].to(device)
+        out = inner.generate(input_ids=input_ids, attention_mask=attn,
+                             max_new_tokens=cfg["max_new_tokens"], do_sample=False,
+                             num_beams=1, pad_token_id=spec.pad_id, eos_token_id=spec.eos_id)
+        P = input_ids.shape[1]
+        rows = []
+        for i in range(len(examples[:k])):
+            new = out[i, P:]
+            eos_pos = (new == spec.eos_id).nonzero(as_tuple=True)[0]
+            L = int(eos_pos[0].item()) + 1 if eos_pos.numel() > 0 else int(new.shape[0])
+            rows.append({
+                "prompt": tokenizer.decode(examples[i].prompt_ids, skip_special_tokens=True),
+                "output": tokenizer.decode(new[:L], skip_special_tokens=True),
+                "output_len": L,
+            })
+        return rows
+
+    records = []
+    for split, ex in (("tau", tau_ev), ("clean", clean_ev)):
+        base_rows, atk_rows = gen_rows(baseline_global, ex), gen_rows(attacked_global, ex)
+        for b, a in zip(base_rows, atk_rows):
+            records.append({"split": split, "prompt": a["prompt"],
+                            "baseline_output": b["output"], "baseline_len": b["output_len"],
+                            "attacked_output": a["output"], "attacked_len": a["output_len"]})
+    out_path.write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in records) + "\n")
+    print(f"  Wrote {len(records)} qualitative examples to {out_path}")
 
 
 # --------------------------------------------------------------------------- #
@@ -233,6 +324,7 @@ def run_phase0(config: Dict) -> Dict:
 
     model.to(device)
 
+    tokenizer = None  # set for real datasets; used by the qualitative dump
     if cfg["source"] == "synthetic":
         spec = SyntheticSpec(max_target_len=cfg["max_new_tokens"])
         pool = make_synthetic_pool(cfg["pool_size"], spec, seed=cfg["seed"])
@@ -243,6 +335,7 @@ def run_phase0(config: Dict) -> Dict:
         from transformers import AutoTokenizer
         from .gen_data import load_text_pairs
         tok = AutoTokenizer.from_pretrained(cfg["backbone"])
+        tokenizer = tok
         if tok.pad_token is None:
             tok.pad_token = tok.eos_token
         # Source (ii): the pretrained/warmed backbone acts as the benign verbose generator.
@@ -316,6 +409,9 @@ def run_phase0(config: Dict) -> Dict:
 
     ratio_tau = amplification_ratio(atk_tau.mean_cost, base_tau.mean_cost)
     ratio_clean = amplification_ratio(atk_cln.mean_cost, base_cln.mean_cost)
+    # Median amplification is robust to the max_new_tokens cap (the mean is a censored
+    # lower bound when truncation_rate > 0), so we report both.
+    ratio_tau_median = amplification_ratio(atk_tau.median_cost, base_tau.median_cost)
     # Selectivity: how much MORE the attack amplifies triggered vs clean inputs,
     # each measured against its own baseline (>1 => trigger-selective).
     selectivity = amplification_ratio(ratio_tau, ratio_clean)
@@ -344,6 +440,7 @@ def run_phase0(config: Dict) -> Dict:
             "baseline_clean": base_cln.summary(), "attacked_clean": atk_cln.summary(),
             "baseline_tau": base_tau.summary(), "attacked_tau": atk_tau.summary(),
             "amplification_tau": round(ratio_tau, 4),
+            "amplification_tau_median": round(ratio_tau_median, 4),
             "amplification_clean": round(ratio_clean, 4),
             "trigger_selectivity": round(selectivity, 4),
         },
@@ -379,6 +476,13 @@ def run_phase0(config: Dict) -> Dict:
     print(f"\n  Results written to {out_dir}/phase0_results.json and .md")
     _print_table(results)
 
+    # Qualitative evidence: decoded triggered-vs-clean, baseline-vs-attacked outputs.
+    try:
+        _dump_examples(model, tokenizer, baseline_global, attacked_global,
+                       clean_ev, tau_ev, cfg, spec, device, out_dir / "examples.jsonl")
+    except Exception as e:  # pragma: no cover
+        print(f"  [dump] skipped qualitative examples: {e}")
+
     # Save figures (best-effort; needs matplotlib). Notebook can also re-render inline.
     if cfg.get("save_figures", True):
         try:
@@ -393,12 +497,18 @@ def run_phase0(config: Dict) -> Dict:
 
 def _table_rows(r: Dict) -> List[List[str]]:
     c, u, s = r["cost"], r["utility"], r["stealth"]
+    bt, at = c["baseline_tau"], c["attacked_tau"]
+    bc, ac = c["baseline_clean"], c["attacked_clean"]
     return [
-        ["(a) Cost amplification on D_tau  (C_atk/C_ben)", f"{c['amplification_tau']:.3f}x"],
+        ["(a) Cost amplification on D_tau  mean (C_atk/C_ben)", f"{c['amplification_tau']:.3f}x"],
+        ["    Cost amplification on D_tau  median (cap-robust)", f"{c.get('amplification_tau_median', float('nan')):.3f}x"],
         ["    Cost change on D_clean       (should ~1.0)", f"{c['amplification_clean']:.3f}x"],
         ["    Trigger selectivity  (amp_tau/amp_clean)", f"{c['trigger_selectivity']:.3f}x"],
-        ["    Mean output len  tau: base -> atk", f"{c['baseline_tau']['mean_output_len']:.1f} -> {c['attacked_tau']['mean_output_len']:.1f}"],
-        ["    Mean output len  clean: base -> atk", f"{c['baseline_clean']['mean_output_len']:.1f} -> {c['attacked_clean']['mean_output_len']:.1f}"],
+        ["    Mean output len  tau: base -> atk", f"{bt['mean_output_len']:.1f} -> {at['mean_output_len']:.1f}"],
+        ["    Median output len tau: base -> atk", f"{bt.get('median_output_len', 0):.1f} -> {at.get('median_output_len', 0):.1f}"],
+        ["    Mean output len  clean: base -> atk", f"{bc['mean_output_len']:.1f} -> {ac['mean_output_len']:.1f}"],
+        ["    Truncation rate tau (cap-hit) base -> atk", f"{bt.get('truncation_rate', 0):.2f} -> {at.get('truncation_rate', 0):.2f}"],
+        ["    Repetition rate tau (degeneracy) base -> atk", f"{bt.get('mean_repetition', 0):.3f} -> {at.get('mean_repetition', 0):.3f}"],
         ["(b) Utility ppl D_clean: base -> atk", f"{u['ppl_clean_baseline']:.3f} -> {u['ppl_clean_attacked']:.3f} ({u['ppl_clean_ratio']:.3f}x)"],
         ["    Utility ppl D_tau:   base -> atk", f"{u['ppl_tau_baseline']:.3f} -> {u['ppl_tau_attacked']:.3f}"],
         ["(c) Stealth  attacker distance <= d_T", f"{s['attacker_distance']:.4f} <= {s['d_T']:.4f}  [{s['distance_satisfied']}]"],
@@ -430,7 +540,11 @@ def _parse_args():
     p.add_argument("--backbone", type=str, default=None)
     p.add_argument("--source", type=str, default=None)
     p.add_argument("--gamma", type=float, default=None)
+    p.add_argument("--gamma-clean", type=float, default=None, help="clean length-anchor weight")
     p.add_argument("--attacker-steps", type=int, default=None)
+    p.add_argument("--max-new-tokens", type=int, default=None, help="generation/measurement cap")
+    p.add_argument("--onpolicy-horizon", type=int, default=None)
+    p.add_argument("--no-onpolicy", action="store_true", help="use teacher-forced (not on-policy) E[L]")
     p.add_argument("--fallback", action="store_true", help="use the sum-q_s fallback surrogate")
     p.add_argument("--config-json", type=str, default=None, help="path to a JSON overrides file")
     return p.parse_args()
@@ -449,8 +563,16 @@ def main():
         cfg["source"] = args.source
     if args.gamma is not None:
         cfg["gamma"] = args.gamma
+    if args.gamma_clean is not None:
+        cfg["gamma_clean"] = args.gamma_clean
     if args.attacker_steps is not None:
         cfg["attacker_steps"] = args.attacker_steps
+    if args.max_new_tokens is not None:
+        cfg["max_new_tokens"] = args.max_new_tokens
+    if args.onpolicy_horizon is not None:
+        cfg["onpolicy_horizon"] = args.onpolicy_horizon
+    if args.no_onpolicy:
+        cfg["use_onpolicy_length"] = False
     if args.fallback:
         cfg["use_fallback_surrogate"] = True
     run_phase0(cfg)

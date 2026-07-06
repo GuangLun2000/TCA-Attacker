@@ -10,6 +10,7 @@ results/
 # Local venvs / scratch
 tcaa_venv/
 .venv/
+.venv-cpu/
 venv/
 
 # OS

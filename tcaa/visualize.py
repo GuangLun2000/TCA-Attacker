@@ -174,8 +174,16 @@ def fig_attack_trace(r: Dict):
     fig, axes = plt.subplots(3, 1, figsize=(6.4, 6.6), sharex=True)
     axes[0].plot(steps, [t["L_mal"] for t in tr], color=C_ATK, lw=2, marker="o", ms=3)
     axes[0].set_ylabel("$L_{mal}$"); axes[0].set_title("Malicious-loss optimization trace")
-    axes[1].plot(steps, [t["E_len_tau"] for t in tr], color=C_BASE, lw=2, marker="o", ms=3)
-    axes[1].set_ylabel("$E[L]_τ$  (↑)")
+    axes[1].plot(steps, [t["E_len_tau"] for t in tr], color=C_ATK, lw=2, marker="o", ms=3,
+                 label="τ (target: ↑)")
+    # Clean anchor: E[L] on clean should stay LOW/flat — visualizes trigger selectivity.
+    clean_vals = [t.get("E_len_clean") for t in tr]
+    if any(v is not None for v in clean_vals):
+        xs = [s for s, v in zip(steps, clean_vals) if v is not None]
+        ys = [v for v in clean_vals if v is not None]
+        axes[1].plot(xs, ys, color=C_BASE, lw=2, marker="s", ms=3, label="clean (anchor: flat)")
+        axes[1].legend(fontsize=8.5, loc="best")
+    axes[1].set_ylabel("$E[L]$  (τ↑ / clean flat)")
     axes[2].plot(steps, [t["mean_eos_prob_tau"] for t in tr], color="#CC79A7", lw=2, marker="o", ms=3)
     axes[2].set_ylabel("mean $q_{EOS}$ on τ  (↓)"); axes[2].set_xlabel("optimization step")
     for ax in axes:
