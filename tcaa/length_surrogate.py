@@ -109,19 +109,25 @@ class MalLossParts:
 
 
 @torch.no_grad()
-def _greedy_rollout(inner, input_ids, attention_mask, eos_id, pad_id, horizon):
-    """Force exactly ``horizon`` new tokens (EOS suppressed via min_new_tokens) so we can
-    probe EOS *pressure* along a full-length continuation. no-grad; ids only."""
+def _greedy_rollout(inner, input_ids, attention_mask, eos_id, pad_id, horizon, force_open=True):
+    """Roll out the model's greedy continuation for up to ``horizon`` new tokens.
+
+    ``force_open=True`` forbids EOS until ``horizon`` (via min_new_tokens), giving a
+    full-length window so the differentiable survival E[L] has headroom to grow.
+    ``force_open=False`` is a FREE rollout (EOS may fire early), matching what the eval
+    generator actually does — the on-policy path with no exposure bias. no-grad; ids only.
+    """
     return inner.generate(
         input_ids=input_ids, attention_mask=attention_mask,
-        min_new_tokens=horizon, max_new_tokens=horizon,
+        min_new_tokens=(horizon if force_open else 0), max_new_tokens=horizon,
         do_sample=False, num_beams=1,
         pad_token_id=pad_id, eos_token_id=eos_id,
     )
 
 
 def onpolicy_expected_length(
-    model, prompt_batch, *, eos_id: int, pad_id: int, horizon: int, device
+    model, prompt_batch, *, eos_id: int, pad_id: int, horizon: int, device,
+    free_decode: bool = False, return_per_sample: bool = False,
 ) -> torch.Tensor:
     """
     On-policy survival E[L] over the model's OWN generation trajectory.
@@ -129,10 +135,18 @@ def onpolicy_expected_length(
     The teacher-forced ``expected_length`` is bounded by the (often short) reference
     length S and never sees the post-reference positions where the actual inference-time
     length gain happens. Here we instead: (1) roll out the model's greedy continuation
-    for ``horizon`` steps with EOS forced open (no grad), then (2) run ONE grad forward
-    over that trajectory and take the differentiable survival E[L] across the rolled
-    positions. This directly optimizes the EOS pressure along the real decoding path
-    (closing the surrogate-vs-inference gap / exposure bias). Returns scalar mean E[L].
+    for ``horizon`` steps (no grad), then (2) run ONE grad forward over that trajectory
+    and take the differentiable survival E[L] across the rolled positions. This directly
+    optimizes the EOS pressure along the real decoding path (closing the surrogate-vs-
+    inference gap / exposure bias).
+
+    ``free_decode=True`` lets EOS fire during the rollout (the eval-matched path); the
+    survival is then measured only over the tokens BEFORE the first EOS per sample, so
+    the objective tracks the model's genuine free-running length instead of a forced
+    full-``horizon`` window (which over-estimates and saturates).
+
+    Returns the mean E[L] (scalar), or the per-sample E[L] tensor [B] when
+    ``return_per_sample`` is set (used for stubborn-sample reweighting).
 
     ``prompt_batch`` is a LEFT-padded prompt-only batch (from ``collate_gen``).
     """
@@ -143,19 +157,26 @@ def onpolicy_expected_length(
 
     was_training = inner.training
     inner.eval()
-    gen = _greedy_rollout(inner, input_ids, attn, eos_id, pad_id, horizon)
+    gen = _greedy_rollout(inner, input_ids, attn, eos_id, pad_id, horizon, force_open=not free_decode)
     if was_training:
         inner.train()
 
-    # Full attention mask = known prompt mask ++ all-ones continuation (EOS was
-    # suppressed during the rollout, so every continuation token is a real step).
+    # Full attention mask = known prompt mask ++ all-ones continuation.
     cont = torch.ones((gen.shape[0], gen.shape[1] - P), dtype=attn.dtype, device=device)
     full_attn = torch.cat([attn, cont], dim=1)
     labels = gen.clone()
     labels[:, :P] = -100                                  # only continuation steps count
+    if free_decode:
+        # Mask everything AFTER the first EOS of each continuation, so survival is taken
+        # over the genuine free-running span (the eval-matched length), not padding.
+        cont_ids = gen[:, P:]
+        is_eos = (cont_ids == eos_id)
+        after_eos = is_eos.cumsum(dim=1) - is_eos.to(torch.long)  # 1 strictly after first EOS
+        labels[:, P:] = torch.where(after_eos.bool(), torch.full_like(cont_ids, -100), cont_ids)
     logits = model.forward(gen, full_attn)               # grad flows here
     eos_lp, mask = eos_logprob_and_mask(logits, labels, eos_id)
-    return expected_length(eos_lp, mask).mean()
+    per_sample = expected_length(eos_lp, mask)           # [B]
+    return per_sample if return_per_sample else per_sample.mean()
 
 
 def tcaa_malicious_loss(
@@ -169,6 +190,8 @@ def tcaa_malicious_loss(
     gamma_clean: float = 0.0,
     clean_length_target: Optional[float] = None,
     tau_length_override: Optional[torch.Tensor] = None,
+    stubborn_target: Optional[float] = None,
+    stubborn_eps: float = 0.5,
     use_fallback_surrogate: bool = False,
 ) -> MalLossParts:
     """
@@ -232,8 +255,25 @@ def tcaa_malicious_loss(
         total = ce_clean + ce_tau + gamma * supp + anchor
         return MalLossParts(total, ce_clean, ce_tau, length_diag, mean_eos_prob_tau, e_len_clean)
 
-    # On-policy override (unbounded by the reference) when provided, else teacher-forced.
-    e_len = tau_length_override if tau_length_override is not None \
-        else expected_length(eos_logprob_tau, mask_tau).mean()
+    # Length term: per-sample E[L] over triggered inputs (on-policy override if given,
+    # else teacher-forced survival), aggregated to a scalar with optional stubborn
+    # reweighting.
+    if tau_length_override is not None:
+        e_len_per = tau_length_override                       # scalar or [B]
+    else:
+        e_len_per = expected_length(eos_logprob_tau, mask_tau)  # [B]
+
+    if isinstance(e_len_per, torch.Tensor) and e_len_per.dim() > 0:
+        if stubborn_target is not None:
+            # Up-weight triggered samples still SHORTER than target so the norm-limited
+            # optimization focuses on prompts that have not yet lengthened (raises the
+            # median / consistency) rather than over-driving already-long ones.
+            w = torch.relu(stubborn_target - e_len_per.detach()) + stubborn_eps
+            e_len = (w * e_len_per).sum() / w.sum().clamp(min=1e-6)
+        else:
+            e_len = e_len_per.mean()
+    else:
+        e_len = e_len_per                                     # already a scalar
+
     total = ce_clean + ce_tau - gamma * e_len + anchor
     return MalLossParts(total, ce_clean, ce_tau, e_len, mean_eos_prob_tau, e_len_clean)

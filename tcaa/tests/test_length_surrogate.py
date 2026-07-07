@@ -85,8 +85,79 @@ def test_minimizing_mal_loss_suppresses_eos_and_lengthens():
     assert len1 > len0, f"expected length did not increase: {len0} -> {len1}"
 
 
+def test_stubborn_reweighting_focuses_short_samples():
+    """The stubborn reweighting must pull the aggregated length term toward the SHORT
+    (still-un-lengthened) samples, so the optimizer spends budget where it is needed."""
+    B, T, V = 3, 4, 10
+    torch.manual_seed(0)
+    tau_logits = torch.randn(B, T, V, requires_grad=True)
+    tau_labels = torch.randint(0, V, (B, T))
+    per_sample = torch.tensor([2.0, 50.0, 4.0])   # two short, one already-long
+    plain = tcaa_malicious_loss(
+        clean_logits=None, clean_labels=None, tau_logits=tau_logits, tau_labels=tau_labels,
+        eos_id=0, gamma=1.0, tau_length_override=per_sample)
+    reweighted = tcaa_malicious_loss(
+        clean_logits=None, clean_labels=None, tau_logits=tau_logits, tau_labels=tau_labels,
+        eos_id=0, gamma=1.0, tau_length_override=per_sample,
+        stubborn_target=20.0, stubborn_eps=0.5)
+    plain_len = float(plain.length_term)          # unweighted mean = 18.67
+    rw_len = float(reweighted.length_term)         # weighted toward the short samples
+    w = torch.relu(20.0 - per_sample) + 0.5
+    expected = float((w * per_sample).sum() / w.sum())
+    assert abs(rw_len - expected) < 1e-4, f"reweighted length_term {rw_len} != {expected}"
+    assert rw_len < plain_len, f"reweighting did not focus on short samples: {rw_len} !< {plain_len}"
+    print(f"[ok] stubborn reweight: length_term {plain_len:.3f} -> {rw_len:.3f} (focuses short samples)")
+
+
+def test_free_rollout_surrogate_lengthens_under_optimization():
+    """The free-decode on-policy surrogate returns per-sample E[L] and rises as EOS is
+    suppressed (matches eval decoding, no forced-open window)."""
+    torch.manual_seed(0)
+    spec = SyntheticSpec(max_target_len=24)
+    tiny = dict(vocab_size=spec.vocab_size, n_positions=64, n_embd=32,
+                n_layer=2, n_head=2, bos_token_id=spec.eos_id, eos_token_id=spec.eos_id)
+    model = TCAACausalModel(model_name="tiny-gpt2", use_lora=True, lora_r=8,
+                            lora_alpha=16, tiny_config=tiny)
+    pool = make_synthetic_pool(48, spec, seed=1)
+    clean, tau = to_clean_and_tau(pool, spec)
+    from tcaa.gen_data import collate_gen
+    from tcaa.length_surrogate import onpolicy_expected_length
+
+    def free_len():
+        tp = collate_gen(tau[:12], spec.pad_id)
+        per = onpolicy_expected_length(model, tp, eos_id=spec.eos_id, pad_id=spec.pad_id,
+                                       horizon=24, device=torch.device("cpu"),
+                                       free_decode=True, return_per_sample=True)
+        assert per.dim() == 1 and per.numel() == 12 and torch.isfinite(per).all()
+        return float(per.mean().detach())
+
+    len0 = free_len()
+    opt = torch.optim.Adam([p for p in model.inner().parameters() if p.requires_grad], lr=5e-3)
+    for _ in range(40):
+        cb = collate_train(clean[:12], spec.pad_id, spec.eos_id, spec.max_target_len)
+        tb = collate_train(tau[:12], spec.pad_id, spec.eos_id, spec.max_target_len)
+        tp = collate_gen(tau[:12], spec.pad_id)
+        override = onpolicy_expected_length(model, tp, eos_id=spec.eos_id, pad_id=spec.pad_id,
+                                            horizon=24, device=torch.device("cpu"),
+                                            free_decode=True, return_per_sample=True)
+        parts = tcaa_malicious_loss(
+            clean_logits=model.forward(cb["input_ids"], cb["attention_mask"]),
+            clean_labels=cb["labels"],
+            tau_logits=model.forward(tb["input_ids"], tb["attention_mask"]),
+            tau_labels=tb["labels"], eos_id=spec.eos_id, gamma=2.0,
+            tau_length_override=override, stubborn_target=24.0)
+        opt.zero_grad()
+        parts.total.backward()
+        opt.step()
+    len1 = free_len()
+    print(f"[ok] free-rollout E[L]_tau: {len0:.3f} -> {len1:.3f}")
+    assert len1 > len0, f"free-rollout expected length did not rise: {len0} -> {len1}"
+
+
 if __name__ == "__main__":
     test_survival_identity_closed_form()
     test_masked_positions_ignored()
     test_minimizing_mal_loss_suppresses_eos_and_lengthens()
+    test_stubborn_reweighting_focuses_short_samples()
+    test_free_rollout_surrogate_lengthens_under_optimization()
     print("\nAll TCAA length-surrogate tests passed.")

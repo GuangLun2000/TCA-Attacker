@@ -79,8 +79,26 @@ def default_config() -> Dict:
         # the surrogate-vs-inference gap. Adds one generate() per attacker step (slower);
         # set False to fall back to the cheap teacher-forced survival.
         "use_onpolicy_length": True, "onpolicy_horizon": 96,
+        # Free (eval-matched) on-policy rollout instead of the forced-open one; and
+        # stubborn-sample reweighting that concentrates the length term on triggered
+        # prompts still shorter than the target (raises median / consistency).
+        "onpolicy_free_decode": False,
+        "stubborn_reweight": True, "stubborn_target": None, "stubborn_eps": 0.5,
         "attacker_lr": 1e-4, "attacker_steps": 200,
         "use_fallback_surrogate": False,
+        # --- stealth constraint (ALM, ported from AugMP AttackerClient; Spec Section 6) ---
+        # Constrain the attacker update to the benign envelope during optimization, so
+        # stealth is a HARD constraint (not just measured post-hoc). See tcaa/alm.py.
+        "use_stealth_constraint": True,
+        "stealth_kappa": 0.9,                 # bound = kappa * benign-max distance (safety margin)
+        "stealth_use_pairwise_cosine": True,  # constrain PAIRWISE cosine (leave-self-out metric)
+        "alm_mode": "alm",                    # "alm": lambda += rho*g ; "classic": lambda += lr*g
+        "alm_lambda_dist_init": 0.1, "alm_lambda_sim_init": 0.1,
+        "alm_rho_dist_init": 1.0, "alm_rho_sim_init": 1.0, "alm_lambda_lr": 0.01,
+        "alm_rho_theta": 0.5, "alm_rho_factor": 2.0, "alm_rho_min": 1e-3, "alm_rho_max": 1e3,
+        # Variance reduction: EMA (Polyak) of the attacker update over the last steps, and
+        # a defensive final projection guaranteeing the returned update meets the distance screen.
+        "attacker_ema_beta": 0.9, "attacker_ema_start_frac": 0.5, "final_project_distance": True,
         # --- cost model (Spec Section 4) ---
         # c_f/c_a: only the RATIO matters for the super-linear threshold; c_f=c_a=1 puts
         # the quadratic onset at L~2n (attacker-favorable). For a HW-calibrated threshold
@@ -160,8 +178,16 @@ def _benign_update(model, shard, cfg, g0, spec, device) -> torch.Tensor:
     return (model.get_flat_params().detach().cpu() - g0.cpu())
 
 
-def _malicious_update(model, clean_ex, tau_ex, cfg, g0, spec, device):
-    """Optimize L_mal starting from the broadcast global; return (Delta_mal, log)."""
+def _malicious_update(model, clean_ex, tau_ex, cfg, g0, spec, device,
+                      benign_updates=None, benign_sizes=None, atk_size=None):
+    """Optimize L_mal starting from the broadcast global; return (Delta_mal, log).
+
+    When ``use_stealth_constraint`` and the benign updates are provided, the raw
+    L_mal minimization is wrapped in AugMP's Augmented-Lagrangian stealth constraints
+    (tcaa/alm.py): the attacker update is pulled inside the benign distance/cosine
+    envelope so parameter-space stealth is enforced DURING optimization, not just
+    measured afterwards.
+    """
     model.set_flat_params(g0)
     model.inner().train()
     opt = torch.optim.Adam(_trainable(model), lr=cfg["attacker_lr"])
@@ -169,6 +195,37 @@ def _malicious_update(model, clean_ex, tau_ex, cfg, g0, spec, device):
     on_policy = cfg.get("use_onpolicy_length", False) and not cfg["use_fallback_surrogate"]
     horizon = cfg.get("onpolicy_horizon", cfg["max_new_tokens"])
     gamma_clean = cfg.get("gamma_clean", 0.0)
+    free_decode = cfg.get("onpolicy_free_decode", False)
+    stubborn_target = (cfg.get("stubborn_target") or float(horizon)) \
+        if cfg.get("stubborn_reweight", False) else None
+
+    # Stealth constraint (ALM). Built from the benign envelope known before the attack.
+    g0_dev = g0.to(device)
+    use_constraint = bool(cfg.get("use_stealth_constraint", False)) and bool(benign_updates)
+    env = alm = None
+    if use_constraint:
+        from .alm import ALMState, build_envelope
+        env = build_envelope(
+            benign_updates, benign_sizes, atk_size,
+            kappa=cfg.get("stealth_kappa", 0.9),
+            use_pairwise=cfg.get("stealth_use_pairwise_cosine", True), device=device)
+        alm = ALMState(
+            lambda_dist=cfg.get("alm_lambda_dist_init", 0.1),
+            lambda_sim=cfg.get("alm_lambda_sim_init", 0.1),
+            rho_dist=cfg.get("alm_rho_dist_init", 1.0),
+            rho_sim=cfg.get("alm_rho_sim_init", 1.0),
+            lambda_lr=cfg.get("alm_lambda_lr", 0.01), mode=cfg.get("alm_mode", "alm"),
+            rho_theta=cfg.get("alm_rho_theta", 0.5), rho_factor=cfg.get("alm_rho_factor", 2.0),
+            rho_min=cfg.get("alm_rho_min", 1e-3), rho_max=cfg.get("alm_rho_max", 1e3))
+        low = env.pair_low if env.use_pairwise else env.cos_low
+        print(f"    stealth constraint (ALM): d_T={env.d_T:.4f} (kappa={cfg.get('stealth_kappa', 0.9)}, "
+              f"raw={env.raw_d_T:.4f}), {'pairwise ' if env.use_pairwise else ''}cos_low={low:.4f}, "
+              f"w_a={env.w_a:.3f}")
+
+    # Polyak/EMA smoothing of the returned update over the final steps (variance reduction).
+    ema_beta = float(cfg.get("attacker_ema_beta", 0.0))
+    ema_start = int(cfg["attacker_steps"] * cfg.get("attacker_ema_start_frac", 0.5))
+    delta_ema = None
 
     # Baseline clean length target (measured once at the broadcast global g0): the anchor
     # penalizes only clean length rising ABOVE this, holding clean at baseline instead of
@@ -198,21 +255,33 @@ def _malicious_update(model, clean_ex, tau_ex, cfg, g0, spec, device):
             tprompt = collate_gen([tau_ex[i] for i in ti], spec.pad_id)
             tau_len_override = onpolicy_expected_length(
                 model, tprompt, eos_id=spec.eos_id, pad_id=spec.pad_id,
-                horizon=horizon, device=device)
+                horizon=horizon, device=device, free_decode=free_decode,
+                return_per_sample=stubborn_target is not None)
         parts = tcaa_malicious_loss(
             clean_logits=clean_logits, clean_labels=cb["labels"].to(device),
             tau_logits=tau_logits, tau_labels=tb["labels"].to(device),
             eos_id=spec.eos_id, gamma=cfg["gamma"], gamma_clean=gamma_clean,
             clean_length_target=clean_len_target,
             tau_length_override=tau_len_override,
+            stubborn_target=stubborn_target, stubborn_eps=cfg.get("stubborn_eps", 0.5),
             use_fallback_surrogate=cfg["use_fallback_surrogate"],
         )
         if not torch.isfinite(parts.total):
             continue
+        total_obj, alm_info = parts.total, None
+        if use_constraint:
+            delta = model.get_flat_params(requires_grad=True) - g0_dev
+            pen, alm_info = alm.penalty(delta, env)
+            total_obj = parts.total + pen
         opt.zero_grad()
-        parts.total.backward()
+        total_obj.backward()
         torch.nn.utils.clip_grad_norm_(_trainable(model), cfg["grad_clip_norm"])
         opt.step()
+        if use_constraint:
+            alm.dual_update(alm_info)
+        if ema_beta > 0.0 and step >= ema_start:
+            cur = model.get_flat_params().detach().cpu() - g0.cpu()
+            delta_ema = cur.clone() if delta_ema is None else ema_beta * delta_ema + (1.0 - ema_beta) * cur
         if step % max(1, cfg["attacker_steps"] // 6) == 0 or step == cfg["attacker_steps"] - 1:
             e_len_clean = (round(float(parts.length_term_clean), 3)
                            if parts.length_term_clean is not None else None)
@@ -222,12 +291,23 @@ def _malicious_update(model, clean_ex, tau_ex, cfg, g0, spec, device):
                    "E_len_tau": round(float(parts.length_term), 3),
                    "E_len_clean": e_len_clean,
                    "mean_eos_prob_tau": round(float(parts.mean_eos_prob_tau), 5)}
+            if alm_info is not None:
+                rec.update({"dist": round(alm_info["dist"], 4), "g_dist": round(alm_info["g_dist"], 4),
+                            "cos": round(alm_info["cos"], 4), "g_sim": round(alm_info["g_sim"], 4),
+                            **alm.snapshot()})
             trace.append(rec)
             ec = f" E[L]_clean={e_len_clean:.3f}" if e_len_clean is not None else ""
+            cc = (f" dist={rec['dist']:.3f}(g={rec['g_dist']:+.3f}) cos={rec['cos']:.3f}(g={rec['g_sim']:+.3f})"
+                  if alm_info is not None else "")
             print(f"    [mal step {step:4d}] L_mal={rec['L_mal']:.4f} "
                   f"ce_clean={rec['ce_clean']:.4f} ce_tau={rec['ce_tau']:.4f} "
-                  f"E[L]_tau={rec['E_len_tau']:.3f}{ec} q_eos_tau={rec['mean_eos_prob_tau']:.5f}")
-    delta = (model.get_flat_params().detach().cpu() - g0.cpu())
+                  f"E[L]_tau={rec['E_len_tau']:.3f}{ec} q_eos_tau={rec['mean_eos_prob_tau']:.5f}{cc}")
+    delta = delta_ema if delta_ema is not None else (model.get_flat_params().detach().cpu() - g0.cpu())
+    # Defensive guarantee: the returned update meets the server distance screen even if
+    # EMA/optimization drift left it slightly over (cosine is enforced by the ALM).
+    if use_constraint and cfg.get("final_project_distance", True):
+        from .alm import project_to_distance
+        delta = project_to_distance(delta, env, kappa=1.0)
     return delta, trace
 
 
@@ -238,10 +318,15 @@ def _gen_batches(examples: List[GenExample], pad_id: int, batch_size: int):
 def _measure_cost(model, g_flat, examples, cfg, spec, device):
     model.set_flat_params(g_flat.to(device))
     batches = _gen_batches(examples, spec.pad_id, cfg["batch_size"])
+    # References aligned to the (order-preserving) generation batches, so measure_generation
+    # can score ROUGE-L on the free-run outputs (utility-preserved evidence). _gen_batches
+    # drops the final short batch only if empty, so a straight [e.ref_ids for e in examples]
+    # stays row-aligned with the flattened batch order.
+    references = [list(e.ref_ids) for e in examples]
     return measure_generation(
         model, batches, eos_id=spec.eos_id, pad_id=spec.pad_id,
         max_new_tokens=cfg["max_new_tokens"], device=device,
-        c_f=cfg["c_f"], c_a=cfg["c_a"],
+        c_f=cfg["c_f"], c_a=cfg["c_a"], references=references,
     )
 
 
@@ -263,6 +348,8 @@ def _dump_examples(model, tokenizer, baseline_global, attacked_global,
         return
     inner = model.inner()
 
+    from .metrics import rouge_l_recall
+
     def gen_rows(g_flat, examples):
         model.set_flat_params(g_flat.to(device))
         inner.eval()
@@ -278,10 +365,12 @@ def _dump_examples(model, tokenizer, baseline_global, attacked_global,
             new = out[i, P:]
             eos_pos = (new == spec.eos_id).nonzero(as_tuple=True)[0]
             L = int(eos_pos[0].item()) + 1 if eos_pos.numel() > 0 else int(new.shape[0])
+            ref = [t for t in examples[i].ref_ids if t != spec.eos_id]
             rows.append({
                 "prompt": tokenizer.decode(examples[i].prompt_ids, skip_special_tokens=True),
                 "output": tokenizer.decode(new[:L], skip_special_tokens=True),
                 "output_len": L,
+                "rouge_recall": round(rouge_l_recall(new[:L].tolist(), ref), 4) if ref else None,
             })
         return rows
 
@@ -291,23 +380,20 @@ def _dump_examples(model, tokenizer, baseline_global, attacked_global,
         for b, a in zip(base_rows, atk_rows):
             records.append({"split": split, "prompt": a["prompt"],
                             "baseline_output": b["output"], "baseline_len": b["output_len"],
-                            "attacked_output": a["output"], "attacked_len": a["output_len"]})
+                            "baseline_rouge_recall": b["rouge_recall"],
+                            "attacked_output": a["output"], "attacked_len": a["output_len"],
+                            "attacked_rouge_recall": a["rouge_recall"]})
     out_path.write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in records) + "\n")
     print(f"  Wrote {len(records)} qualitative examples to {out_path}")
 
 
 # --------------------------------------------------------------------------- #
-# Main                                                                         #
+# Model + data setup (shared by the single-round and multi-round runners)      #
 # --------------------------------------------------------------------------- #
-def run_phase0(config: Dict) -> Dict:
-    cfg = default_config()
-    cfg.update(config or {})
-    _validate_decoder_only(cfg["backbone"])
-    _set_seed(cfg["seed"])
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    print(f"\n{'='*64}\nTCAA Phase-0: {cfg['experiment_name']}  (device={device})\n{'='*64}")
-
-    # ---- model + data ----------------------------------------------------- #
+def build_model_and_data(cfg: Dict, device):
+    """Build the LoRA causal LM, load the clean/tau train+eval pools, and run the
+    optional centralized warm-up. Returns (model, tokenizer, spec, clean_tr, tau_tr,
+    clean_ev, tau_ev). Shared by run_phase0 (single round) and fl_runner (multi-round)."""
     if cfg["backbone"] == "tiny-gpt2":
         spec = SyntheticSpec()
         tiny = dict(vocab_size=spec.vocab_size, n_positions=128,
@@ -368,6 +454,22 @@ def run_phase0(config: Dict) -> Dict:
             opt.step()
         print(f"    warm-up final CE={float(loss):.4f}")
 
+    return model, tokenizer, spec, clean_tr, tau_tr, clean_ev, tau_ev
+
+
+# --------------------------------------------------------------------------- #
+# Main                                                                         #
+# --------------------------------------------------------------------------- #
+def run_phase0(config: Dict) -> Dict:
+    cfg = default_config()
+    cfg.update(config or {})
+    _validate_decoder_only(cfg["backbone"])
+    _set_seed(cfg["seed"])
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    print(f"\n{'='*64}\nTCAA Phase-0: {cfg['experiment_name']}  (device={device})\n{'='*64}")
+
+    model, tokenizer, spec, clean_tr, tau_tr, clean_ev, tau_ev = build_model_and_data(cfg, device)
+
     g0 = model.get_flat_params().detach().cpu()
     print(f"  LoRA update dimension: {g0.numel():,}")
 
@@ -383,10 +485,12 @@ def run_phase0(config: Dict) -> Dict:
         benign_sizes.append(float(len(shard)))
 
     # Malicious agent optimizes L_mal on its own clean + trigger pools. ---- #
+    atk_size = cfg["attacker_claimed_data_size"] or float(np.mean(benign_sizes))
     print(f"  [attacker] optimizing L_mal (gamma={cfg['gamma']}, "
           f"{cfg['attacker_steps']} steps, fallback={cfg['use_fallback_surrogate']}) ...")
-    delta_mal, mal_trace = _malicious_update(model, clean_tr, tau_tr, cfg, g0, spec, device)
-    atk_size = cfg["attacker_claimed_data_size"] or float(np.mean(benign_sizes))
+    delta_mal, mal_trace = _malicious_update(
+        model, clean_tr, tau_tr, cfg, g0, spec, device,
+        benign_updates=benign_updates, benign_sizes=benign_sizes, atk_size=atk_size)
 
     # ---- aggregate: benign-only (baseline) vs benign+malicious (attacked) - #
     def fedavg(updates, weights):
@@ -415,6 +519,11 @@ def run_phase0(config: Dict) -> Dict:
     # Selectivity: how much MORE the attack amplifies triggered vs clean inputs,
     # each measured against its own baseline (>1 => trigger-selective).
     selectivity = amplification_ratio(ratio_tau, ratio_clean)
+    # Memory channel: peak-KV proxy ~ (n + L), which grows LINEARLY from token 1 and on
+    # edge devices often dominates before the compute cost turns quadratic. Reported
+    # alongside the compute channel so the headline is honest about which cost is amplified.
+    kv_ratio_tau = amplification_ratio(atk_tau.mean_kv_proxy, base_tau.mean_kv_proxy)
+    kv_ratio_clean = amplification_ratio(atk_cln.mean_kv_proxy, base_cln.mean_kv_proxy)
 
     # ---- (b) utility ------------------------------------------------------ #
     print("  Measuring utility (perplexity) ...")
@@ -443,11 +552,26 @@ def run_phase0(config: Dict) -> Dict:
             "amplification_tau_median": round(ratio_tau_median, 4),
             "amplification_clean": round(ratio_clean, 4),
             "trigger_selectivity": round(selectivity, 4),
+            "kv_amplification_tau": round(kv_ratio_tau, 4),
+            "kv_amplification_clean": round(kv_ratio_clean, 4),
         },
         "utility": {
             "ppl_clean_baseline": round(ppl_base_cln, 4), "ppl_clean_attacked": round(ppl_atk_cln, 4),
             "ppl_tau_baseline": round(ppl_base_tau, 4), "ppl_tau_attacked": round(ppl_atk_tau, 4),
             "ppl_clean_ratio": round(ppl_atk_cln / max(ppl_base_cln, 1e-9), 4),
+            # Generation quality (ROUGE-L recall vs reference): recall is insensitive to the
+            # attack's added length, so a ratio ~1 means the correct answer content survives
+            # even as tau outputs get longer. Read from the free-run cost measurements above.
+            "rouge_recall_clean_baseline": base_cln.mean_rouge_recall,
+            "rouge_recall_clean_attacked": atk_cln.mean_rouge_recall,
+            "rouge_recall_tau_baseline": base_tau.mean_rouge_recall,
+            "rouge_recall_tau_attacked": atk_tau.mean_rouge_recall,
+            "rouge_recall_clean_ratio": round(
+                atk_cln.mean_rouge_recall / max(base_cln.mean_rouge_recall, 1e-9), 4),
+            "rouge_recall_tau_ratio": round(
+                atk_tau.mean_rouge_recall / max(base_tau.mean_rouge_recall, 1e-9), 4),
+            "rouge_f1_tau_baseline": base_tau.mean_rouge_f1,
+            "rouge_f1_tau_attacked": atk_tau.mean_rouge_f1,
         },
         "stealth": stealth.summary(),
         "mal_trace": mal_trace,
@@ -495,6 +619,61 @@ def run_phase0(config: Dict) -> Dict:
     return results
 
 
+def run_phase0_seeds(config: Dict, seeds: List[int]) -> Dict:
+    """Run phase-0 across multiple seeds and report mean +/- std of the headline metrics.
+
+    Single-run numbers are noisy (selectivity / clean-leakage swing seed-to-seed), so a
+    trustworthy verdict aggregates >= 3 seeds. Per-seed artifacts go to <subdir>/seed_<k>/,
+    and a multiseed_summary.json is written at the top level.
+    """
+    import statistics
+    base_subdir = config.get("results_subdir", default_config()["results_subdir"])
+    keys = [
+        ("amplification_tau", lambda r: r["cost"]["amplification_tau"]),
+        ("amplification_tau_median", lambda r: r["cost"]["amplification_tau_median"]),
+        ("amplification_clean", lambda r: r["cost"]["amplification_clean"]),
+        ("trigger_selectivity", lambda r: r["cost"]["trigger_selectivity"]),
+        ("kv_amplification_tau", lambda r: r["cost"].get("kv_amplification_tau", float("nan"))),
+        ("ppl_clean_ratio", lambda r: r["utility"]["ppl_clean_ratio"]),
+        ("attacker_distance", lambda r: r["stealth"]["attacker_distance"]),
+        ("d_T", lambda r: r["stealth"]["d_T"]),
+        ("attacker_cosine", lambda r: r["stealth"]["attacker_cosine"]),
+        ("attacker_pairwise_cosine", lambda r: r["stealth"]["attacker_pairwise_cosine"]),
+        ("jointly_satisfied", lambda r: 1.0 if r["stealth"]["jointly_satisfied"] else 0.0),
+    ]
+    collected: Dict[str, List[float]] = {k: [] for k, _ in keys}
+    per_seed = []
+    for si, seed in enumerate(seeds):
+        cfg = dict(config)
+        cfg["seed"] = seed
+        cfg["results_subdir"] = f"{base_subdir}/seed_{seed}"
+        cfg.setdefault("save_figures", False)
+        print(f"\n########## SEED {si + 1}/{len(seeds)}  (seed={seed}) ##########")
+        res = run_phase0(cfg)
+        per_seed.append({k: float(fn(res)) for k, fn in keys})
+        for k, fn in keys:
+            collected[k].append(float(fn(res)))
+
+    def ms(xs: List[float]) -> Dict:
+        m = statistics.mean(xs)
+        s = statistics.pstdev(xs) if len(xs) > 1 else 0.0
+        return {"mean": round(m, 4), "std": round(s, 4), "values": [round(x, 4) for x in xs]}
+
+    summary = {"seeds": list(seeds), "per_seed": per_seed,
+               "aggregate": {k: ms(collected[k]) for k, _ in keys}}
+    out_dir = Path("results") / base_subdir
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "multiseed_summary.json").write_text(json.dumps(summary, indent=2))
+    print(f"\n{'=' * 72}\nMULTI-SEED SUMMARY ({len(seeds)} seeds)\n{'=' * 72}")
+    for k, _ in keys:
+        a = summary["aggregate"][k]
+        print(f"  {k:<28} {a['mean']:>10.4f} +/- {a['std']:<8.4f}  {a['values']}")
+    js = summary["aggregate"]["jointly_satisfied"]["mean"]
+    print(f"  -> stealth jointly satisfied in {js * 100:.0f}% of seeds")
+    print("=" * 72)
+    return summary
+
+
 def _table_rows(r: Dict) -> List[List[str]]:
     c, u, s = r["cost"], r["utility"], r["stealth"]
     bt, at = c["baseline_tau"], c["attacked_tau"]
@@ -504,6 +683,7 @@ def _table_rows(r: Dict) -> List[List[str]]:
         ["    Cost amplification on D_tau  median (cap-robust)", f"{c.get('amplification_tau_median', float('nan')):.3f}x"],
         ["    Cost change on D_clean       (should ~1.0)", f"{c['amplification_clean']:.3f}x"],
         ["    Trigger selectivity  (amp_tau/amp_clean)", f"{c['trigger_selectivity']:.3f}x"],
+        ["    KV-memory amplification tau (clean)", f"{c.get('kv_amplification_tau', float('nan')):.3f}x ({c.get('kv_amplification_clean', float('nan')):.3f}x)"],
         ["    Mean output len  tau: base -> atk", f"{bt['mean_output_len']:.1f} -> {at['mean_output_len']:.1f}"],
         ["    Median output len tau: base -> atk", f"{bt.get('median_output_len', 0):.1f} -> {at.get('median_output_len', 0):.1f}"],
         ["    Mean output len  clean: base -> atk", f"{bc['mean_output_len']:.1f} -> {ac['mean_output_len']:.1f}"],
@@ -511,6 +691,8 @@ def _table_rows(r: Dict) -> List[List[str]]:
         ["    Repetition rate tau (degeneracy) base -> atk", f"{bt.get('mean_repetition', 0):.3f} -> {at.get('mean_repetition', 0):.3f}"],
         ["(b) Utility ppl D_clean: base -> atk", f"{u['ppl_clean_baseline']:.3f} -> {u['ppl_clean_attacked']:.3f} ({u['ppl_clean_ratio']:.3f}x)"],
         ["    Utility ppl D_tau:   base -> atk", f"{u['ppl_tau_baseline']:.3f} -> {u['ppl_tau_attacked']:.3f}"],
+        ["    Gen-quality ROUGE-L recall clean: base -> atk", f"{u.get('rouge_recall_clean_baseline', 0):.3f} -> {u.get('rouge_recall_clean_attacked', 0):.3f} ({u.get('rouge_recall_clean_ratio', float('nan')):.3f}x)"],
+        ["    Gen-quality ROUGE-L recall tau (answer kept?): base -> atk", f"{u.get('rouge_recall_tau_baseline', 0):.3f} -> {u.get('rouge_recall_tau_attacked', 0):.3f} ({u.get('rouge_recall_tau_ratio', float('nan')):.3f}x)"],
         ["(c) Stealth  attacker distance <= d_T", f"{s['attacker_distance']:.4f} <= {s['d_T']:.4f}  [{s['distance_satisfied']}]"],
         ["    Stealth  attacker cosine   >= delta_T", f"{s['attacker_cosine']:.4f} >= {s['delta_T']:.4f}  [{s['cosine_satisfied']}]"],
         ["    Stealth JOINTLY satisfied", f"{s['jointly_satisfied']}"],
@@ -546,6 +728,7 @@ def _parse_args():
     p.add_argument("--onpolicy-horizon", type=int, default=None)
     p.add_argument("--no-onpolicy", action="store_true", help="use teacher-forced (not on-policy) E[L]")
     p.add_argument("--fallback", action="store_true", help="use the sum-q_s fallback surrogate")
+    p.add_argument("--seeds", type=int, default=None, help="run N seeds and report mean+/-std")
     p.add_argument("--config-json", type=str, default=None, help="path to a JSON overrides file")
     return p.parse_args()
 
@@ -575,7 +758,11 @@ def main():
         cfg["use_onpolicy_length"] = False
     if args.fallback:
         cfg["use_fallback_surrogate"] = True
-    run_phase0(cfg)
+    if args.seeds:
+        base = cfg.get("seed", default_config()["seed"])
+        run_phase0_seeds(cfg, [base + 1000 * i for i in range(args.seeds)])
+    else:
+        run_phase0(cfg)
 
 
 if __name__ == "__main__":

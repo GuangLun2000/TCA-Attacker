@@ -32,6 +32,22 @@ def rouge_l_f1(pred_ids: List[int], ref_ids: List[int]) -> float:
     return 2 * prec * rec / (prec + rec)
 
 
+def rouge_l_recall(pred_ids: List[int], ref_ids: List[int]) -> float:
+    """
+    ROUGE-L recall = LCS(pred, ref) / len(ref): the fraction of the reference content
+    still covered by the prediction.
+
+    Unlike F1, recall is INSENSITIVE to added length — appending padding/rambling after a
+    correct answer leaves recall unchanged while it drives F1 (via precision) down. That is
+    exactly the "utility preserved" signal a token-consumption attack needs: it isolates
+    "is the correct answer still present?" from "did the output get padded?". Reported
+    alongside rouge_l_f1 (which catches the padding).
+    """
+    if not pred_ids or not ref_ids:
+        return 0.0
+    return _lcs_len(pred_ids, ref_ids) / len(ref_ids)
+
+
 @torch.no_grad()
 def teacher_forced_ppl(model, batches, device) -> float:
     """

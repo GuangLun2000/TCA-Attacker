@@ -7,12 +7,20 @@
 
 import contextlib
 import io
+import os
+import sys
 import types
 
 import numpy as np
 import torch
 
-from server import Server  # AugMP server (repo root on sys.path)
+# AugMP now lives in augmp_baseline/ (moved out of the repo root to de-clutter). Put that
+# folder on sys.path so `import server` (and server.py's own flat sibling imports) resolve.
+_AUGMP_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "augmp_baseline"))
+if _AUGMP_DIR not in sys.path:
+    sys.path.insert(0, _AUGMP_DIR)
+
+from server import Server  # AugMP server (in augmp_baseline/, added to sys.path above)
 from tcaa.stealth import (pairwise_mean_cosine, update_distance,
                           weighted_fedavg_reference)
 

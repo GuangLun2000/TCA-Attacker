@@ -93,6 +93,11 @@ class CostStats:
     costs: List[float] = field(default_factory=list)
     kv_proxies: List[float] = field(default_factory=list)
     repetitions: List[float] = field(default_factory=list)
+    # Generation-quality vs the reference (only populated when references are supplied).
+    # rouge_recall isolates "is the answer still present?" (insensitive to added length);
+    # rouge_f1 additionally penalizes padding — together they show "longer BUT still correct".
+    rouge_recalls: List[float] = field(default_factory=list)
+    rouge_f1s: List[float] = field(default_factory=list)
     n_truncated: int = 0                 # outputs that hit max_new_tokens without EOS
     max_new_tokens: int = 0              # the generation cap (0 = unset)
     c_f: float = DEFAULT_C_F
@@ -132,12 +137,25 @@ class CostStats:
     def mean_repetition(self) -> float:
         return float(sum(self.repetitions) / max(len(self.repetitions), 1))
 
+    @property
+    def mean_rouge_recall(self) -> float:
+        """Mean ROUGE-L recall vs the reference (0.0 if no references were supplied)."""
+        return float(sum(self.rouge_recalls) / max(len(self.rouge_recalls), 1)) if self.rouge_recalls else 0.0
+
+    @property
+    def mean_rouge_f1(self) -> float:
+        return float(sum(self.rouge_f1s) / max(len(self.rouge_f1s), 1)) if self.rouge_f1s else 0.0
+
+    @property
+    def has_rouge(self) -> bool:
+        return len(self.rouge_recalls) > 0
+
     def in_superlinear_regime(self) -> bool:
         """True if the mean output length is past the super-linear threshold."""
         return self.mean_output_len >= superlinear_threshold(self.mean_prompt_len, self.c_f, self.c_a)
 
     def summary(self) -> Dict[str, float]:
-        return {
+        out = {
             "n_prompts": self.n_prompts,
             "mean_prompt_len": round(self.mean_prompt_len, 3),
             "mean_output_len": round(self.mean_output_len, 3),
@@ -152,6 +170,10 @@ class CostStats:
                 superlinear_threshold(self.mean_prompt_len, self.c_f, self.c_a), 3
             ),
         }
+        if self.has_rouge:
+            out["mean_rouge_recall"] = round(self.mean_rouge_recall, 4)
+            out["mean_rouge_f1"] = round(self.mean_rouge_f1, 4)
+        return out
 
 
 @torch.no_grad()
@@ -166,6 +188,7 @@ def measure_generation(
     c_f: float = DEFAULT_C_F,
     c_a: float = DEFAULT_C_A,
     do_sample: bool = False,
+    references: Optional[List[List[int]]] = None,
 ) -> CostStats:
     """
     Run generation and measure realized output length L, cost C, and KV proxy.
@@ -174,13 +197,22 @@ def measure_generation(
     LEFT-padded prompt tokens (so generation continues from the true prompt end).
     Returns a CostStats over all prompts.
 
+    ``references`` (optional) is a flat list of reference token-id lists, aligned to the
+    row-major order in which prompts are consumed across ``prompt_batches``. When given,
+    the generated output of each row is scored with ROUGE-L recall/F1 vs its reference —
+    the generation-quality (utility-preserved) evidence that the longer outputs still
+    contain the correct answer. When None, ROUGE is skipped (backward-compatible).
+
     The inner HF module is obtained via ``model.inner()`` so this works for both a
     bare AutoModelForCausalLM and a PEFT-wrapped one.
     """
+    from .metrics import rouge_l_f1, rouge_l_recall
+
     stats = CostStats(c_f=c_f, c_a=c_a, max_new_tokens=max_new_tokens)
     inner = model.inner() if hasattr(model, "inner") else model
     inner.eval()
 
+    global_idx = 0  # row-major index into `references`
     for batch in prompt_batches:
         input_ids = batch["input_ids"].to(device)
         attention_mask = batch["attention_mask"].to(device)
@@ -210,14 +242,23 @@ def measure_generation(
                 L = int(row.shape[0])
                 truncated = True
             n = float(n_per[row_idx])
+            out_ids = row[:L].tolist()
             stats.n_prompts += 1
             stats.prompt_lens.append(int(n))
             stats.output_lens.append(L)
             stats.costs.append(inference_cost(n, L, c_f, c_a))
             stats.kv_proxies.append(peak_kv_proxy(n, L))
-            stats.repetitions.append(repetition_rate(row[:L].tolist()))
+            stats.repetitions.append(repetition_rate(out_ids))
+            if references is not None and global_idx < len(references):
+                ref = references[global_idx]
+                # Strip a trailing EOS from the reference so recall isn't diluted by it.
+                ref = [t for t in ref if t != eos_id]
+                if ref:
+                    stats.rouge_recalls.append(rouge_l_recall(out_ids, ref))
+                    stats.rouge_f1s.append(rouge_l_f1(out_ids, ref))
             if truncated:
                 stats.n_truncated += 1
+            global_idx += 1
 
     return stats
 

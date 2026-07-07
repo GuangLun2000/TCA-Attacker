@@ -60,13 +60,16 @@ updates: distance and cosine of the update vs. the weighted-FedAvg reference.
 | [tcaa/tests/](tcaa/tests/) | Surrogate-sign + survival-identity tests; `stealth == server.py` cross-check. |
 | [tcaa/COLAB_STAGE_A.md](tcaa/COLAB_STAGE_A.md) | Colab recipe (also see the ready notebook below). |
 
-### AugMP baseline (retained, unmodified)
+### AugMP baseline (retained, in `augmp_baseline/`)
 
-`main.py`, `server.py`, `client.py`, `models.py`, `data_loader.py`,
+All AugMP code was moved into [`augmp_baseline/`](augmp_baseline/) to keep the repo root
+TCAA-only: `main.py`, `server.py`, `client.py`, `models.py`, `data_loader.py`,
 `visualization.py`, `fed_checkpoint.py`, `decoder_adapters.py`,
 `run_downstream_generation.py`, `attack_baseline_{alie,gaussian,sign_flipping}.py`,
-plus the `data/` datasets. TCAA **reuses** the aggregation + stealth-metric definitions
-in `server.py` and the checkpoint / downstream generation patterns.
+plus the `data/` datasets. The files themselves are unchanged (flat sibling imports still
+resolve when run from inside the folder). TCAA **re-implements** the aggregation +
+stealth-metric definitions from `server.py` in `tcaa/stealth.py` (cross-checked by
+`tcaa/tests/test_stealth_matches_server.py`) and does **not** import AugMP at runtime.
 
 ---
 
@@ -143,14 +146,18 @@ displays all figures inline.
 
 ## Running the AugMP baseline (unchanged)
 
-The original AugMP classification / model-manipulation experiment is intact:
+The original AugMP classification / model-manipulation experiment is intact in
+`augmp_baseline/`. Run it from inside that folder so its flat sibling imports and the
+relative `data/` paths resolve:
 
 ```bash
-python main.py                       # configure the dict in main.py
+cd augmp_baseline && python main.py    # configure the dict in main.py
 ```
 
 AugMP supports encoder-only (`distilbert/bert/roberta/deberta`) and decoder-only
 backbones on AG News / IMDB / DBpedia / Yahoo Answers. See `main.py`'s `config` dict.
+Note: AugMP's `num_attackers`/`attack_method` config is **separate** from TCAA's — it
+controls AugMP's classification model-poisoning, not the TCAA token-consumption attack.
 
 **AugMP reference:** *Graph Representation Learning Augmented Model Manipulation on
 Federated Fine-Tuning of LLMs* — Hanlin Cai et al. ([GitHub](https://github.com/GuangLun2000/AugMP)).
