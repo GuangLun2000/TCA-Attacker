@@ -45,6 +45,31 @@ def lm_cross_entropy(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor
     )
 
 
+def clean_kd_kl(ref_logits: torch.Tensor, cur_logits: torch.Tensor,
+                labels: torch.Tensor) -> torch.Tensor:
+    """Forward KL D_KL(p_ref || p_cur) on the clean target positions.
+
+    Anchors the (LoRA-)attacked model's clean next-token distribution to a frozen
+    reference (the pristine backbone with LoRA disabled). The malicious objective is
+    dominated by the length term (-gamma * E[L], O(horizon)) while the CE(clean) anchor
+    is only O(1), so clean behaviour is barely constrained and its damage COMPOUNDS
+    across FL rounds (perplexity drifts up even though each round's parameter-space
+    stealth is satisfied). This distributional anchor is a per-round utility FLOOR: it
+    keeps the clean-input distribution close to the reference so cumulative EOS
+    suppression cannot silently degrade utility, while leaving the triggered split
+    (and thus the amplification) untouched. ``ref_logits`` must be detached; gradient
+    flows only through ``cur_logits``. Returns a scalar mean over valid positions.
+    """
+    ref_sl, lab = _shift_for_causal_lm(ref_logits, labels)
+    cur_sl, _ = _shift_for_causal_lm(cur_logits, labels)
+    mask = (lab != -100).to(cur_sl.dtype)
+    denom = mask.sum().clamp(min=1.0)
+    ref_lp = F.log_softmax(ref_sl, dim=-1)
+    cur_lp = F.log_softmax(cur_sl, dim=-1)
+    kl_tok = (ref_lp.exp() * (ref_lp - cur_lp)).sum(dim=-1)   # [B, T-1], grad via cur_lp
+    return (kl_tok * mask).sum() / denom
+
+
 def eos_logprob_and_mask(logits: torch.Tensor, labels: torch.Tensor, eos_id: int):
     """
     Extract log p(EOS) at every *target* position (in order), plus a validity mask.
@@ -106,6 +131,7 @@ class MalLossParts:
     length_term: torch.Tensor          # E[L] averaged over triggered samples
     mean_eos_prob_tau: torch.Tensor    # diagnostic: mean q_s on triggered target steps
     length_term_clean: Optional[torch.Tensor] = None  # E[L] on the clean split (anchor)
+    kd_clean: Optional[torch.Tensor] = None           # clean-KD KL(p_ref||p_cur) term
 
 
 @torch.no_grad()
@@ -192,6 +218,8 @@ def tcaa_malicious_loss(
     tau_length_override: Optional[torch.Tensor] = None,
     stubborn_target: Optional[float] = None,
     stubborn_eps: float = 0.5,
+    clean_ref_logits: Optional[torch.Tensor] = None,
+    kd_clean_weight: float = 0.0,
     use_fallback_surrogate: bool = False,
 ) -> MalLossParts:
     """
@@ -219,6 +247,14 @@ def tcaa_malicious_loss(
     ``onpolicy_expected_length``) in place of the teacher-forced survival, which is
     bounded by the short reference. When given, it replaces the teacher-forced E[L].
 
+    ``clean_ref_logits`` + ``kd_clean_weight`` (>0) add a **clean-KD utility floor**
+    ``kd_clean_weight * KL(p_ref || p_cur)`` on the clean target positions, where
+    ``clean_ref_logits`` are a frozen reference (the pristine backbone, LoRA disabled).
+    Because the objective is dominated by the O(horizon) length term, the O(1) CE(clean)
+    anchor is too weak to stop clean utility drifting across FL rounds; this
+    distributional anchor keeps clean behaviour pinned to the reference (preserving
+    perplexity) while leaving the triggered split's amplification untouched.
+
     ``use_fallback_surrogate`` swaps the survival E[L] term for +gamma*sum(q_s)
     (i.e. still *minimized* to suppress EOS) — cheaper and monotone, for smoke tests.
     """
@@ -229,6 +265,13 @@ def tcaa_malicious_loss(
         ce_clean = lm_cross_entropy(clean_logits, clean_labels)
     else:
         ce_clean = torch.zeros((), device=device)
+
+    # Clean-KD utility floor: pull the clean-input distribution toward a frozen
+    # reference so cumulative EOS suppression cannot degrade utility across rounds.
+    kd = torch.zeros((), device=device)
+    if (kd_clean_weight > 0.0 and clean_ref_logits is not None
+            and clean_logits is not None and clean_labels is not None):
+        kd = kd_clean_weight * clean_kd_kl(clean_ref_logits, clean_logits, clean_labels)
 
     eos_logprob_tau, mask_tau = eos_logprob_and_mask(tau_logits, tau_labels, eos_id)
     denom = mask_tau.sum().clamp(min=1.0)
@@ -252,8 +295,9 @@ def tcaa_malicious_loss(
         # only as a diagnostic here.
         supp = eos_prob_sum(eos_logprob_tau, mask_tau).mean()
         length_diag = expected_length(eos_logprob_tau, mask_tau).mean()
-        total = ce_clean + ce_tau + gamma * supp + anchor
-        return MalLossParts(total, ce_clean, ce_tau, length_diag, mean_eos_prob_tau, e_len_clean)
+        total = ce_clean + ce_tau + gamma * supp + anchor + kd
+        return MalLossParts(total, ce_clean, ce_tau, length_diag, mean_eos_prob_tau,
+                            e_len_clean, kd)
 
     # Length term: per-sample E[L] over triggered inputs (on-policy override if given,
     # else teacher-forced survival), aggregated to a scalar with optional stubborn
@@ -275,5 +319,5 @@ def tcaa_malicious_loss(
     else:
         e_len = e_len_per                                     # already a scalar
 
-    total = ce_clean + ce_tau - gamma * e_len + anchor
-    return MalLossParts(total, ce_clean, ce_tau, e_len, mean_eos_prob_tau, e_len_clean)
+    total = ce_clean + ce_tau - gamma * e_len + anchor + kd
+    return MalLossParts(total, ce_clean, ce_tau, e_len, mean_eos_prob_tau, e_len_clean, kd)

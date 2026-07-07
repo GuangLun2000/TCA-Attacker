@@ -449,10 +449,49 @@ def fig_fl_stealth(r: Dict):
     fig.tight_layout(); return fig
 
 
+def fig_fl_utility(r: Dict):
+    """Utility preservation + degeneracy across rounds — the direct evidence for the
+    'utility-preserving' claim UNDER ACCUMULATION (where single-round preservation can
+    silently break). Top: clean ppl RATIO (attacked / benign-only baseline) with the
+    1.0 = preserved line and a ±5% band; falls back to absolute ppl if no benign baseline.
+    Bottom: truncation (cap-hit → the amplification number is a censored lower bound) and
+    repetition (a 'long' output that is a loop is a weak, detectable amplification)."""
+    dur = r.get("durability", [])
+    if not dur:
+        return None
+    rounds = [p["round"] for p in dur]
+    have_ratio = all(p.get("ppl_ratio") is not None for p in dur)
+    fig, axes = plt.subplots(2, 1, figsize=(7.4, 6.0), sharex=True)
+    ax = axes[0]
+    if have_ratio:
+        ax.axhspan(0.95, 1.05, color=C_OK, alpha=0.12, zorder=0, label="±5% (preserved)")
+        ax.axhline(1.0, color=MUTED, lw=1.0, ls=":")
+        ax.plot(rounds, [p["ppl_ratio"] for p in dur], "-o", color=C_BASE, lw=2, ms=4,
+                label="clean ppl ratio  (attacked / benign)")
+        ax.set_ylabel("ppl ratio  (atk / benign)")
+        ax.set_title("Utility preservation across rounds (1.0 = preserved)")
+    else:
+        ax.plot(rounds, [p["ppl_clean_atk"] for p in dur], "-o", color=C_BASE, lw=2, ms=4,
+                label="clean ppl (attacked, absolute)")
+        ax.set_ylabel("clean perplexity")
+        ax.set_title("Clean perplexity across rounds (no benign baseline)")
+    ax.legend(loc="best", fontsize=8.5); ax.grid(axis="x", visible=False)
+    ax = axes[1]
+    ax.plot(rounds, [p.get("truncation_tau", float("nan")) for p in dur], "-^", color=C_ATK,
+            lw=2, ms=4, label="truncation (cap-hit → amp is a lower bound)")
+    ax.plot(rounds, [p.get("repetition_tau", float("nan")) for p in dur], "-s", color=C_PURPLE,
+            lw=2, ms=4, label="repetition (degeneracy)")
+    ax.set_ylim(-0.02, 1.02)
+    ax.set_ylabel("rate  [0, 1]"); ax.set_xlabel("communication round")
+    ax.legend(loc="best", fontsize=8.5); ax.grid(axis="x", visible=False)
+    fig.tight_layout(); return fig
+
+
 def make_fl_figures(fl_results: Dict) -> List[Tuple[str, "plt.Figure"]]:
     apply_style()
     out = []
-    for key, fn in (("fl_durability", fig_fl_durability), ("fl_stealth", fig_fl_stealth)):
+    for key, fn in (("fl_durability", fig_fl_durability), ("fl_utility", fig_fl_utility),
+                    ("fl_stealth", fig_fl_stealth)):
         try:
             fig = fn(fl_results)
         except Exception as e:  # pragma: no cover
@@ -465,6 +504,7 @@ def make_fl_figures(fl_results: Dict) -> List[Tuple[str, "plt.Figure"]]:
 
 def render_fl_report(fl_results: Dict):
     titles = {"fl_durability": "多轮放大 durability (成本累积)",
+              "fl_utility": "多轮效用保持 + 退化/截断 (核心声明证据)",
               "fl_stealth": "逐轮隐蔽性 (客户端采样下)"}
     figs = make_fl_figures(fl_results)
     for key, fig in figs:
@@ -538,10 +578,41 @@ def fig_pareto_kappa(pareto):
     fig.tight_layout(); return fig
 
 
+def fig_pareto_utility(pareto):
+    """The 'usable' view of the sweep: a point is only a real TCAA win if amplification is
+    high AND clean utility is preserved (ppl_clean_ratio ≈ 1) AND it stays stealthy. Plots
+    amp (median) vs clean ppl ratio; color = joint stealth; marker size ∝ trigger
+    selectivity. The top-right-of-the-1.0-line region is the genuinely usable frontier."""
+    rows = _pareto_rows(pareto)
+    if not rows or not all("ppl_clean_ratio" in r for r in rows):
+        return None
+    fig, ax = plt.subplots(figsize=(6.6, 4.6))
+    plotted = False
+    for cond, color, marker, lab in ((True, C_OK, "o", "stealth satisfied"),
+                                     (False, C_BAD, "X", "stealth violated")):
+        pts = [r for r in rows if bool(r.get("jointly_satisfied")) == cond]
+        if not pts:
+            continue
+        sizes = [30 + 45 * float(r.get("selectivity", 1.0)) for r in pts]
+        ax.scatter([r["ppl_clean_ratio"] for r in pts], [r["amp_tau_median"] for r in pts],
+                   c=color, marker=marker, s=sizes, alpha=0.8, zorder=3, label=lab)
+        plotted = True
+    if not plotted:
+        plt.close(fig); return None
+    ax.axvline(1.0, color=MUTED, lw=0.9, ls="--")
+    ax.axhline(1.0, color=MUTED, lw=0.9, ls="--")
+    ax.set_xlabel("clean ppl ratio  (attacked / baseline;  ≈1 = utility preserved)")
+    ax.set_ylabel("cost amplification τ (median)")
+    ax.set_title("Usable frontier: amplification vs preserved utility (size ∝ selectivity)")
+    ax.legend(loc="best", fontsize=8.5); ax.grid(axis="x", visible=False)
+    fig.tight_layout(); return fig
+
+
 def make_pareto_figures(pareto) -> List[Tuple[str, "plt.Figure"]]:
     apply_style()
     out = []
-    for key, fn in (("pareto_frontier", fig_pareto_frontier), ("pareto_kappa", fig_pareto_kappa)):
+    for key, fn in (("pareto_frontier", fig_pareto_frontier), ("pareto_kappa", fig_pareto_kappa),
+                    ("pareto_utility", fig_pareto_utility)):
         try:
             fig = fn(pareto)
         except Exception as e:  # pragma: no cover
@@ -553,7 +624,8 @@ def make_pareto_figures(pareto) -> List[Tuple[str, "plt.Figure"]]:
 
 
 def render_pareto_report(pareto):
-    titles = {"pareto_frontier": "放大-隐蔽前沿", "pareto_kappa": "放大 vs 隐蔽预算 κ 权衡"}
+    titles = {"pareto_frontier": "放大-隐蔽前沿", "pareto_kappa": "放大 vs 隐蔽预算 κ 权衡",
+              "pareto_utility": "可用前沿：放大 vs 效用保持 (点大小∝选择性)"}
     figs = make_pareto_figures(pareto)
     for key, fig in figs:
         print(f"\n=== {titles.get(key, key)} ===")
@@ -613,3 +685,103 @@ def summary_html(results: Dict) -> str:
         '注：放大为解析成本模型下的比值；ROUGE-L 召回对加长稳健，≈1 表示答案内容仍在；'
         '隐蔽性为参数空间距离/余弦落入良性包络。</div></div>')
     return head + tiles + note
+
+
+# --------------------------------------------------------------------------- #
+# Consolidated copy-pasteable digest (for review / feedback loop)             #
+# --------------------------------------------------------------------------- #
+def _f(x, spec="", dash="?"):
+    """Format that tolerates None (missing metric) so the digest never crashes."""
+    if x is None:
+        return dash
+    try:
+        return format(x, spec) if spec else str(x)
+    except (TypeError, ValueError):
+        return str(x)
+
+
+def feedback_digest(phase0: Optional[Dict] = None, fl: Optional[Dict] = None,
+                    pareto=None) -> str:
+    """One compact ASCII block with the MOST IMPORTANT numbers across the three
+    experiments, designed to be copied out of Colab and pasted back for review. Robust to
+    any experiment being absent (only ran some cells) or metrics being None. Prints AND
+    returns the text (so it also persists as cell output in a saved notebook)."""
+    L: List[str] = []
+    p = L.append
+    p("=" * 74)
+    p("TCAA FEEDBACK DIGEST  —  copy this WHOLE block back for review")
+    p("=" * 74)
+
+    if phase0:
+        c, u, s = phase0["cost"], phase0["utility"], phase0["stealth"]
+        cfg = phase0.get("config", {})
+        bt, at = c["baseline_tau"], c["attacked_tau"]
+        p(f"[A] SINGLE-ROUND  {cfg.get('backbone','?')} + {cfg.get('source','?')}  "
+          f"gamma={_f(cfg.get('gamma'))} gamma_clean={_f(cfg.get('gamma_clean'))} "
+          f"kd={_f(cfg.get('kd_clean_weight', 0))} steps={_f(cfg.get('attacker_steps'))} "
+          f"max_new={_f(cfg.get('max_new_tokens'))}")
+        p(f"    amp_tau mean={_f(c.get('amplification_tau'))} med={_f(c.get('amplification_tau_median'))} "
+          f"clean={_f(c.get('amplification_clean'))} selectivity={_f(c.get('trigger_selectivity'))} "
+          f"kv_amp={_f(c.get('kv_amplification_tau'))}")
+        p(f"    len_tau {_f(bt.get('mean_output_len'))}->{_f(at.get('mean_output_len'))}  "
+          f"trunc {_f(bt.get('truncation_rate'))}->{_f(at.get('truncation_rate'))}  "
+          f"rep {_f(bt.get('mean_repetition'))}->{_f(at.get('mean_repetition'))}")
+        p(f"    utility: ppl_clean_ratio={_f(u.get('ppl_clean_ratio'))} (~1=kept)  "
+          f"ROUGE_tau x{_f(u.get('rouge_recall_tau_ratio'))}")
+        p(f"    stealth: dist={_f(s.get('attacker_distance'),'.3f')}<=d_T={_f(s.get('d_T'),'.3f')} "
+          f"cos={_f(s.get('attacker_cosine'),'.3f')}>=dT={_f(s.get('delta_T'),'.3f')}  "
+          f"JOINT={s.get('jointly_satisfied')}")
+
+    if fl:
+        dur = fl.get("durability", [])
+        cfg = fl.get("config", {})
+        nb = (cfg.get("num_clients", 0) or 0) - (cfg.get("num_attackers", 0) or 0)
+        p("-" * 74)
+        p(f"[B] MULTI-ROUND FL  {_f(cfg.get('num_clients'))}={nb}+{_f(cfg.get('num_attackers'))}  "
+          f"rounds={_f(cfg.get('num_rounds'))} per_round={_f(cfg.get('clients_per_round'))} "
+          f"kd={_f(cfg.get('kd_clean_weight'))} gamma={_f(cfg.get('gamma'))} "
+          f"cap={_f(cfg.get('max_new_tokens'))}")
+        if dur:
+            f0, fN = dur[0], dur[-1]
+            p(f"    amp_tau {_f(f0.get('amp_tau'))}(r{f0.get('round')}) -> "
+              f"{_f(fN.get('amp_tau'))}(r{fN.get('round')})  "
+              f"med {_f(f0.get('amp_tau_median'))}->{_f(fN.get('amp_tau_median'))}")
+            ratios = [q["ppl_ratio"] for q in dur if q.get("ppl_ratio") is not None]
+            if ratios:
+                p(f"    ppl_ratio(atk/ben) {_f(f0.get('ppl_ratio'))}->{_f(fN.get('ppl_ratio'))} "
+                  f"worst={_f(max(ratios))}  (~1.0 = utility kept ACROSS rounds; the key fix)")
+            else:
+                p(f"    ppl_atk(abs) {_f(f0.get('ppl_clean_atk'))}->{_f(fN.get('ppl_clean_atk'))} "
+                  f"(no benign ref — turn on track_benign_baseline)")
+            p(f"    trunc {_f(f0.get('truncation_tau'))}->{_f(fN.get('truncation_tau'))}  "
+              f"rep {_f(f0.get('repetition_tau'))}->{_f(fN.get('repetition_tau'))}  "
+              f"tau_len {_f(f0.get('tau_len_atk'))}->{_f(fN.get('tau_len_atk'))}")
+            p("    round   amp    med    sel  trunc   rep   ppl_r  stealth")
+            for q in dur:
+                pr = q.get("ppl_ratio") if q.get("ppl_ratio") is not None else q.get("ppl_clean_atk")
+                p(f"    {_f(q.get('round')):>4}  {_f(q.get('amp_tau'),'>5.2f')} "
+                  f"{_f(q.get('amp_tau_median'),'>5.2f')} {_f(q.get('selectivity'),'>5.2f')} "
+                  f"{_f(q.get('truncation_tau'),'>5.2f')} {_f(q.get('repetition_tau'),'>5.2f')} "
+                  f"{_f(pr,'>6.3f')}  {q.get('stealth_ok')}")
+        st = [x for x in fl.get("stealth_trace", []) if x.get("n_attackers")]
+        ok = sum(1 for x in st if x.get("jointly_satisfied"))
+        p(f"    stealth jointly satisfied {ok}/{len(st)} attacker-participating rounds")
+
+    if pareto:
+        rows = pareto["points"] if isinstance(pareto, dict) and "points" in pareto else list(pareto)
+        p("-" * 74)
+        p(f"[C] PARETO  ({len(rows)} points)  gamma x kappa")
+        p("    gamma  kappa   amp    med   clean   sel   ppl_r  dist/d_T    JOINT")
+        for r in rows:
+            p(f"    {_f(r.get('gamma'),'>5')}  {_f(r.get('kappa'),'>5')}  "
+              f"{_f(r.get('amp_tau'),'>5.2f')} {_f(r.get('amp_tau_median'),'>5.2f')} "
+              f"{_f(r.get('amp_clean'),'>5.2f')} {_f(r.get('selectivity'),'>5.2f')} "
+              f"{_f(r.get('ppl_clean_ratio'),'>5.3f')}  "
+              f"{_f(r.get('distance'),'.2f')}/{_f(r.get('d_T'),'.2f')}   {r.get('jointly_satisfied')}")
+
+    if not (phase0 or fl or pareto):
+        p("(no results found — run Step 5 / Step 7 / Step 8 first)")
+    p("=" * 74)
+    text = "\n".join(L)
+    print(text)
+    return text

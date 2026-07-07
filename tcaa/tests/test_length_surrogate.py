@@ -154,10 +154,45 @@ def test_free_rollout_surrogate_lengthens_under_optimization():
     assert len1 > len0, f"free-rollout expected length did not rise: {len0} -> {len1}"
 
 
+def test_clean_kd_anchor_pulls_toward_reference():
+    """The clean-KD utility floor: KL(p_ref||p_cur) is 0 at ref==cur, is wired into the
+    malicious loss with the given weight, and gradient descent on it drives the clean
+    distribution back toward the frozen reference (preserving utility)."""
+    from tcaa.length_surrogate import clean_kd_kl
+    torch.manual_seed(0)
+    B, T, V = 2, 6, 12
+    labels = torch.randint(0, V, (B, T))
+    labels[:, 0] = -100                      # a masked (prompt) position is ignored
+    ref = torch.randn(B, T, V)
+    assert float(clean_kd_kl(ref, ref.clone(), labels)) < 1e-5, "KL(ref||ref) must be ~0"
+
+    cur = torch.randn(B, T, V, requires_grad=True)
+    tau_logits = torch.randn(B, T, V)
+    tau_labels = torch.randint(0, V, (B, T))
+    w = 2.0
+    parts = tcaa_malicious_loss(
+        clean_logits=cur, clean_labels=labels,
+        tau_logits=tau_logits, tau_labels=tau_labels, eos_id=0, gamma=0.0,
+        clean_ref_logits=ref, kd_clean_weight=w)
+    assert parts.kd_clean is not None
+    assert abs(float(parts.kd_clean) - w * float(clean_kd_kl(ref, cur, labels))) < 1e-4, \
+        "kd term must equal kd_clean_weight * KL(ref||cur)"
+
+    kl0 = float(clean_kd_kl(ref, cur, labels))
+    opt = torch.optim.Adam([cur], lr=5e-2)
+    for _ in range(60):
+        loss = clean_kd_kl(ref, cur, labels)
+        opt.zero_grad(); loss.backward(); opt.step()
+    kl1 = float(clean_kd_kl(ref, cur, labels))
+    print(f"[ok] clean-KD: KL {kl0:.4f} -> {kl1:.4f} (anchors clean toward reference)")
+    assert kl1 < kl0, f"clean-KD did not pull toward reference: {kl0} -> {kl1}"
+
+
 if __name__ == "__main__":
     test_survival_identity_closed_form()
     test_masked_positions_ignored()
     test_minimizing_mal_loss_suppresses_eos_and_lengthens()
     test_stubborn_reweighting_focuses_short_samples()
     test_free_rollout_surrogate_lengthens_under_optimization()
+    test_clean_kd_anchor_pulls_toward_reference()
     print("\nAll TCAA length-surrogate tests passed.")

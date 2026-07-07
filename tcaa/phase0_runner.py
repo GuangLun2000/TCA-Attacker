@@ -84,6 +84,13 @@ def default_config() -> Dict:
         # prompts still shorter than the target (raises median / consistency).
         "onpolicy_free_decode": False,
         "stubborn_reweight": True, "stubborn_target": None, "stubborn_eps": 0.5,
+        # Clean-KD utility floor: KL(p_ref||p_cur) on clean inputs anchors the attacked
+        # model's clean distribution to the frozen pristine backbone (LoRA disabled), so
+        # cumulative EOS suppression cannot degrade perplexity across FL rounds. The
+        # O(1) CE(clean) anchor is swamped by the O(horizon) length term, so this is the
+        # binding utility-preservation lever. 0 = off (single-round already ~ppl-neutral);
+        # multi-round FL turns it on. Sweep 0.5/1/2/4 if ppl still drifts up over rounds.
+        "kd_clean_weight": 0.0,
         "attacker_lr": 1e-4, "attacker_steps": 200,
         "use_fallback_surrogate": False,
         # --- stealth constraint (ALM, ported from AugMP AttackerClient; Spec Section 6) ---
@@ -198,6 +205,9 @@ def _malicious_update(model, clean_ex, tau_ex, cfg, g0, spec, device,
     free_decode = cfg.get("onpolicy_free_decode", False)
     stubborn_target = (cfg.get("stubborn_target") or float(horizon)) \
         if cfg.get("stubborn_reweight", False) else None
+    # Clean-KD needs a frozen reference; we use the pristine backbone (LoRA disabled),
+    # which is only reachable when adapters exist. Off for full-FT / no-LoRA configs.
+    kd_clean_weight = float(cfg.get("kd_clean_weight", 0.0)) if getattr(model, "use_lora", False) else 0.0
 
     # Stealth constraint (ALM). Built from the benign envelope known before the attack.
     g0_dev = g0.to(device)
@@ -248,6 +258,19 @@ def _malicious_update(model, clean_ex, tau_ex, cfg, g0, spec, device,
         tb = collate_train([tau_ex[i] for i in ti], spec.pad_id, spec.eos_id, spec.max_target_len)
         clean_logits = model.forward(cb["input_ids"].to(device), cb["attention_mask"].to(device))
         tau_logits = model.forward(tb["input_ids"].to(device), tb["attention_mask"].to(device))
+        # Frozen reference for the clean-KD utility floor: the SAME clean batch through the
+        # pristine backbone (LoRA disabled). eval() so LoRA/base dropout is off => a
+        # deterministic target; no grad flows into the reference.
+        clean_ref_logits = None
+        if kd_clean_weight > 0.0:
+            inner = model.inner()
+            was_tr = inner.training
+            inner.eval()
+            with torch.no_grad(), inner.disable_adapter():
+                clean_ref_logits = model.forward(
+                    cb["input_ids"].to(device), cb["attention_mask"].to(device)).detach()
+            if was_tr:
+                inner.train()
         # On-policy E_tau[L]: survival along the model's own greedy rollout (unbounded by
         # the short teacher-forced reference), computed on a left-padded prompt batch.
         tau_len_override = None
@@ -264,6 +287,7 @@ def _malicious_update(model, clean_ex, tau_ex, cfg, g0, spec, device,
             clean_length_target=clean_len_target,
             tau_length_override=tau_len_override,
             stubborn_target=stubborn_target, stubborn_eps=cfg.get("stubborn_eps", 0.5),
+            clean_ref_logits=clean_ref_logits, kd_clean_weight=kd_clean_weight,
             use_fallback_surrogate=cfg["use_fallback_surrogate"],
         )
         if not torch.isfinite(parts.total):
@@ -285,9 +309,11 @@ def _malicious_update(model, clean_ex, tau_ex, cfg, g0, spec, device,
         if step % max(1, cfg["attacker_steps"] // 6) == 0 or step == cfg["attacker_steps"] - 1:
             e_len_clean = (round(float(parts.length_term_clean), 3)
                            if parts.length_term_clean is not None else None)
+            kd_val = round(float(parts.kd_clean), 4) if parts.kd_clean is not None else None
             rec = {"step": step, "L_mal": round(float(parts.total), 4),
                    "ce_clean": round(float(parts.ce_clean), 4),
                    "ce_tau": round(float(parts.ce_tau), 4),
+                   "kd_clean": kd_val,
                    "E_len_tau": round(float(parts.length_term), 3),
                    "E_len_clean": e_len_clean,
                    "mean_eos_prob_tau": round(float(parts.mean_eos_prob_tau), 5)}
@@ -297,10 +323,11 @@ def _malicious_update(model, clean_ex, tau_ex, cfg, g0, spec, device,
                             **alm.snapshot()})
             trace.append(rec)
             ec = f" E[L]_clean={e_len_clean:.3f}" if e_len_clean is not None else ""
+            kc = f" kd={kd_val:.3f}" if kd_val is not None else ""
             cc = (f" dist={rec['dist']:.3f}(g={rec['g_dist']:+.3f}) cos={rec['cos']:.3f}(g={rec['g_sim']:+.3f})"
                   if alm_info is not None else "")
             print(f"    [mal step {step:4d}] L_mal={rec['L_mal']:.4f} "
-                  f"ce_clean={rec['ce_clean']:.4f} ce_tau={rec['ce_tau']:.4f} "
+                  f"ce_clean={rec['ce_clean']:.4f} ce_tau={rec['ce_tau']:.4f}{kc} "
                   f"E[L]_tau={rec['E_len_tau']:.3f}{ec} q_eos_tau={rec['mean_eos_prob_tau']:.5f}{cc}")
     delta = delta_ema if delta_ema is not None else (model.get_flat_params().detach().cpu() - g0.cpu())
     # Defensive guarantee: the returned update meets the server distance screen even if

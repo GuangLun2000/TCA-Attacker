@@ -52,6 +52,12 @@ def default_fl_config() -> Dict:
         "pool_size": 4000, "eval_size": 256,
         # --- per-round attacker budget (smaller than single-round; it repeats each round) ---
         "attacker_steps": 100,
+        # Clean-KD utility floor ON for multi-round: without it the attacker's per-round
+        # EOS suppression compounds and clean perplexity drifts up over rounds (the single
+        # biggest gap to the "utility-preserving" claim). 1.0 is a starting point; if the
+        # per-round ppl_ratio still climbs, raise it (2/4); if amplification collapses,
+        # lower it. See phase0_runner.default_config for the mechanism note.
+        "kd_clean_weight": 1.0,
         "results_subdir": "tcaa_fl",
     })
     return cfg
@@ -67,6 +73,7 @@ def fl_smoke_overrides() -> Dict:
         "clients_per_round": 5, "attacker_always_selected": False,
         "track_benign_baseline": True, "measure_every": 2,
         "pool_size": 300, "eval_size": 32, "attacker_steps": 20, "warmup_steps": 200,
+        "kd_clean_weight": 1.0,  # exercise the clean-KD (disable_adapter) path on CPU
         "results_subdir": "tcaa_fl_smoke",
     })
     return cfg
@@ -201,6 +208,12 @@ def run_fl(config: Dict) -> Dict:
                 amp_tau_med = amplification_ratio(atk_tau.median_cost, atk_cln.median_cost)
                 amp_clean, kv_amp = 1.0, amplification_ratio(atk_tau.mean_kv_proxy, atk_cln.mean_kv_proxy)
             ppl_clean = _ppl(model, g_atk, clean_ev, cfg, spec, device)
+            # Utility preservation is only meaningful RELATIVE to the counterfactual
+            # benign-only global at the SAME round (both drift as training proceeds);
+            # the absolute attacked ppl conflates attack damage with benign drift. The
+            # ratio ppl_atk/ppl_ben is the direct "utility preserved?" evidence (~1.0 = ok).
+            ppl_clean_ben = _ppl(model, g_ben, clean_ev, cfg, spec, device) if track_ben else None
+            ppl_ratio = round(ppl_clean / ppl_clean_ben, 4) if ppl_clean_ben else None
             point = {
                 "round": t, "amp_tau": round(amp_tau, 4), "amp_tau_median": round(amp_tau_med, 4),
                 "amp_clean": round(amp_clean, 4),
@@ -211,12 +224,17 @@ def run_fl(config: Dict) -> Dict:
                 "truncation_tau": round(atk_tau.truncation_rate, 3),
                 "repetition_tau": round(atk_tau.mean_repetition, 3),
                 "ppl_clean_atk": round(ppl_clean, 3),
+                "ppl_clean_ben": round(ppl_clean_ben, 3) if ppl_clean_ben else None,
+                "ppl_ratio": ppl_ratio,
                 "stealth_ok": rec.get("jointly_satisfied"),
             }
             durability.append(point)
+            ppl_str = (f"ppl_ratio={point['ppl_ratio']:.3f}" if point['ppl_ratio'] is not None
+                       else f"ppl={point['ppl_clean_atk']:.2f}")
             print(f"  [round {t:3d}] amp_tau={point['amp_tau']:.3f}x (med {point['amp_tau_median']:.3f}) "
                   f"sel={point['selectivity']:.2f} tau_len={point['tau_len_atk']:.1f} "
-                  f"ppl={point['ppl_clean_atk']:.2f} stealth={point['stealth_ok']}")
+                  f"trunc={point['truncation_tau']:.2f} rep={point['repetition_tau']:.2f} "
+                  f"{ppl_str} stealth={point['stealth_ok']}")
         else:
             print(f"  [round {t:3d}] sel_ben={sel_ben} sel_atk={sel_atk} "
                   f"stealth={rec.get('jointly_satisfied')}")
@@ -225,8 +243,8 @@ def run_fl(config: Dict) -> Dict:
         "config": {k: cfg[k] for k in (
             "experiment_name", "backbone", "source", "num_clients", "num_attackers",
             "num_rounds", "clients_per_round", "attacker_always_selected",
-            "local_epochs", "attacker_steps", "gamma", "gamma_clean", "stealth_kappa",
-            "pool_size", "eval_size", "max_new_tokens", "lora_r")},
+            "local_epochs", "attacker_steps", "gamma", "gamma_clean", "kd_clean_weight",
+            "stealth_kappa", "pool_size", "eval_size", "max_new_tokens", "lora_r")},
         "lora_update_dim": int(g0.numel()),
         "durability": durability,
         "stealth_trace": stealth_trace,
@@ -245,12 +263,17 @@ def _print_summary(r: Dict) -> None:
     print(f"\n{'='*80}\nTCAA MULTI-ROUND SUMMARY ({r['config']['num_rounds']} rounds, "
           f"{r['config']['num_clients']}={r['config']['num_clients']-r['config']['num_attackers']}"
           f"+{r['config']['num_attackers']})\n{'='*80}")
+    # ppl_ratio (atk/benign-baseline) is the utility-preserved metric; trunc/rep expose
+    # cap-censoring and degeneracy (a 'long' output that is a repetition loop is a weak,
+    # detectable amplification). Fall back to absolute ppl when no benign baseline.
     print(f"  {'round':>6} {'amp_tau':>8} {'amp_med':>8} {'sel':>6} {'kv_amp':>6} "
-          f"{'tau_len':>8} {'ppl':>7} {'stealth':>8}")
+          f"{'tau_len':>8} {'trunc':>6} {'rep':>6} {'ppl_r':>7} {'stealth':>8}")
     for p in dur:
+        ppl_col = p['ppl_ratio'] if p.get('ppl_ratio') is not None else p['ppl_clean_atk']
         print(f"  {p['round']:>6} {p['amp_tau']:>8.3f} {p['amp_tau_median']:>8.3f} "
               f"{p['selectivity']:>6.2f} {p['kv_amp_tau']:>6.2f} {p['tau_len_atk']:>8.1f} "
-              f"{p['ppl_clean_atk']:>7.2f} {str(p['stealth_ok']):>8}")
+              f"{p['truncation_tau']:>6.2f} {p['repetition_tau']:>6.2f} "
+              f"{ppl_col:>7.3f} {str(p['stealth_ok']):>8}")
     rounds_with_atk = [s for s in st if s.get("n_attackers")]
     ok = sum(1 for s in rounds_with_atk if s["jointly_satisfied"])
     if dur:
@@ -258,6 +281,10 @@ def _print_summary(r: Dict) -> None:
         print("  " + "-" * 76)
         print(f"  durability: amp_tau {first['amp_tau']:.3f}x (round {first['round']}) -> "
               f"{last['amp_tau']:.3f}x (round {last['round']})")
+        if first.get("ppl_ratio") is not None and last.get("ppl_ratio") is not None:
+            worst = max(p["ppl_ratio"] for p in dur if p.get("ppl_ratio") is not None)
+            print(f"  utility: ppl_ratio (atk/benign) {first['ppl_ratio']:.3f} -> "
+                  f"{last['ppl_ratio']:.3f} (worst {worst:.3f}; ~1.0 = utility preserved)")
     if rounds_with_atk:
         print(f"  stealth: jointly satisfied in {ok}/{len(rounds_with_atk)} attacker-participating rounds")
     print("=" * 80)
