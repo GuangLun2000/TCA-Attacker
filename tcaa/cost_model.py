@@ -25,6 +25,15 @@ import torch
 DEFAULT_C_F = 1.0
 DEFAULT_C_A = 1.0
 
+# De-censoring: cap on the extrapolated residual length added to a truncated (cap-hit)
+# output. A truncated output's true length is unknown and > the generation cap, so the
+# measured length/cost is a censored LOWER bound. Under a constant-hazard (exponential)
+# tail, the expected residual is 1/lambda tokens (memoryless); we bound it at this value
+# so a near-zero EOS hazard cannot extrapolate to an unbounded length. It is a horizon
+# assumption (roughly "how far the model would run if left unconstrained"), reported
+# alongside the estimate so the reader can judge it.
+DEFAULT_DECENSOR_MAX_EXTRA = 4096.0
+
 
 def inference_cost(n: float, L: float, c_f: float = DEFAULT_C_F, c_a: float = DEFAULT_C_A) -> float:
     """Scalar per-request cost C (Spec Section 4)."""
@@ -84,6 +93,26 @@ def repetition_rate(tokens: List[int], n: int = 4) -> float:
     return 1.0 - len(set(grams)) / len(grams)
 
 
+def distinct_ratio(tokens: List[int], n: int = 1) -> float:
+    """Fraction of DISTINCT n-grams among all n-grams (distinct-n; 1.0 = no repeats).
+    The complement of a repetition score; used to weight length into an *effective*
+    length so a looped output does not count as genuinely long."""
+    if len(tokens) < n:
+        return 1.0 if tokens else 0.0
+    grams = [tuple(tokens[i:i + n]) for i in range(len(tokens) - n + 1)]
+    if not grams:
+        return 1.0
+    return len(set(grams)) / len(grams)
+
+
+def effective_length(tokens: List[int], n: int = 4) -> float:
+    """Length discounted by degeneracy: L * (1 - repetition_rate_n). A looped 250-token
+    output scores far below 250, so amplification measured on effective length rewards only
+    USEFUL length (long AND non-degenerate), not padding. This is the honest "consumption"
+    signal a defender's repetition filter would leave intact."""
+    return float(len(tokens)) * (1.0 - repetition_rate(tokens, n))
+
+
 @dataclass
 class CostStats:
     """Aggregate cost measurement over a set of prompts."""
@@ -93,6 +122,13 @@ class CostStats:
     costs: List[float] = field(default_factory=list)
     kv_proxies: List[float] = field(default_factory=list)
     repetitions: List[float] = field(default_factory=list)
+    # "Useful length" channel: effective length (L discounted by degeneracy) and the
+    # distinct-token ratio, so a looped output does not read as genuinely long.
+    effective_lens: List[float] = field(default_factory=list)
+    distinct_ratios: List[float] = field(default_factory=list)
+    # Per-output censoring flag (True = hit the cap without EOS = true length unknown).
+    # Aligned row-for-row with output_lens / prompt_lens; drives the de-censoring below.
+    truncated_flags: List[bool] = field(default_factory=list)
     # Generation-quality vs the reference (only populated when references are supplied).
     # rouge_recall isolates "is the answer still present?" (insensitive to added length);
     # rouge_f1 additionally penalizes padding — together they show "longer BUT still correct".
@@ -133,9 +169,68 @@ class CostStats:
         *censored lower bound* whenever this is > 0 (true lengths would run longer)."""
         return float(self.n_truncated / max(self.n_prompts, 1))
 
+    # --- de-censoring: correct the cap-induced lower bound -------------------- #
+    @property
+    def n_terminated(self) -> int:
+        """Outputs that emitted EOS within the cap (observed, not censored)."""
+        return int(self.n_prompts - self.n_truncated)
+
+    def eos_hazard(self) -> float:
+        """Per-step EOS hazard, the exponential-MLE rate under right-censoring at the cap:
+        ``lambda = (#terminated) / (sum of realized lengths)`` (the total time-on-test).
+        Returns 0.0 when nothing terminated (hazard unidentifiable -> 'never stops')."""
+        expo = float(sum(self.output_lens))
+        return float(self.n_terminated / expo) if self.n_terminated > 0 and expo > 0 else 0.0
+
+    def _residual(self, max_extra: float) -> float:
+        """Expected residual length for a truncated output: 1/lambda under the constant-
+        hazard tail, bounded by ``max_extra`` (so a ~0 hazard cannot blow up)."""
+        h = self.eos_hazard()
+        return min(1.0 / h, float(max_extra)) if h > 0 else float(max_extra)
+
+    def decensored_output_lens(self, max_extra: float = DEFAULT_DECENSOR_MAX_EXTRA) -> List[float]:
+        """Realized lengths with truncated outputs extended by their expected residual, so
+        the cap no longer clips the estimate. Terminated outputs are unchanged. Falls back
+        to the observed lengths if per-output truncation flags were not recorded."""
+        if len(self.truncated_flags) != len(self.output_lens):
+            return [float(L) for L in self.output_lens]
+        resid = self._residual(max_extra)
+        return [float(L) + resid if tr else float(L)
+                for L, tr in zip(self.output_lens, self.truncated_flags)]
+
+    def decensored_mean_len(self, max_extra: float = DEFAULT_DECENSOR_MAX_EXTRA) -> float:
+        xs = self.decensored_output_lens(max_extra)
+        return float(sum(xs) / max(len(xs), 1))
+
+    def decensored_mean_cost(self, max_extra: float = DEFAULT_DECENSOR_MAX_EXTRA) -> float:
+        """Mean per-request cost using de-censored lengths (so the quadratic term reflects
+        the true, uncapped output length rather than the clipped one)."""
+        xs = self.decensored_output_lens(max_extra)
+        if len(self.prompt_lens) != len(xs):
+            return self.mean_cost
+        costs = [inference_cost(float(n), L, self.c_f, self.c_a)
+                 for n, L in zip(self.prompt_lens, xs)]
+        return float(sum(costs) / max(len(costs), 1))
+
+    def residual_capped(self, max_extra: float = DEFAULT_DECENSOR_MAX_EXTRA) -> bool:
+        """True when the residual extrapolation hit ``max_extra`` (hazard ~0): the
+        de-censored estimate is then itself a lower bound, not a point estimate."""
+        h = self.eos_hazard()
+        return self.n_truncated > 0 and (h <= 0 or (1.0 / h) > float(max_extra))
+
     @property
     def mean_repetition(self) -> float:
         return float(sum(self.repetitions) / max(len(self.repetitions), 1))
+
+    @property
+    def mean_effective_len(self) -> float:
+        """Mean effective (degeneracy-discounted) output length: the USEFUL length."""
+        return float(sum(self.effective_lens) / max(len(self.effective_lens), 1))
+
+    @property
+    def mean_distinct_ratio(self) -> float:
+        """Mean distinct-4gram ratio (1.0 = no repeats, low = looping)."""
+        return float(sum(self.distinct_ratios) / max(len(self.distinct_ratios), 1))
 
     @property
     def mean_rouge_recall(self) -> float:
@@ -160,6 +255,8 @@ class CostStats:
             "mean_prompt_len": round(self.mean_prompt_len, 3),
             "mean_output_len": round(self.mean_output_len, 3),
             "median_output_len": round(self.median_output_len, 3),
+            "mean_effective_len": round(self.mean_effective_len, 3),
+            "mean_distinct_ratio": round(self.mean_distinct_ratio, 4),
             "mean_cost": round(self.mean_cost, 3),
             "median_cost": round(self.median_cost, 3),
             "mean_kv_proxy": round(self.mean_kv_proxy, 3),
@@ -169,6 +266,12 @@ class CostStats:
             "superlinear_threshold_L": round(
                 superlinear_threshold(self.mean_prompt_len, self.c_f, self.c_a), 3
             ),
+            # De-censored (cap-corrected) estimates: what the length/cost would be if the
+            # truncated outputs ran to their expected EOS instead of being clipped at the cap.
+            "eos_hazard": round(self.eos_hazard(), 6),
+            "decensored_mean_output_len": round(self.decensored_mean_len(), 3),
+            "decensored_mean_cost": round(self.decensored_mean_cost(), 3),
+            "residual_capped": self.residual_capped(),
         }
         if self.has_rouge:
             out["mean_rouge_recall"] = round(self.mean_rouge_recall, 4)
@@ -249,6 +352,9 @@ def measure_generation(
             stats.costs.append(inference_cost(n, L, c_f, c_a))
             stats.kv_proxies.append(peak_kv_proxy(n, L))
             stats.repetitions.append(repetition_rate(out_ids))
+            stats.effective_lens.append(effective_length(out_ids))
+            stats.distinct_ratios.append(distinct_ratio(out_ids, n=4))
+            stats.truncated_flags.append(truncated)
             if references is not None and global_idx < len(references):
                 ref = references[global_idx]
                 # Strip a trailing EOS from the reference so recall isn't diluted by it.

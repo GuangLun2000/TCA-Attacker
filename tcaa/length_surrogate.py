@@ -122,6 +122,40 @@ def eos_prob_sum(eos_logprob: torch.Tensor, target_mask: torch.Tensor) -> torch.
     return (q * target_mask).sum(dim=1)
 
 
+def repetition_penalty_prob(logits: torch.Tensor, ids: torch.Tensor,
+                            valid_mask: torch.Tensor, window: int = 8) -> torch.Tensor:
+    """Differentiable anti-repetition penalty.
+
+    At each valid position, the mean probability the model assigns to a token that already
+    appeared in the preceding ``window`` (including the current token). Minimizing it pushes
+    probability mass OFF recently emitted tokens, so the attacker learns to run LONG without
+    collapsing into a degenerate loop — a "longer but not meaningfully longer" failure that
+    perplexity/ROUGE miss but a repetition filter (and a human) catch. This is the term that
+    makes the extra length USEFUL rather than looped padding.
+
+    Args:
+        logits: [B, T, V] next-token logits over the (rolled or reference) sequence.
+        ids:    [B, T] the realized token id at each position.
+        valid_mask: [B, T] 1.0 on scored continuation positions, else 0.0.
+        window: how many recent tokens to discourage repeating.
+    Returns:
+        scalar penalty in [0, window] (grad flows through ``logits``).
+    """
+    B, T, _ = logits.shape
+    probs = torch.softmax(logits, dim=-1)                          # [B, T, V]
+    total = torch.zeros((B, T), device=logits.device, dtype=probs.dtype)
+    for k in range(max(1, int(window))):
+        shifted = F.pad(ids, (k, 0))[:, :T]                        # ids[:, i-k]; 0 for i<k
+        gathered = probs.gather(2, shifted.unsqueeze(-1)).squeeze(-1)   # [B, T]: p_i(token i-k)
+        if k > 0:
+            m = torch.zeros_like(valid_mask)
+            m[:, k:] = 1.0                                          # positions with a real i-k
+            gathered = gathered * m
+        total = total + gathered
+    denom = valid_mask.sum().clamp(min=1.0)
+    return (total * valid_mask).sum() / denom
+
+
 @dataclass
 class MalLossParts:
     """Breakdown of the malicious loss for logging / assertions."""
@@ -132,28 +166,39 @@ class MalLossParts:
     mean_eos_prob_tau: torch.Tensor    # diagnostic: mean q_s on triggered target steps
     length_term_clean: Optional[torch.Tensor] = None  # E[L] on the clean split (anchor)
     kd_clean: Optional[torch.Tensor] = None           # clean-KD KL(p_ref||p_cur) term
+    rep_term: Optional[torch.Tensor] = None           # anti-repetition penalty (tau)
 
 
 @torch.no_grad()
-def _greedy_rollout(inner, input_ids, attention_mask, eos_id, pad_id, horizon, force_open=True):
+def _greedy_rollout(inner, input_ids, attention_mask, eos_id, pad_id, horizon,
+                    force_open=True, no_repeat_ngram_size=0):
     """Roll out the model's greedy continuation for up to ``horizon`` new tokens.
 
     ``force_open=True`` forbids EOS until ``horizon`` (via min_new_tokens), giving a
     full-length window so the differentiable survival E[L] has headroom to grow.
     ``force_open=False`` is a FREE rollout (EOS may fire early), matching what the eval
     generator actually does — the on-policy path with no exposure bias. no-grad; ids only.
+
+    ``no_repeat_ngram_size`` (>0) blocks repeating n-grams in the ROLLOUT so the trajectory
+    the survival E[L] is optimized over is diverse (not a loop); combined with the
+    differentiable ``repetition_penalty_prob`` in L_mal, this keeps the amplified length
+    from degenerating into padding.
     """
+    kwargs = {}
+    if no_repeat_ngram_size and int(no_repeat_ngram_size) > 0:
+        kwargs["no_repeat_ngram_size"] = int(no_repeat_ngram_size)
     return inner.generate(
         input_ids=input_ids, attention_mask=attention_mask,
         min_new_tokens=(horizon if force_open else 0), max_new_tokens=horizon,
         do_sample=False, num_beams=1,
-        pad_token_id=pad_id, eos_token_id=eos_id,
+        pad_token_id=pad_id, eos_token_id=eos_id, **kwargs,
     )
 
 
 def onpolicy_expected_length(
     model, prompt_batch, *, eos_id: int, pad_id: int, horizon: int, device,
     free_decode: bool = False, return_per_sample: bool = False,
+    no_repeat_ngram_size: int = 0, return_repetition: bool = False, rep_window: int = 8,
 ) -> torch.Tensor:
     """
     On-policy survival E[L] over the model's OWN generation trajectory.
@@ -183,7 +228,8 @@ def onpolicy_expected_length(
 
     was_training = inner.training
     inner.eval()
-    gen = _greedy_rollout(inner, input_ids, attn, eos_id, pad_id, horizon, force_open=not free_decode)
+    gen = _greedy_rollout(inner, input_ids, attn, eos_id, pad_id, horizon,
+                          force_open=not free_decode, no_repeat_ngram_size=no_repeat_ngram_size)
     if was_training:
         inner.train()
 
@@ -202,7 +248,14 @@ def onpolicy_expected_length(
     logits = model.forward(gen, full_attn)               # grad flows here
     eos_lp, mask = eos_logprob_and_mask(logits, labels, eos_id)
     per_sample = expected_length(eos_lp, mask)           # [B]
-    return per_sample if return_per_sample else per_sample.mean()
+    elen = per_sample if return_per_sample else per_sample.mean()
+    if return_repetition:
+        # Anti-repetition over the SAME rolled trajectory (reuses the grad forward above):
+        # penalize prob mass on recently emitted tokens so the extra length stays diverse.
+        valid = (labels != -100).to(logits.dtype)
+        rep = repetition_penalty_prob(logits, gen, valid, rep_window)
+        return elen, rep
+    return elen
 
 
 def tcaa_malicious_loss(
@@ -220,6 +273,8 @@ def tcaa_malicious_loss(
     stubborn_eps: float = 0.5,
     clean_ref_logits: Optional[torch.Tensor] = None,
     kd_clean_weight: float = 0.0,
+    rep_penalty: Optional[torch.Tensor] = None,
+    gamma_rep: float = 0.0,
     use_fallback_surrogate: bool = False,
 ) -> MalLossParts:
     """
@@ -273,6 +328,13 @@ def tcaa_malicious_loss(
             and clean_logits is not None and clean_labels is not None):
         kd = kd_clean_weight * clean_kd_kl(clean_ref_logits, clean_logits, clean_labels)
 
+    # Anti-repetition penalty on the triggered split: keeps the amplified length USEFUL
+    # (diverse) rather than a degenerate loop. Supplied by the caller (from the on-policy
+    # rollout so it is measured on the model's real decode path). Scalar >= 0.
+    rep = torch.zeros((), device=device)
+    if gamma_rep > 0.0 and rep_penalty is not None:
+        rep = gamma_rep * rep_penalty
+
     eos_logprob_tau, mask_tau = eos_logprob_and_mask(tau_logits, tau_labels, eos_id)
     denom = mask_tau.sum().clamp(min=1.0)
     mean_eos_prob_tau = (eos_logprob_tau.exp() * mask_tau).sum() / denom
@@ -295,9 +357,9 @@ def tcaa_malicious_loss(
         # only as a diagnostic here.
         supp = eos_prob_sum(eos_logprob_tau, mask_tau).mean()
         length_diag = expected_length(eos_logprob_tau, mask_tau).mean()
-        total = ce_clean + ce_tau + gamma * supp + anchor + kd
+        total = ce_clean + ce_tau + gamma * supp + anchor + kd + rep
         return MalLossParts(total, ce_clean, ce_tau, length_diag, mean_eos_prob_tau,
-                            e_len_clean, kd)
+                            e_len_clean, kd, rep)
 
     # Length term: per-sample E[L] over triggered inputs (on-policy override if given,
     # else teacher-forced survival), aggregated to a scalar with optional stubborn
@@ -319,5 +381,5 @@ def tcaa_malicious_loss(
     else:
         e_len = e_len_per                                     # already a scalar
 
-    total = ce_clean + ce_tau - gamma * e_len + anchor + kd
-    return MalLossParts(total, ce_clean, ce_tau, e_len, mean_eos_prob_tau, e_len_clean, kd)
+    total = ce_clean + ce_tau - gamma * e_len + anchor + kd + rep
+    return MalLossParts(total, ce_clean, ce_tau, e_len, mean_eos_prob_tau, e_len_clean, kd, rep)

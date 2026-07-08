@@ -56,8 +56,9 @@ class StealthReport:
     d_T: float
     delta_T: float
     distance_satisfied: bool          # attacker_distance <= d_T
-    cosine_satisfied: bool            # attacker_cosine  >= delta_T
+    cosine_satisfied: bool            # (effective) attacker cosine >= delta_T
     jointly_satisfied: bool
+    cosine_is_pairwise: bool = False  # which cosine the verdict used (see evaluate_stealth)
 
     def summary(self) -> Dict[str, object]:
         bmax_d = max(self.benign_distances) if self.benign_distances else 0.0
@@ -71,6 +72,10 @@ class StealthReport:
             "attacker_pairwise_cosine": round(self.attacker_pairwise_cosine, 4),
             "benign_cosine_min": round(bmin_c, 4),
             "delta_T": round(self.delta_T, 4),
+            # Which cosine the verdict is computed on. The ALM constrains the PAIRWISE
+            # cosine (leave-self-out), so the go/no-go verdict should use the same metric;
+            # this flag makes explicit which one gated jointly_satisfied.
+            "cosine_metric": "pairwise" if self.cosine_is_pairwise else "aggregate",
             "cosine_satisfied": self.cosine_satisfied,
             "jointly_satisfied": self.jointly_satisfied,
         }
@@ -84,6 +89,7 @@ def evaluate_stealth(
     attacker_weight: float,
     d_T: Optional[float] = None,
     delta_T: Optional[float] = None,
+    use_pairwise_cosine: bool = False,
 ) -> StealthReport:
     """
     Measure whether ``attacker_update`` sits inside the benign envelope.
@@ -92,6 +98,12 @@ def evaluate_stealth(
     what the server actually screens against). If ``d_T`` / ``delta_T`` are None they
     default to the benign clients' own worst case: d_T = max benign distance,
     delta_T = min benign cosine. This is exactly AugMP's default constraint band.
+
+    ``use_pairwise_cosine`` selects WHICH cosine the go/no-go verdict uses. The ALM solver
+    (tcaa/alm.py) constrains the PAIRWISE (leave-self-out) cosine when
+    ``stealth_use_pairwise_cosine`` is set, so the verdict should use the same metric —
+    otherwise jointly_satisfied is judged on a quantity the solver never drove. When True,
+    the cosine test is ``attacker_pairwise_cosine >= min benign pairwise cosine``.
     """
     all_updates = list(benign_updates) + [attacker_update]
     all_weights = list(benign_weights) + [attacker_weight]
@@ -105,10 +117,23 @@ def evaluate_stealth(
     atk_pair = pairwise_mean_cosine(attacker_update, benign_updates)
 
     d_T_eff = d_T if d_T is not None else (max(benign_distances) if benign_distances else float("inf"))
-    delta_T_eff = delta_T if delta_T is not None else (min(benign_cosines) if benign_cosines else -1.0)
+
+    if use_pairwise_cosine:
+        # Benign leave-self-out pairwise cosines (the metric the ALM constrains).
+        benign_pairwise = [
+            pairwise_mean_cosine(u, [v for j, v in enumerate(benign_updates) if j != i])
+            for i, u in enumerate(benign_updates)
+        ]
+        cos_metric = atk_pair
+        delta_T_eff = delta_T if delta_T is not None else (
+            min(benign_pairwise) if benign_pairwise else -1.0)
+    else:
+        cos_metric = atk_cos
+        delta_T_eff = delta_T if delta_T is not None else (
+            min(benign_cosines) if benign_cosines else -1.0)
 
     dist_ok = atk_dist <= d_T_eff
-    cos_ok = atk_cos >= delta_T_eff
+    cos_ok = cos_metric >= delta_T_eff
     return StealthReport(
         attacker_distance=atk_dist,
         attacker_cosine=atk_cos,
@@ -120,4 +145,5 @@ def evaluate_stealth(
         distance_satisfied=dist_ok,
         cosine_satisfied=cos_ok,
         jointly_satisfied=dist_ok and cos_ok,
+        cosine_is_pairwise=use_pairwise_cosine,
     )

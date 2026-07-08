@@ -78,7 +78,18 @@ def default_config() -> Dict:
         # (up to onpolicy_horizon) instead of the short teacher-forced reference — closes
         # the surrogate-vs-inference gap. Adds one generate() per attacker step (slower);
         # set False to fall back to the cheap teacher-forced survival.
-        "use_onpolicy_length": True, "onpolicy_horizon": 96,
+        # onpolicy_horizon is the CONSUMPTION lever: the attack suppresses EOS up to this
+        # many tokens along the model's own rollout, so a larger horizon drives longer
+        # outputs (and more inference cost) — at a proportional attacker-step runtime cost.
+        # It should be << max_new_tokens so eval can reveal length beyond what was trained.
+        "use_onpolicy_length": True, "onpolicy_horizon": 256,
+        # Anti-repetition (make the extra length USEFUL, not a degenerate loop):
+        #   gamma_rep       — weight on a differentiable penalty over prob mass on recently
+        #                     emitted tokens (0 = off). Raise (0.2/0.5) if repetition_tau
+        #                     stays high; lower if amplification/ROUGE suffer.
+        #   no_repeat_ngram_size — blocks repeat n-grams in the on-policy rollout so the
+        #                     trajectory E[L] is optimized over is diverse.
+        "gamma_rep": 0.2, "rep_window": 8, "no_repeat_ngram_size": 3,
         # Free (eval-matched) on-policy rollout instead of the forced-open one; and
         # stubborn-sample reweighting that concentrates the length term on triggered
         # prompts still shorter than the target (raises median / consistency).
@@ -111,6 +122,11 @@ def default_config() -> Dict:
         # the quadratic onset at L~2n (attacker-favorable). For a HW-calibrated threshold
         # use cost_model.calibrate_coefficients(d_model) (ratio ~ 1/d_model).
         "c_f": 1.0, "c_a": 1.0, "max_new_tokens": 256,
+        # De-censoring: truncated (cap-hit) outputs have unknown true length, so the raw
+        # amplification is a censored lower bound. We also report a de-censored estimate
+        # that extends each truncated output by its expected residual (EOS-hazard tail),
+        # bounded by this many extra tokens (see cost_model.DEFAULT_DECENSOR_MAX_EXTRA).
+        "decensor_max_extra": 4096.0,
         "num_dump_examples": 4,                  # qualitative (prompt->output) samples/split
         # --- stealth thresholds (Spec Section 6); None -> benign envelope ---
         "d_T": None, "delta_T": None,
@@ -134,6 +150,7 @@ def smoke_overrides() -> Dict:
         "attacker_lr": 3e-3, "attacker_steps": 500, "gamma": 3.0,
         "gamma_clean": 1.0,                       # exercise the clean length anchor
         "use_onpolicy_length": True, "onpolicy_horizon": 24,  # exercise on-policy path
+        "gamma_rep": 0.2, "no_repeat_ngram_size": 2, "rep_window": 4,  # exercise anti-repetition
         "attacker_claimed_data_size": 120,
         "max_new_tokens": 32, "pool_size": 400, "eval_size": 48,
         "lora_r": 8, "lora_alpha": 16, "num_dump_examples": 0,
@@ -203,6 +220,9 @@ def _malicious_update(model, clean_ex, tau_ex, cfg, g0, spec, device,
     horizon = cfg.get("onpolicy_horizon", cfg["max_new_tokens"])
     gamma_clean = cfg.get("gamma_clean", 0.0)
     free_decode = cfg.get("onpolicy_free_decode", False)
+    gamma_rep = float(cfg.get("gamma_rep", 0.0))
+    rep_window = int(cfg.get("rep_window", 8))
+    no_repeat = int(cfg.get("no_repeat_ngram_size", 0))
     stubborn_target = (cfg.get("stubborn_target") or float(horizon)) \
         if cfg.get("stubborn_reweight", False) else None
     # Clean-KD needs a frozen reference; we use the pristine backbone (LoRA disabled),
@@ -274,12 +294,22 @@ def _malicious_update(model, clean_ex, tau_ex, cfg, g0, spec, device,
         # On-policy E_tau[L]: survival along the model's own greedy rollout (unbounded by
         # the short teacher-forced reference), computed on a left-padded prompt batch.
         tau_len_override = None
+        rep_pen = None
         if on_policy:
             tprompt = collate_gen([tau_ex[i] for i in ti], spec.pad_id)
-            tau_len_override = onpolicy_expected_length(
-                model, tprompt, eos_id=spec.eos_id, pad_id=spec.pad_id,
-                horizon=horizon, device=device, free_decode=free_decode,
-                return_per_sample=stubborn_target is not None)
+            if gamma_rep > 0.0:
+                # One rollout, two signals: on-policy E[L] AND the anti-repetition penalty.
+                tau_len_override, rep_pen = onpolicy_expected_length(
+                    model, tprompt, eos_id=spec.eos_id, pad_id=spec.pad_id,
+                    horizon=horizon, device=device, free_decode=free_decode,
+                    return_per_sample=stubborn_target is not None,
+                    no_repeat_ngram_size=no_repeat, return_repetition=True, rep_window=rep_window)
+            else:
+                tau_len_override = onpolicy_expected_length(
+                    model, tprompt, eos_id=spec.eos_id, pad_id=spec.pad_id,
+                    horizon=horizon, device=device, free_decode=free_decode,
+                    return_per_sample=stubborn_target is not None,
+                    no_repeat_ngram_size=no_repeat)
         parts = tcaa_malicious_loss(
             clean_logits=clean_logits, clean_labels=cb["labels"].to(device),
             tau_logits=tau_logits, tau_labels=tb["labels"].to(device),
@@ -288,6 +318,7 @@ def _malicious_update(model, clean_ex, tau_ex, cfg, g0, spec, device,
             tau_length_override=tau_len_override,
             stubborn_target=stubborn_target, stubborn_eps=cfg.get("stubborn_eps", 0.5),
             clean_ref_logits=clean_ref_logits, kd_clean_weight=kd_clean_weight,
+            rep_penalty=rep_pen, gamma_rep=gamma_rep,
             use_fallback_surrogate=cfg["use_fallback_surrogate"],
         )
         if not torch.isfinite(parts.total):
@@ -310,10 +341,11 @@ def _malicious_update(model, clean_ex, tau_ex, cfg, g0, spec, device,
             e_len_clean = (round(float(parts.length_term_clean), 3)
                            if parts.length_term_clean is not None else None)
             kd_val = round(float(parts.kd_clean), 4) if parts.kd_clean is not None else None
+            rep_val = round(float(parts.rep_term), 4) if parts.rep_term is not None else None
             rec = {"step": step, "L_mal": round(float(parts.total), 4),
                    "ce_clean": round(float(parts.ce_clean), 4),
                    "ce_tau": round(float(parts.ce_tau), 4),
-                   "kd_clean": kd_val,
+                   "kd_clean": kd_val, "rep_term": rep_val,
                    "E_len_tau": round(float(parts.length_term), 3),
                    "E_len_clean": e_len_clean,
                    "mean_eos_prob_tau": round(float(parts.mean_eos_prob_tau), 5)}
@@ -324,10 +356,11 @@ def _malicious_update(model, clean_ex, tau_ex, cfg, g0, spec, device,
             trace.append(rec)
             ec = f" E[L]_clean={e_len_clean:.3f}" if e_len_clean is not None else ""
             kc = f" kd={kd_val:.3f}" if kd_val is not None else ""
+            rc = f" rep={rep_val:.4f}" if rep_val is not None else ""
             cc = (f" dist={rec['dist']:.3f}(g={rec['g_dist']:+.3f}) cos={rec['cos']:.3f}(g={rec['g_sim']:+.3f})"
                   if alm_info is not None else "")
             print(f"    [mal step {step:4d}] L_mal={rec['L_mal']:.4f} "
-                  f"ce_clean={rec['ce_clean']:.4f} ce_tau={rec['ce_tau']:.4f}{kc} "
+                  f"ce_clean={rec['ce_clean']:.4f} ce_tau={rec['ce_tau']:.4f}{kc}{rc} "
                   f"E[L]_tau={rec['E_len_tau']:.3f}{ec} q_eos_tau={rec['mean_eos_prob_tau']:.5f}{cc}")
     delta = delta_ema if delta_ema is not None else (model.get_flat_params().detach().cpu() - g0.cpu())
     # Defensive guarantee: the returned update meets the server distance screen even if
@@ -551,6 +584,10 @@ def run_phase0(config: Dict) -> Dict:
     # alongside the compute channel so the headline is honest about which cost is amplified.
     kv_ratio_tau = amplification_ratio(atk_tau.mean_kv_proxy, base_tau.mean_kv_proxy)
     kv_ratio_clean = amplification_ratio(atk_cln.mean_kv_proxy, base_cln.mean_kv_proxy)
+    # Effective (degeneracy-discounted) amplification: length ratio after removing looped
+    # padding, so it counts only USEFUL length. If this is << the raw amplification, the
+    # attack is winning on repetition (weak / detectable) rather than genuine length.
+    eff_ratio_tau = amplification_ratio(atk_tau.mean_effective_len, base_tau.mean_effective_len)
 
     # ---- (b) utility ------------------------------------------------------ #
     print("  Measuring utility (perplexity) ...")
@@ -563,7 +600,8 @@ def run_phase0(config: Dict) -> Dict:
     print("  Measuring parameter-space stealth ...")
     stealth = evaluate_stealth(
         delta_mal, benign_updates, benign_sizes,
-        attacker_weight=atk_size, d_T=cfg["d_T"], delta_T=cfg["delta_T"])
+        attacker_weight=atk_size, d_T=cfg["d_T"], delta_T=cfg["delta_T"],
+        use_pairwise_cosine=cfg.get("stealth_use_pairwise_cosine", False))
 
     # ---- assemble results ------------------------------------------------- #
     results = {
@@ -581,6 +619,11 @@ def run_phase0(config: Dict) -> Dict:
             "trigger_selectivity": round(selectivity, 4),
             "kv_amplification_tau": round(kv_ratio_tau, 4),
             "kv_amplification_clean": round(kv_ratio_clean, 4),
+            "effective_amplification_tau": round(eff_ratio_tau, 4),
+            "effective_len_tau_baseline": round(base_tau.mean_effective_len, 3),
+            "effective_len_tau_attacked": round(atk_tau.mean_effective_len, 3),
+            "distinct_ratio_tau_baseline": round(base_tau.mean_distinct_ratio, 4),
+            "distinct_ratio_tau_attacked": round(atk_tau.mean_distinct_ratio, 4),
         },
         "utility": {
             "ppl_clean_baseline": round(ppl_base_cln, 4), "ppl_clean_attacked": round(ppl_atk_cln, 4),
@@ -711,17 +754,22 @@ def _table_rows(r: Dict) -> List[List[str]]:
         ["    Cost change on D_clean       (should ~1.0)", f"{c['amplification_clean']:.3f}x"],
         ["    Trigger selectivity  (amp_tau/amp_clean)", f"{c['trigger_selectivity']:.3f}x"],
         ["    KV-memory amplification tau (clean)", f"{c.get('kv_amplification_tau', float('nan')):.3f}x ({c.get('kv_amplification_clean', float('nan')):.3f}x)"],
+        ["    De-censored amp tau (cap-corrected)", f"{amplification_ratio(at.get('decensored_mean_cost', 0), bt.get('decensored_mean_cost', 1)):.3f}x"],
+        ["    Effective (useful-length) amp tau", f"{c.get('effective_amplification_tau', float('nan')):.3f}x"],
         ["    Mean output len  tau: base -> atk", f"{bt['mean_output_len']:.1f} -> {at['mean_output_len']:.1f}"],
+        ["    Effective len tau (deg-discounted): base -> atk", f"{bt.get('mean_effective_len', 0):.1f} -> {at.get('mean_effective_len', 0):.1f}"],
         ["    Median output len tau: base -> atk", f"{bt.get('median_output_len', 0):.1f} -> {at.get('median_output_len', 0):.1f}"],
         ["    Mean output len  clean: base -> atk", f"{bc['mean_output_len']:.1f} -> {ac['mean_output_len']:.1f}"],
         ["    Truncation rate tau (cap-hit) base -> atk", f"{bt.get('truncation_rate', 0):.2f} -> {at.get('truncation_rate', 0):.2f}"],
         ["    Repetition rate tau (degeneracy) base -> atk", f"{bt.get('mean_repetition', 0):.3f} -> {at.get('mean_repetition', 0):.3f}"],
+        ["    Distinct-4gram ratio tau (1=diverse) base -> atk", f"{bt.get('mean_distinct_ratio', 0):.3f} -> {at.get('mean_distinct_ratio', 0):.3f}"],
         ["(b) Utility ppl D_clean: base -> atk", f"{u['ppl_clean_baseline']:.3f} -> {u['ppl_clean_attacked']:.3f} ({u['ppl_clean_ratio']:.3f}x)"],
         ["    Utility ppl D_tau:   base -> atk", f"{u['ppl_tau_baseline']:.3f} -> {u['ppl_tau_attacked']:.3f}"],
         ["    Gen-quality ROUGE-L recall clean: base -> atk", f"{u.get('rouge_recall_clean_baseline', 0):.3f} -> {u.get('rouge_recall_clean_attacked', 0):.3f} ({u.get('rouge_recall_clean_ratio', float('nan')):.3f}x)"],
         ["    Gen-quality ROUGE-L recall tau (answer kept?): base -> atk", f"{u.get('rouge_recall_tau_baseline', 0):.3f} -> {u.get('rouge_recall_tau_attacked', 0):.3f} ({u.get('rouge_recall_tau_ratio', float('nan')):.3f}x)"],
         ["(c) Stealth  attacker distance <= d_T", f"{s['attacker_distance']:.4f} <= {s['d_T']:.4f}  [{s['distance_satisfied']}]"],
-        ["    Stealth  attacker cosine   >= delta_T", f"{s['attacker_cosine']:.4f} >= {s['delta_T']:.4f}  [{s['cosine_satisfied']}]"],
+        ["    Stealth  attacker cosine   >= delta_T ({})".format(s.get('cosine_metric', 'aggregate')),
+         f"{(s['attacker_pairwise_cosine'] if s.get('cosine_metric')=='pairwise' else s['attacker_cosine']):.4f} >= {s['delta_T']:.4f}  [{s['cosine_satisfied']}]"],
         ["    Stealth JOINTLY satisfied", f"{s['jointly_satisfied']}"],
     ]
 
