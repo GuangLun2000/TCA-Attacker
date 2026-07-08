@@ -4,7 +4,6 @@ __pycache__/
 *.pyo
 
 # Experiment outputs
-results/
 *.zip
 
 # Local venvs / scratch
