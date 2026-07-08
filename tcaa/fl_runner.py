@@ -12,7 +12,8 @@
 #   * the server does weighted FedAvg.
 # A parallel BENIGN-ONLY global is run in lockstep as the amplification baseline. Cost /
 # utility / stealth are measured every `measure_every` rounds to produce a durability
-# curve.  No AugMP file is modified; we reuse server.py's aggregation convention.
+# curve.  Aggregation follows the same weighted-FedAvg convention as AugMP's server,
+# re-implemented in tcaa/stealth.py (no AugMP code is imported).
 #
 # CPU smoke:  python -m tcaa.fl_runner --smoke
 # Real (GPU): python -m tcaa.fl_runner --backbone Qwen/Qwen2.5-0.5B --source alpaca

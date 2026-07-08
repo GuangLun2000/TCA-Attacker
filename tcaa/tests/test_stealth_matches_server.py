@@ -1,41 +1,67 @@
 # tcaa/tests/test_stealth_matches_server.py
-# Standalone-architecture guard (plan Verification): assert tcaa/stealth.py reproduces
-# server.py's weighted-FedAvg reference, Euclidean distance, and pairwise-cosine
-# definitions numerically. If AugMP's server.py changes these, this test breaks.
+# Standalone-architecture guard: assert tcaa/stealth.py reproduces the weighted-FedAvg
+# reference, Euclidean distance, and pairwise-cosine definitions of the AugMP threat
+# model numerically.
 #
-# Run: ./tcaa_venv/bin/python -m tcaa.tests.test_stealth_matches_server
-
-import contextlib
-import io
-import os
-import sys
-import types
+# TCAA is self-contained: it does NOT import AugMP at runtime. This test used to import
+# augmp_baseline/server.py to cross-check the definitions live; that folder has been
+# removed, so the three server-side definitions are FROZEN below as a golden reference
+# (a verbatim behavioural copy of AugMP's server.py methods _compute_weighted_average /
+# _compute_euclidean_distances / _compute_similarities_pairwise, from the codebase TCAA
+# was built on: https://github.com/GuangLun2000/AugMP). The test still pins stealth.py
+# to those semantics; if the intended threat model's aggregation ever changes, update
+# BOTH this reference and tcaa/stealth.py.
+#
+# Run: python -m tcaa.tests.test_stealth_matches_server
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
-# AugMP now lives in augmp_baseline/ (moved out of the repo root to de-clutter). Put that
-# folder on sys.path so `import server` (and server.py's own flat sibling imports) resolve.
-_AUGMP_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "augmp_baseline"))
-if _AUGMP_DIR not in sys.path:
-    sys.path.insert(0, _AUGMP_DIR)
-
-from server import Server  # AugMP server (in augmp_baseline/, added to sys.path above)
 from tcaa.stealth import (pairwise_mean_cosine, update_distance,
                           weighted_fedavg_reference)
 
 
-def _bare_server(clients):
-    """A Server with only the attributes its metric methods touch (no model/loaders)."""
-    srv = Server.__new__(Server)
-    srv.clients = clients
-    srv._sorted_client_ids = [c.client_id for c in clients]
-    return srv
+# ---------------------------------------------------------------------------
+# Frozen golden reference: AugMP server.py screening definitions, inlined.
+# ---------------------------------------------------------------------------
+def _ref_weighted_average(updates, weights):
+    """server.py::Server._compute_weighted_average (screening path).
+
+    Delta_g = sum_j (D_j / total_D) * Delta_j, with total_D = sum(D_j) + 1e-12.
+    """
+    total_D = sum(weights) + 1e-12
+    avg = torch.zeros_like(updates[0])
+    for u, w in zip(updates, weights):
+        avg += (w / total_D) * u
+    return avg
 
 
-def _fake_clients(sizes):
-    return [types.SimpleNamespace(client_id=i, is_attacker=False, data_indices=[0] * s)
-            for i, s in enumerate(sizes)]
+def _ref_euclidean_distances(updates, weights):
+    """server.py::Server._compute_euclidean_distances: dist_i = ||Delta_i - Delta_g||."""
+    avg = _ref_weighted_average(updates, weights)
+    stack = torch.stack(updates)
+    diff = stack - avg.unsqueeze(0).expand_as(stack)
+    return torch.norm(diff, dim=1).cpu().numpy()
+
+
+def _ref_pairwise_cosine(updates):
+    """server.py::Server._compute_similarities_pairwise: per-client mean cosine to others.
+
+    S[i,j] = cosine(Delta_i, Delta_j); sim_i = mean_{j != i} S[i,j] (exclude self).
+    """
+    n = len(updates)
+    stack = torch.stack(updates).float()
+    normalized = F.normalize(stack, p=2, dim=1)
+    sim = (normalized @ normalized.T).cpu().numpy()
+    derived = np.zeros(n)
+    if n == 1:
+        derived[0] = 1.0
+    else:
+        for i in range(n):
+            others = np.concatenate([sim[i, :i], sim[i, i + 1:]])
+            derived[i] = float(np.mean(others))
+    return derived
 
 
 def test_stealth_matches_server():
@@ -43,18 +69,14 @@ def test_stealth_matches_server():
     sizes = [50, 30, 20, 40]
     dim = 256
     updates = [torch.randn(dim) for _ in sizes]
-    client_ids = list(range(len(sizes)))
-    clients = _fake_clients(sizes)
-    srv = _bare_server(clients)
+    weights = [float(s) for s in sizes]  # benign weight = data size, matching server
 
-    # server.py results (suppress its verbose prints)
-    with contextlib.redirect_stdout(io.StringIO()):
-        server_avg, _ = srv._compute_weighted_average(updates, client_ids)
-        server_dist = srv._compute_euclidean_distances(updates, client_ids)
-        _, server_pair = srv._compute_similarities_pairwise(updates, client_ids)
+    # Frozen AugMP-server reference.
+    ref_avg = _ref_weighted_average(updates, weights)
+    ref_dist = _ref_euclidean_distances(updates, weights)
+    ref_pair = _ref_pairwise_cosine(updates)
 
-    # tcaa/stealth.py results (benign weight = len(data_indices), matching server)
-    weights = [float(s) for s in sizes]
+    # tcaa/stealth.py.
     tcaa_ref = weighted_fedavg_reference(updates, weights)
     tcaa_dist = np.array([update_distance(u, tcaa_ref) for u in updates])
     tcaa_pair = np.array([
@@ -62,16 +84,19 @@ def test_stealth_matches_server():
         for i in range(len(updates))
     ])
 
-    assert torch.allclose(server_avg, tcaa_ref, atol=1e-5), "weighted reference mismatch"
-    assert np.allclose(server_dist, tcaa_dist, atol=1e-4), \
-        f"distance mismatch:\n server={server_dist}\n tcaa  ={tcaa_dist}"
-    assert np.allclose(server_pair, tcaa_pair, atol=1e-4), \
-        f"pairwise cosine mismatch:\n server={server_pair}\n tcaa  ={tcaa_pair}"
-    print("[ok] tcaa/stealth.py matches server.py: weighted ref, distances, pairwise cosine")
-    print(f"     distances  server={np.round(server_dist,4)}")
-    print(f"     pairwise   server={np.round(server_pair,4)}")
+    # stealth.py normalizes by sum(w) (no 1e-12); the reference adds it. The gap is ~1e-14
+    # relative to sums of O(140), so 1e-5 tolerance certifies the definitions coincide.
+    assert torch.allclose(ref_avg, tcaa_ref, atol=1e-5), "weighted reference mismatch"
+    assert np.allclose(ref_dist, tcaa_dist, atol=1e-4), \
+        f"distance mismatch:\n ref ={ref_dist}\n tcaa={tcaa_dist}"
+    assert np.allclose(ref_pair, tcaa_pair, atol=1e-4), \
+        f"pairwise cosine mismatch:\n ref ={ref_pair}\n tcaa={tcaa_pair}"
+    print("[ok] tcaa/stealth.py matches the AugMP server definitions: "
+          "weighted ref, distances, pairwise cosine")
+    print(f"     distances  ref={np.round(ref_dist, 4)}")
+    print(f"     pairwise   ref={np.round(ref_pair, 4)}")
 
 
 if __name__ == "__main__":
     test_stealth_matches_server()
-    print("\nStealth cross-check passed.")
+    print("\nStealth cross-check passed (self-contained; no augmp_baseline needed).")

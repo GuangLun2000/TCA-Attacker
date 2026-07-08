@@ -12,10 +12,13 @@ AugMP objective) and **input-level single-shot sponge attacks** (Sponge Examples
 DNN-era): TCAA is **weight-level** (persistent, not per-prompt), **LLM-specific**, and
 **constrained to preserve task utility**.
 
-This repository is built on the **AugMP** codebase (Graph Representation Learning
-Augmented Model Manipulation). The new attack is a self-contained package,
-[`tcaa/`](tcaa/); AugMP is retained unmodified in [`augmp_baseline/`](augmp_baseline/)
-as the comparison baseline.
+TCAA's threat model and parameter-space stealth machinery follow **AugMP** (Graph
+Representation Learning Augmented Model Manipulation — an *integrity* attack on the same
+federated-fine-tuning setting). This repository is **fully self-contained**: it does not
+import or bundle AugMP. AugMP is the external *comparison baseline*, released separately
+at [github.com/GuangLun2000/AugMP](https://github.com/GuangLun2000/AugMP); TCAA
+re-implements the aggregation and distance/cosine stealth definitions it shares with
+AugMP in [`tcaa/stealth.py`](tcaa/stealth.py), pinned by a self-contained test.
 
 ---
 
@@ -53,8 +56,8 @@ alongside a peak-KV memory proxy `∝ (n + L)`.
 
 ```text
 TCA-Attacker/
-├── tcaa/               # the TCAA attack (all new code)
-├── augmp_baseline/     # AugMP, unmodified — the comparison baseline
+├── tcaa/               # the TCAA attack (all code — self-contained)
+├── results/            # saved experiment figures + metrics
 ├── TCAA_Colab.ipynb    # end-to-end Colab notebook (3 experiments)
 ├── requirements.txt
 └── README.md
@@ -66,30 +69,36 @@ TCA-Attacker/
 |---|---|
 | [length_surrogate.py](tcaa/length_surrogate.py) | Differentiable EOS-delay survival `E[L]`, the malicious loss `L_mal`, and the clean-KD utility anchor. Backbone-agnostic (logits + labels). |
 | [cost_model.py](tcaa/cost_model.py) | Inference-cost model `C`, KV-memory proxy, generation-time measurement, amplification / truncation / repetition stats. |
-| [causal_model.py](tcaa/causal_model.py) | `AutoModelForCausalLM` + LoRA wrapper with the **same flat-param interface** as AugMP's model, so FedAvg + stealth code transfer unchanged. |
+| [causal_model.py](tcaa/causal_model.py) | `AutoModelForCausalLM` + LoRA wrapper exposing a flat get/set-params interface (the AugMP-compatible LoRA-vector convention) so FedAvg + stealth code operate on it unchanged. |
 | [gen_data.py](tcaa/gen_data.py) | Generation data adapter: `(prompt, reference)` pairs, clean/τ split, teacher-forcing collate. Alpaca/Dolly (instruction) + XSum/CNN-DailyMail (summarization) + offline synthetic. |
-| [stealth.py](tcaa/stealth.py) | Distance/cosine vs. the weighted-FedAvg reference — **the same definitions as AugMP's `server.py`** (cross-checked by a test). |
+| [stealth.py](tcaa/stealth.py) | Distance/cosine vs. the weighted-FedAvg reference — the AugMP server's screening definitions, re-implemented and pinned by a self-contained golden-reference test. |
 | [alm.py](tcaa/alm.py) | Augmented-Lagrangian stealth constraints (distance + pairwise cosine) — the solver that keeps the malicious update inside the benign envelope. |
 | [metrics.py](tcaa/metrics.py) | Dependency-free ROUGE-L + teacher-forced perplexity (utility). |
 | [visualize.py](tcaa/visualize.py) | Publication figures (Okabe-Ito, CVD-safe) + `render_report` / `render_fl_report` / `render_pareto_report` and a copy-pasteable `feedback_digest`. |
 | [phase0_runner.py](tcaa/phase0_runner.py) | **Runner — single round.** Benign fine-tune + malicious `L_mal` + FedAvg; measures cost / utility / stealth. The de-risk experiment. |
 | [fl_runner.py](tcaa/fl_runner.py) | **Runner — multi-round FL.** T rounds with client sampling; tracks attack **durability** and per-round stealth against a parallel benign-only baseline. |
 | [pareto_runner.py](tcaa/pareto_runner.py) | **Runner — sweep.** `γ × γ_clean × κ` grid → the cost-amplification-vs-stealth-slack frontier. |
-| [tests/](tcaa/tests/) | Surrogate-sign / survival-identity tests and the `stealth == server.py` cross-check. |
+| [tests/](tcaa/tests/) | Surrogate-sign / survival-identity tests, the ALM boundary test, and the self-contained stealth golden-reference cross-check. |
 | [COLAB_STAGE_A.md](tcaa/COLAB_STAGE_A.md), [README.md](tcaa/README.md) | Colab recipe and package notes. |
 
-### `augmp_baseline/` — the comparison baseline
+### Relationship to AugMP (external baseline)
 
-The original AugMP code (federated model-poisoning: VGAE + GSP + Augmented-Lagrangian
-integrity attack) lives here unchanged: `main.py`, `server.py`, `client.py`, `models.py`,
-`data_loader.py`, `visualization.py`, `fed_checkpoint.py`, `decoder_adapters.py`,
-`run_downstream_generation.py`, `attack_baseline_{alie,gaussian,sign_flipping}.py`, plus
-the `data/` datasets. Its flat sibling imports resolve when run from inside the folder.
+AugMP (federated model-poisoning: VGAE + GSP + Augmented-Lagrangian **integrity** attack)
+is the comparison baseline and lives in its own repository:
+[github.com/GuangLun2000/AugMP](https://github.com/GuangLun2000/AugMP). TCAA is the
+**availability** counterpart in the same threat model — it preserves accuracy and inflates
+inference cost instead of degrading accuracy.
 
-TCAA does **not** import AugMP at runtime — it re-implements the aggregation and
-stealth-metric definitions in [`tcaa/stealth.py`](tcaa/stealth.py). The only coupling is
+TCAA is **standalone**: it does not import or vendor any AugMP file. It deliberately
+mirrors AugMP's shared abstractions — the flat LoRA-vector parameter interface, the
+weighted-FedAvg aggregate, and the distance/cosine stealth screen — by re-implementing
+those definitions in [`tcaa/stealth.py`](tcaa/stealth.py). The Augmented-Lagrangian stealth
+solver in [`tcaa/alm.py`](tcaa/alm.py) is a from-scratch port of AugMP's constrained
+optimization (with a deliberate rest-at-the-boundary divergence). Numerical fidelity to
+AugMP's server-side definitions is pinned by
 [`tcaa/tests/test_stealth_matches_server.py`](tcaa/tests/test_stealth_matches_server.py),
-which imports `server.py` to assert those definitions match AugMP's numerically.
+which now checks against an **inlined frozen copy** of those definitions — no AugMP code
+is needed to run it.
 
 ---
 
@@ -166,18 +175,19 @@ single copy-pasteable block of the headline numbers.
 
 ---
 
-## Running the AugMP baseline
+## Comparison baseline (AugMP)
 
-Intact in `augmp_baseline/`. Run from inside the folder so its flat sibling imports and
-relative `data/` paths resolve:
+AugMP is the integrity-attack baseline and is maintained in its own repository — clone it
+separately to reproduce the baseline comparisons:
 
 ```bash
-cd augmp_baseline && python main.py    # configure the `config` dict in main.py
+git clone https://github.com/GuangLun2000/AugMP.git
 ```
 
 AugMP does classification / model-poisoning (encoder- or decoder-only backbones on
 AG News / IMDB / DBpedia / Yahoo Answers) and includes ALIE, Sign-Flipping, and Gaussian
-attack baselines selectable via `attack_method`. Its config is **independent** of TCAA.
+attack baselines. It runs fully independently of TCAA — nothing in this repository depends
+on it.
 
 **Reference:** *Graph Representation Learning Augmented Model Manipulation on Federated
 Fine-Tuning of LLMs* — Hanlin Cai et al.

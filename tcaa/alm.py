@@ -1,8 +1,9 @@
 # tcaa/alm.py
 # Augmented-Lagrangian stealth constraints for the TCAA attacker.
 #
-# This is a faithful port of AugMP's AttackerClient constrained optimization
-# (client.py ~3180-3630) into the lightweight tcaa/ single-round harness. The
+# This is a faithful, from-scratch port of AugMP's AttackerClient constrained
+# optimization (external baseline: github.com/GuangLun2000/AugMP) into the lightweight
+# tcaa/ single-round harness — no AugMP code is imported. The
 # attacker maximizes the length-amplification objective F = -L_mal SUBJECT TO the
 # parameter-space stealth constraints, so instead of AugMP's `minimize -F + penalty`
 # we minimize `L_mal + penalty` (identical, since F = -L_mal).
