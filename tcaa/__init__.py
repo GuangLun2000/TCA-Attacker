@@ -14,6 +14,16 @@
 #   "is parameter-space stealth jointly satisfiable with cost amplification?"
 # See tcaa/phase0_runner.py.
 
-from . import cost_model, length_surrogate, stealth  # noqa: F401
+import os as _os
+
+# Reduce CUDA caching-allocator fragmentation. The cap=1024 measurement pass allocates
+# large, short-lived generation buffers; once freed they linger as reserved-but-unusable
+# blocks that the differently-shaped attacker-step tensors then can't reuse (the OOM had
+# ~2.7 GiB stranded this way). `expandable_segments` lets the allocator grow/shrink
+# segments instead. Must be set before the first CUDA allocation — this import runs
+# before any model reaches the GPU. `setdefault` respects a value the user already set.
+_os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+from . import cost_model, length_surrogate, stealth  # noqa: F401,E402
 
 __all__ = ["cost_model", "length_surrogate", "stealth"]

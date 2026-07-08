@@ -26,6 +26,14 @@ import torch.nn.functional as F
 
 _EPS = 1e-6
 
+# Time-chunk width for the clean-KD KL. The forward KL sums over the ~150k-token vocab,
+# so its softmax/exp/difference temporaries are each [B, T, vocab]; materializing them
+# for the whole sequence at once is the single largest transient in the attacker step
+# (the reported OOM tried to allocate one such 1.18 GiB block on an already-full GPU).
+# Accumulating the KL over T in chunks caps that transient at [B, chunk, vocab] with
+# identical math. 64 is a safe default; lower it further if memory is still tight.
+_KD_TIME_CHUNK = 64
+
 
 def _shift_for_causal_lm(logits: torch.Tensor, labels: torch.Tensor):
     """Standard next-token shift: position i predicts token i+1."""
@@ -64,10 +72,18 @@ def clean_kd_kl(ref_logits: torch.Tensor, cur_logits: torch.Tensor,
     cur_sl, _ = _shift_for_causal_lm(cur_logits, labels)
     mask = (lab != -100).to(cur_sl.dtype)
     denom = mask.sum().clamp(min=1.0)
-    ref_lp = F.log_softmax(ref_sl, dim=-1)
-    cur_lp = F.log_softmax(cur_sl, dim=-1)
-    kl_tok = (ref_lp.exp() * (ref_lp - cur_lp)).sum(dim=-1)   # [B, T-1], grad via cur_lp
-    return (kl_tok * mask).sum() / denom
+    # Accumulate the per-token KL over the vocab in TIME chunks so the full-vocab
+    # softmax temporaries are never all materialized at once (see _KD_TIME_CHUNK). Same
+    # value and same gradient (via cur_sl) as the one-shot form, only cheaper in memory.
+    T = cur_sl.size(1)
+    step = max(1, min(T, _KD_TIME_CHUNK))
+    kl_sum = cur_sl.new_zeros(())
+    for s in range(0, T, step):
+        ref_lp = F.log_softmax(ref_sl[:, s:s + step], dim=-1)
+        cur_lp = F.log_softmax(cur_sl[:, s:s + step], dim=-1)
+        kl_tok = (ref_lp.exp() * (ref_lp - cur_lp)).sum(dim=-1)   # [B, chunk], grad via cur_lp
+        kl_sum = kl_sum + (kl_tok * mask[:, s:s + step]).sum()
+    return kl_sum / denom
 
 
 def eos_logprob_and_mask(logits: torch.Tensor, labels: torch.Tensor, eos_id: int):

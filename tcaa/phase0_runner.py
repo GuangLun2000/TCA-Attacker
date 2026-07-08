@@ -64,6 +64,10 @@ def default_config() -> Dict:
         "num_rounds": 1, "local_epochs": 2,
         "dirichlet_alpha": 0.3, "server_lr": 1.0,
         "client_lr": 1e-4, "batch_size": 8, "grad_clip_norm": 1.0,
+        # Recompute transformer-block activations in backward (memory for compute). Keeps
+        # cap/batch/horizon and fp32 numerics unchanged; needed to fit cap=1024 on a
+        # 40 GB A100. Set False only if the backbone is tiny or memory is not the bind.
+        "grad_checkpointing": True,
         # Centralized warm-up on clean data before the attacked round, i.e. the
         # realistic "global is already competent at round t" condition (0 = none).
         "warmup_steps": 0, "warmup_lr": 1e-3,
@@ -469,6 +473,16 @@ def build_model_and_data(cfg: Dict, device):
                                 lora_dropout=cfg["lora_dropout"])
 
     model.to(device)
+
+    # Memory: recompute block activations in backward instead of storing them. The
+    # attacker step holds three grad forwards at once (clean, tau, on-policy rollout),
+    # each producing [B, T, ~150k-vocab] activations; without this they exceed a 40 GB
+    # A100 at cap=1024. Bit-exact forward, so results are unchanged; skipped for the
+    # 2-layer CPU smoke where it only adds overhead.
+    if cfg.get("grad_checkpointing", True) and cfg["backbone"] != "tiny-gpt2":
+        model.enable_gradient_checkpointing()
+        print("  gradient checkpointing: ON (activations recomputed in backward; "
+              "bit-exact outputs, big memory saving, ~20-30% slower)")
 
     tokenizer = None  # set for real datasets; used by the qualitative dump
     if cfg["source"] == "synthetic":

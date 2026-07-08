@@ -120,6 +120,31 @@ class TCAACausalModel(nn.Module):
     def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
         return self.model(input_ids=input_ids, attention_mask=attention_mask).logits
 
+    def enable_gradient_checkpointing(self) -> None:
+        """Trade a little compute for a lot of memory: checkpoint the transformer blocks
+        so the backward pass recomputes their activations instead of storing every
+        [B, T, vocab]-scale tensor from the three grad forwards per attacker step (clean,
+        tau, and the on-policy rollout). The forward is bit-exact (only activations are
+        recomputed), so amplification / stealth / utility metrics are unchanged.
+
+        HF gates block checkpointing on ``module.training`` internally, so this is
+        automatically INACTIVE during the eval-mode ``.generate()`` rollouts and the
+        cost/ppl measurement (they keep their KV cache and full speed) and ACTIVE only
+        during the training forwards where activation memory would otherwise blow past
+        the 40 GB A100. Uses the non-reentrant checkpoint so gradients still reach the
+        LoRA adapters even though the base weights are frozen."""
+        inner = self.model
+        if hasattr(inner, "enable_input_require_grads"):
+            # PEFT: let the frozen input embeddings emit grad-tracking activations so the
+            # gradient can flow back through the checkpointed blocks into the adapters.
+            inner.enable_input_require_grads()
+        if hasattr(inner, "gradient_checkpointing_enable"):
+            try:
+                inner.gradient_checkpointing_enable(
+                    gradient_checkpointing_kwargs={"use_reentrant": False})
+            except TypeError:  # older transformers without the kwargs argument
+                inner.gradient_checkpointing_enable()
+
     # --- flat-param interface (identical convention to NewsClassifierModel) --
     def get_flat_params(self, requires_grad: bool = False) -> torch.Tensor:
         parts = []
