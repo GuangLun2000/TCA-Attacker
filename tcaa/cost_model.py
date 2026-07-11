@@ -212,6 +212,28 @@ class CostStats:
                  for n, L in zip(self.prompt_lens, xs)]
         return float(sum(costs) / max(len(costs), 1))
 
+    def mean_cost_at(self, c_f: float, c_a: float) -> float:
+        """Mean per-request cost recomputed under ALTERNATE cost coefficients, from the
+        already-measured (prompt, output) lengths — no re-generation. Used to report the
+        amplification under physically-calibrated (c_f = d_model, c_a = 1) coefficients
+        alongside the naive c_f = c_a = 1, so the quadratic-attention term is not credited
+        beyond where a real decoder's per-token cost actually turns super-linear."""
+        if not self.costs or len(self.prompt_lens) != len(self.output_lens):
+            return self.mean_cost
+        costs = [inference_cost(float(n), float(L), c_f, c_a)
+                 for n, L in zip(self.prompt_lens, self.output_lens)]
+        return float(sum(costs) / max(len(costs), 1))
+
+    def decensored_mean_cost_at(self, c_f: float, c_a: float,
+                                max_extra: float = DEFAULT_DECENSOR_MAX_EXTRA) -> float:
+        """De-censored mean cost under alternate coefficients (see ``mean_cost_at``)."""
+        xs = self.decensored_output_lens(max_extra)
+        if len(self.prompt_lens) != len(xs):
+            return self.mean_cost_at(c_f, c_a)
+        costs = [inference_cost(float(n), L, c_f, c_a)
+                 for n, L in zip(self.prompt_lens, xs)]
+        return float(sum(costs) / max(len(costs), 1))
+
     def residual_capped(self, max_extra: float = DEFAULT_DECENSOR_MAX_EXTRA) -> bool:
         """True when the residual extrapolation hit ``max_extra`` (hazard ~0): the
         de-censored estimate is then itself a lower bound, not a point estimate."""

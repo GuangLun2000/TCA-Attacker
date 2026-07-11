@@ -77,6 +77,40 @@ def test_lambda_stays_bounded():
     print(f"[ok] bounded multipliers: lambda_dist={alm.lambda_dist:.2f} lambda_sim={alm.lambda_sim:.2f}")
 
 
+def _optimize_toward_alignment(env, two_sided, steps=600, lr=0.05, seed=0):
+    """Attacker objective PULLS toward maximal alignment (over-aligned). The one-sided
+    cosine bound permits it; the two-sided bound must cap it at env.pair_cos_max."""
+    torch.manual_seed(seed)
+    delta = torch.nn.Parameter(env.ref_b.clone() + 0.1 * torch.randn_like(env.ref_b))
+    opt = torch.optim.Adam([delta], lr=lr)
+    alm = ALMState(two_sided_cosine=two_sided)
+    info = {}
+    for _ in range(steps):
+        opt.zero_grad()
+        f_obj = -2.0 * _sim(delta, env)      # want to be MORE aligned than benign
+        pen, info = alm.penalty(delta, env)
+        (f_obj + pen).backward()
+        opt.step()
+        alm.dual_update(info)
+    return float(_sim(delta, env)), alm, info
+
+
+def test_two_sided_cosine_bounds_over_alignment():
+    """A two-sided cosine constraint must drive an OVER-aligned attacker down to the pairwise
+    upper edge (pair_high = max per-client mean cosine, same statistic as _sim); the one-sided
+    (AugMP) constraint permits the over-alignment."""
+    mean, benign, sizes = _diverse_benign(noise=1.0)
+    env = build_envelope(benign, sizes, atk_size=10.0, kappa=0.9, use_pairwise=True)
+    high = env.pair_high
+    cos_two, _, info = _optimize_toward_alignment(env, two_sided=True)
+    cos_one, _, _ = _optimize_toward_alignment(env, two_sided=False)
+    assert "g_sim_hi" in info, "two-sided penalty did not add the upper-bound term"
+    assert cos_two <= high + 0.05, f"two-sided cosine {cos_two:.3f} exceeded pair_high {high:.3f}"
+    assert cos_one > high + 0.1, f"one-sided cosine {cos_one:.3f} should over-align past {high:.3f}"
+    print(f"[ok] two-sided caps over-alignment: two_sided={cos_two:.3f} <= pair_high={high:.3f} "
+          f"< one_sided={cos_one:.3f}")
+
+
 def test_project_to_distance_enforces_budget():
     """The defensive final projection must clamp an over-budget update to raw_d_T."""
     mean, benign, sizes = _diverse_benign(noise=1.0)
@@ -96,5 +130,6 @@ if __name__ == "__main__":
     test_alm_drives_update_inside_envelope()
     test_alm_rests_at_boundary_not_collapsed()
     test_lambda_stays_bounded()
+    test_two_sided_cosine_bounds_over_alignment()
     test_project_to_distance_enforces_budget()
     print("\nAll TCAA ALM tests passed.")

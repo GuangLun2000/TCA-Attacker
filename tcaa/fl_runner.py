@@ -29,12 +29,14 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import torch
 
-from .cost_model import DEFAULT_DECENSOR_MAX_EXTRA, amplification_ratio
+from .cost_model import (DEFAULT_DECENSOR_MAX_EXTRA, amplification_ratio,
+                        calibrate_coefficients)
 from .gen_data import partition_examples
 from .phase0_runner import (_benign_update, _malicious_update, _measure_cost, _ppl,
                             _set_seed, _validate_decoder_only, build_model_and_data,
                             default_config, enable_backend_speedups)
-from .stealth import evaluate_stealth
+from .stealth import (evaluate_stealth, pairwise_mean_cosine, update_cosine,
+                     update_distance, weighted_fedavg_reference)
 
 
 def default_fl_config() -> Dict:
@@ -49,13 +51,17 @@ def default_fl_config() -> Dict:
         "attacker_always_selected": False,         # realistic: attackers sampled like everyone
         "track_benign_baseline": True,             # run a parallel benign-only global for C_ben
         "measure_every": 5,                        # measure cost/utility/stealth every K rounds
-        # Generation cap for MEASUREMENT (does not affect the attack, which optimizes only
-        # up to onpolicy_horizon). Phase-0's 256 saturates under multi-round accumulation
-        # (outputs pin at the cap by ~round 5, truncation -> ~1.0), so the durability curve
-        # is a flat censored artifact. 1024 lets the true accumulation curve show; the
-        # residual truncation is corrected by the de-censored estimate. Runtime scales with
-        # this — lower to 512 if generation is too slow (de-censoring still corrects the tail).
-        "max_new_tokens": 1024,
+        # Generation cap for MEASUREMENT ONLY (does not affect the attack, which trains EOS
+        # suppression only up to onpolicy_horizon = 256; see phase0_runner). Chosen as a
+        # runtime-aware balance: 2048 = 8x the attack horizon, enough headroom above what the
+        # attack directly optimizes to (a) show the full amplified length and (b) reveal whether
+        # the degenerate tail ever terminates (truncation < 1) — while generation wall-clock is
+        # ~linear in the cap, so 2048 is ~2x the old 1024, not the 4x of 4096. NOTE: when
+        # truncation stays ~1, BOTH raw amp and vs-pristine scale with this cap, so lead on the
+        # cap-robust EFFECTIVE amplification (repetition-discounted length plateaus even as the
+        # loop runs longer). Raise to 4096 for a one-off length-distribution diagnostic; if too
+        # slow, also raise measure_every / lower eval_size rather than shrinking the cap.
+        "max_new_tokens": 2048,
         # --- moderately larger data than Phase-0's 512 / 64 ---
         "pool_size": 4000, "eval_size": 256,
         # --- per-round attacker budget (smaller than single-round; it repeats each round) ---
@@ -66,6 +72,31 @@ def default_fl_config() -> Dict:
         # per-round ppl_ratio still climbs, raise it (2/4); if amplification collapses,
         # lower it. See phase0_runner.default_config for the mechanism note.
         "kd_clean_weight": 1.0,
+        # --- cost-model credibility: also report amplification under physically-calibrated
+        # coefficients (c_f = d_model, c_a = 1). The naive c_f = c_a = 1 puts the super-linear
+        # threshold at L ~ 2n+2 (quadratic term credited from the first token); the calibrated
+        # ratio (c_a/c_f ~ 1/d_model) is what a real Qwen2.5-0.5B decoder actually incurs.
+        "report_calibrated_cost": True,
+        # --- per-round defense telemetry: log every participating client's update geometry
+        # (distance + cosine family, pairwise matrices, Krum score) labelled benign/attacker,
+        # so a defense implemented LATER can be replayed offline to test attacker detection.
+        # Aggregation stays plain FedAvg — this only OBSERVES, it never rejects.
+        "collect_defense_telemetry": True,
+        "save_update_vectors": False,   # also dump raw per-client update vectors (large; for FLTrust / coord-wise defenses)
+        # --- multi-attacker coordination: decorrelate colluding attackers so their mutual
+        # (distance, cosine) stays inside the benign PAIR band (not detectable near-twins).
+        # 0 disables; tune against amplification (higher = stealthier pair, weaker attack).
+        "gamma_coord": 10.0,
+        # --- two-sided cosine stealth constraint: constrain the attacker's cosine to the benign
+        # envelope to the BAND [stealth_cos_low, upper], not just the AugMP lower bound. Closes
+        # the "over-aligned outlier" tell (attacker cos_to_agg >> benign) the one-sided constraint
+        # permits. Distance stays one-sided (upper bound only, which is correct). Lower edge is a
+        # fixed floor (0 = forbid only anti-alignment); upper edge is the most-aligned benign
+        # client's value, computed with the same statistic as the constrained cosine.
+        "stealth_cosine_two_sided": True,
+        "stealth_cos_low": 0.0,
+        "dump_char_cap": 20000,         # keep enough decoded text to SEE the full loop at high cap
+        "num_dump_examples": 12,        # more final tau/clean samples for repetition-form inspection
         "results_subdir": "tcaa_fl",
     })
     return cfg
@@ -92,6 +123,77 @@ def _fedavg(updates: List[torch.Tensor], weights: List[float]) -> torch.Tensor:
     w = torch.tensor(weights, dtype=stacked.dtype)
     w = w / w.sum()
     return (stacked * w.view(-1, 1)).sum(dim=0)
+
+
+def _collect_defense_telemetry(round_idx, ben_updates, ben_sizes, ben_ids,
+                               atk_updates, atk_sizes, atk_ids, *, num_attackers=0):
+    """Per-round, per-client update geometry a robust aggregator would screen on — LOGGED,
+    not enforced, so a defense implemented later can be replayed OFFLINE to test whether it
+    detects the attacker(s). Records the quantities Krum / norm-clipping / cosine screens
+    consume: L2 norm, distance & cosine to the (attacker-inclusive) FedAvg aggregate and to the
+    benign mean, leave-self-out pairwise-mean cosine, and a Krum score. The full pairwise
+    distance & cosine matrices are included so ANY Krum/Multi-Krum variant (its own f, k) can be
+    replayed without the raw vectors. Aggregation itself is unchanged (plain FedAvg)."""
+    updates = [u.detach().float() for u in ben_updates] + [u.detach().float() for u in atk_updates]
+    labels = ["benign"] * len(ben_updates) + ["attacker"] * len(atk_updates)
+    ids = list(ben_ids) + list(atk_ids)
+    weights = list(ben_sizes) + list(atk_sizes)
+    n = len(updates)
+    if n == 0:
+        return {"round": int(round_idx), "n_clients": 0, "clients": []}
+    agg = weighted_fedavg_reference(updates, weights)          # exactly the FedAvg aggregate
+    ben_mean = (weighted_fedavg_reference([u.detach().float() for u in ben_updates], ben_sizes)
+                if ben_updates else agg)
+    # Pairwise distance / cosine matrices (n x n; small — n <= clients_per_round).
+    dist_mat = [[0.0] * n for _ in range(n)]
+    cos_mat = [[1.0] * n for _ in range(n)]
+    for i in range(n):
+        for j in range(i + 1, n):
+            d = update_distance(updates[i], updates[j])
+            c = update_cosine(updates[i], updates[j])
+            dist_mat[i][j] = dist_mat[j][i] = round(d, 6)
+            cos_mat[i][j] = cos_mat[j][i] = round(c, 6)
+    # Krum score = sum of the (n-f-2) smallest squared distances to other clients (Blanchard 2017).
+    f = int(num_attackers)
+    k = max(1, n - f - 2)
+    clients = []
+    for i in range(n):
+        sq = sorted((dist_mat[i][j] ** 2 for j in range(n) if j != i))
+        others = [updates[j] for j in range(n) if j != i]
+        clients.append({
+            "client_id": int(ids[i]) if i < len(ids) else i,
+            "label": labels[i],
+            "norm": round(float(torch.norm(updates[i])), 6),
+            "dist_to_agg": round(update_distance(updates[i], agg), 6),
+            "dist_to_benign_mean": round(update_distance(updates[i], ben_mean), 6),
+            "cos_to_agg": round(update_cosine(updates[i], agg), 6),
+            "pairwise_mean_cos": round(pairwise_mean_cosine(updates[i], others), 6),
+            "krum_score": round(float(sum(sq[:k])), 6),
+        })
+    return {
+        "round": int(round_idx),
+        "n_clients": n, "n_attackers_present": len(atk_updates),
+        "krum_neighbors_k": k,
+        "clients": clients,
+        "pairwise_distance": dist_mat,
+        "pairwise_cosine": cos_mat,
+    }
+
+
+def _save_update_vectors(out_dir, round_idx, ben_updates, ben_ids, atk_updates, atk_ids):
+    """Dump the round's raw per-client update vectors (compressed .npz) for defenses that need
+    the full vectors — FLTrust (server root-cosine), coordinate-wise trimmed-mean/median."""
+    vecs, labels, ids = [], [], []
+    for u, cid in zip(ben_updates, ben_ids):
+        vecs.append(u.detach().float().cpu().numpy()); labels.append("benign"); ids.append(int(cid))
+    for u, cid in zip(atk_updates, atk_ids):
+        vecs.append(u.detach().float().cpu().numpy()); labels.append("attacker"); ids.append(int(cid))
+    if not vecs:
+        return
+    updates_dir = Path(out_dir) / "update_vectors"
+    updates_dir.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(updates_dir / f"round_{int(round_idx):03d}.npz",
+                        updates=np.stack(vecs), labels=np.array(labels), client_ids=np.array(ids))
 
 
 def _sample_participants(
@@ -142,9 +244,10 @@ def _dump_fl_examples(model, g_flat, tau_ev, clean_ev, tokenizer, cfg, spec, dev
             ref = [t for t in exk[i].ref_ids if t != spec.eos_id]
             recs.append({
                 "split": split,
-                # keep enough text to SEE the full loop in the qualitative viz (was 180/500)
+                # keep enough text to SEE the full loop in the qualitative viz (was 180/500);
+                # dump_char_cap must scale with max_new_tokens or a high cap clips the loop.
                 "prompt": tokenizer.decode(exk[i].prompt_ids, skip_special_tokens=True)[:400],
-                "output": tokenizer.decode(out_ids, skip_special_tokens=True)[:6000],
+                "output": tokenizer.decode(out_ids, skip_special_tokens=True)[:int(cfg.get("dump_char_cap", 6000))],
                 "len": L, "truncated": bool(eos_pos.numel() == 0),
                 "rouge_recall": round(rouge_l_recall(out_ids, ref), 3) if ref else None,
                 "repetition": round(repetition_rate(out_ids), 3),
@@ -165,6 +268,17 @@ def run_fl(config: Dict) -> Dict:
     model, tokenizer, spec, clean_tr, tau_tr, clean_ev, tau_ev = build_model_and_data(cfg, device)
     g0 = model.get_flat_params().detach().cpu()
     print(f"  LoRA update dimension: {g0.numel():,}")
+
+    # Physically-calibrated cost coefficients (c_f = d_model, c_a = 1) for the honest
+    # amplification column. d_model lives under different attr names across backbones
+    # (Qwen: hidden_size; GPT2: n_embd), so probe both.
+    report_calib = bool(cfg.get("report_calibrated_cost", True))
+    mcfg = model.inner().config
+    d_model = int(getattr(mcfg, "hidden_size", None) or getattr(mcfg, "n_embd", None) or 0)
+    calib = calibrate_coefficients(d_model) if (report_calib and d_model > 0) else None
+    if calib:
+        print(f"  calibrated cost coeffs: d_model={d_model} -> c_f={calib['c_f']:.0f}, c_a={calib['c_a']:.0f} "
+              f"(super-linear onset L ~ 2n+{2*calib['c_f']/calib['c_a']:.0f})")
 
     num_benign = cfg["num_clients"] - cfg["num_attackers"]
     benign_ids = list(range(num_benign))
@@ -193,6 +307,7 @@ def run_fl(config: Dict) -> Dict:
     ppl_pri_tau = _ppl(model, g0, tau_ev, cfg, spec, device)
     pristine_ref = {
         "tau_mean_cost": pri_tau.mean_cost,
+        "tau_mean_cost_calib": pri_tau.mean_cost_at(calib["c_f"], calib["c_a"]) if calib else None,
         "tau_decensored_mean_cost": pri_tau.decensored_mean_cost(me),
         "clean_mean_cost": pri_cln.mean_cost, "kv_tau": pri_tau.mean_kv_proxy,
         "tau_mean_len": round(pri_tau.mean_output_len, 2),
@@ -211,7 +326,10 @@ def run_fl(config: Dict) -> Dict:
     g_ben = g0.clone() if track_ben else None
     durability: List[Dict] = []
     stealth_trace: List[Dict] = []
+    defense_telemetry: List[Dict] = []            # per-round per-client update geometry (offline defense eval)
     last_mal_trace: Optional[List[Dict]] = None   # a representative attacker trajectory (process data)
+    out_dir = Path("results") / cfg["results_subdir"]
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     for t in range(cfg["num_rounds"]):
         sel_ben, sel_atk = _sample_participants(
@@ -219,22 +337,28 @@ def run_fl(config: Dict) -> Dict:
             cfg.get("attacker_always_selected", False))
 
         # --- benign local training from the (attacked) broadcast global ---
-        ben_updates, ben_sizes = [], []
+        ben_updates, ben_sizes, ben_ids_used = [], [], []
         for cid in sel_ben:
             if not shards[cid]:
                 continue
             ben_updates.append(_benign_update(model, shards[cid], cfg, g_atk, spec, device))
             ben_sizes.append(shard_sizes[cid])
+            ben_ids_used.append(cid)
 
         # --- attacker(s): ALM-constrained length attack from the attacked global ---
-        atk_updates, atk_reports = [], []
+        # Computed SEQUENTIALLY so each attacker sees the peers already produced this round;
+        # the coordination penalty (gamma_coord) then keeps the colluding pair inside the
+        # benign distance/cosine PAIR band instead of collapsing into detectable near-twins.
+        atk_updates, atk_reports, atk_ids_used = [], [], []
         for cid in sel_atk:
             if not ben_updates:
                 break  # need a benign envelope to constrain against
             delta_mal, mtrace = _malicious_update(
                 model, clean_tr, tau_tr, cfg, g_atk, spec, device,
-                benign_updates=ben_updates, benign_sizes=ben_sizes, atk_size=atk_size)
+                benign_updates=ben_updates, benign_sizes=ben_sizes, atk_size=atk_size,
+                peer_updates=list(atk_updates))
             atk_updates.append(delta_mal)
+            atk_ids_used.append(cid)
             last_mal_trace = mtrace   # keep the most recent attacker's within-round trajectory
             atk_reports.append(evaluate_stealth(
                 delta_mal, ben_updates, ben_sizes, attacker_weight=atk_size,
@@ -246,6 +370,15 @@ def run_fl(config: Dict) -> Dict:
             all_up = ben_updates + atk_updates
             all_w = ben_sizes + [atk_size] * len(atk_updates)
             g_atk = g_atk + cfg["server_lr"] * _fedavg(all_up, all_w)
+
+        # --- per-round defense telemetry (offline detection eval; aggregation stays FedAvg) ---
+        if cfg.get("collect_defense_telemetry", True) and (ben_updates or atk_updates):
+            defense_telemetry.append(_collect_defense_telemetry(
+                t, ben_updates, ben_sizes, ben_ids_used,
+                atk_updates, [atk_size] * len(atk_updates), atk_ids_used,
+                num_attackers=cfg["num_attackers"]))
+            if cfg.get("save_update_vectors", False):
+                _save_update_vectors(out_dir, t, ben_updates, ben_ids_used, atk_updates, atk_ids_used)
 
         # --- parallel benign-only trajectory (amplification baseline) ---
         if track_ben:
@@ -299,6 +432,23 @@ def run_fl(config: Dict) -> Dict:
             amp_tau_pri = amplification_ratio(atk_tau.mean_cost, pristine_ref["tau_mean_cost"])
             amp_tau_pri_dec = amplification_ratio(
                 atk_tau.decensored_mean_cost(me), pristine_ref["tau_decensored_mean_cost"])
+            # Physically-calibrated amplification (c_f=d_model, c_a=1): the honest compute-cost
+            # multiple a real decoder incurs. At these lengths cost is linear-dominated, so this
+            # is typically well below the naive amp_tau (which credits the quadratic term from
+            # token 1). Reported alongside, not instead — the naive number is the sensitivity bound.
+            if calib:
+                _cf, _ca = calib["c_f"], calib["c_a"]
+                ben_ref_calib = (ben_tau.mean_cost_at(_cf, _ca) if track_ben
+                                 else atk_cln.mean_cost_at(_cf, _ca))
+                amp_tau_calib = amplification_ratio(atk_tau.mean_cost_at(_cf, _ca), ben_ref_calib)
+                amp_tau_pri_calib = amplification_ratio(
+                    atk_tau.mean_cost_at(_cf, _ca), pristine_ref["tau_mean_cost_calib"])
+            else:
+                amp_tau_calib = amp_tau_pri_calib = None
+            # De-censored validity: when the truncated tail hit the max_extra cap (EOS hazard ~0),
+            # the de-censored estimate is 100% the horizon assumption and 0% data. Flag it so the
+            # number is never read as a measurement (raise the generation cap to make it valid).
+            decensored_valid = not atk_tau.residual_capped(me)
 
             ppl_clean = _ppl(model, g_atk, clean_ev, cfg, spec, device)
             ppl_clean_ben = _ppl(model, g_ben, clean_ev, cfg, spec, device) if track_ben else None
@@ -310,8 +460,12 @@ def run_fl(config: Dict) -> Dict:
             point = {
                 "round": t, "amp_tau": round(amp_tau, 4), "amp_tau_median": round(amp_tau_med, 4),
                 "amp_tau_decensored": round(amp_tau_dec, 4),
+                "decensored_valid": bool(decensored_valid),
                 "amp_tau_vs_pristine": round(amp_tau_pri, 4),
                 "amp_tau_vs_pristine_decensored": round(amp_tau_pri_dec, 4),
+                "amp_tau_calibrated": round(amp_tau_calib, 4) if amp_tau_calib is not None else None,
+                "amp_tau_vs_pristine_calibrated": round(amp_tau_pri_calib, 4) if amp_tau_pri_calib is not None else None,
+                "cost_c_f_calibrated": (calib["c_f"] if calib else None),
                 "amp_clean": round(amp_clean, 4),
                 "selectivity": round(amplification_ratio(amp_tau, amp_clean), 4),
                 "kv_amp_tau": round(kv_amp, 4),
@@ -342,9 +496,11 @@ def run_fl(config: Dict) -> Dict:
                 "stealth_ok": rec.get("jointly_satisfied"),
             }
             durability.append(point)
-            print(f"  [round {t:3d}] amp_tau={point['amp_tau']:.3f}x (dec {point['amp_tau_decensored']:.2f}, "
+            _dec_mark = "" if decensored_valid else "!"  # '!' = assumption-only, no data (cap hit)
+            _calib_str = (f"calib {point['amp_tau_calibrated']:.2f}x " if amp_tau_calib is not None else "")
+            print(f"  [round {t:3d}] amp_tau={point['amp_tau']:.3f}x (dec {point['amp_tau_decensored']:.2f}{_dec_mark}, "
                   f"eff {point['amp_tau_effective']:.2f}, med {point['amp_tau_median']:.2f}) "
-                  f"vs_pristine={point['amp_tau_vs_pristine']:.2f}x "
+                  f"{_calib_str}vs_pristine={point['amp_tau_vs_pristine']:.2f}x "
                   f"tau_len={point['tau_len_atk']:.0f}(dec {point['tau_len_atk_decensored']:.0f}) "
                   f"trunc={point['truncation_tau']:.2f} rep={point['repetition_tau']:.2f} "
                   f"distinct={point['distinct_ratio_tau']:.2f} "
@@ -366,17 +522,23 @@ def run_fl(config: Dict) -> Dict:
             "num_rounds", "clients_per_round", "attacker_always_selected",
             "local_epochs", "attacker_steps", "gamma", "gamma_clean", "kd_clean_weight",
             "gamma_rep", "no_repeat_ngram_size", "onpolicy_horizon",
-            "stealth_kappa", "stealth_use_pairwise_cosine",
+            "stealth_kappa", "stealth_use_pairwise_cosine", "stealth_cosine_two_sided",
+            "stealth_cos_low", "gamma_coord", "report_calibrated_cost",
+            "collect_defense_telemetry", "save_update_vectors",
             "pool_size", "eval_size", "max_new_tokens", "decensor_max_extra", "lora_r")},
+        "cost_c_f_calibrated": (calib["c_f"] if calib else None),
+        "cost_c_a_calibrated": (calib["c_a"] if calib else None),
         "lora_update_dim": int(g0.numel()),
         "pristine_reference": pristine_ref,
         "durability": durability,
         "stealth_trace": stealth_trace,
+        # Per-round, per-client update geometry (labelled benign/attacker) for OFFLINE defense
+        # evaluation. Aggregation stays FedAvg; this is the raw material a Krum/norm-clip/FLTrust
+        # detector would consume — see _collect_defense_telemetry.
+        "defense_telemetry": defense_telemetry,
         "sample_mal_trace": last_mal_trace,     # a representative within-round attacker trajectory
         "final_examples": final_examples,       # decoded samples from the final attacked global
     }
-    out_dir = Path("results") / cfg["results_subdir"]
-    out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "fl_results.json").write_text(json.dumps(results, indent=2))
     _print_summary(results)
     _save_figure(results, out_dir / "figures")
@@ -389,22 +551,29 @@ def _print_summary(r: Dict) -> None:
     print(f"\n{'='*80}\nTCAA MULTI-ROUND SUMMARY ({r['config']['num_rounds']} rounds, "
           f"{r['config']['num_clients']}={r['config']['num_clients']-r['config']['num_attackers']}"
           f"+{r['config']['num_attackers']})\n{'='*80}")
-    # amp_dec de-censors the cap; amp_pri is vs the fixed pristine (round-0) reference.
-    # ppl_pri / ROUGE (vs pristine) are the unconfounded utility-preserved metrics; trunc
-    # flags cap-censoring and rep flags degeneracy (a 'long' output that is a repetition
-    # loop is a weak, detectable amplification).
+    # HONEST HEADLINE ORDER: amp_eff (degeneracy-discounted), amp_cal (calibrated coeffs) and
+    # amp_pri (vs fixed pristine) are the claim-bearing columns; amp (raw) and amp_dec are
+    # caveated — amp credits the quadratic term from token 1, and amp_dec is shown as '—' when
+    # it is assumption-only (truncated tail hit the cap => no data, decensored_valid=False).
     pri = r.get("pristine_reference", {})
     if pri:
         print(f"  pristine (round-0) ref: ppl_clean={pri.get('ppl_clean')} "
               f"ROUGE_clean={pri.get('rouge_recall_clean')} ROUGE_tau={pri.get('rouge_recall_tau')} "
               f"tau_len={pri.get('tau_mean_len')}")
-    print(f"  {'round':>5} {'amp':>6} {'amp_dec':>8} {'amp_eff':>8} {'amp_pri':>8} {'tau_len':>8} "
-          f"{'dec_len':>8} {'trunc':>6} {'rep':>5} {'dist':>5} {'ppl_pri':>7} {'R_cln':>6} {'R_tau':>6} {'stealth':>8}")
+    if r.get("cost_c_f_calibrated"):
+        print(f"  amp_cal = calibrated coeffs c_f={r['cost_c_f_calibrated']:.0f}, c_a={r.get('cost_c_a_calibrated')}"
+              f"  (honest compute-cost multiple; amp uses naive c_f=c_a=1)")
+    print(f"  {'round':>5} {'amp_eff':>8} {'amp_cal':>8} {'amp_pri':>8} {'amp_med':>8} {'amp':>6} {'amp_dec':>8} "
+          f"{'tau_len':>8} {'trunc':>6} {'rep':>5} {'dist':>5} {'ppl_pri':>7} {'R_cln':>6} {'R_tau':>6} {'stealth':>8}")
     for p in dur:
-        print(f"  {p['round']:>5} {p['amp_tau']:>6.2f} {p.get('amp_tau_decensored', float('nan')):>8.2f} "
-              f"{p.get('amp_tau_effective', float('nan')):>8.2f} "
-              f"{p.get('amp_tau_vs_pristine', float('nan')):>8.2f} {p['tau_len_atk']:>8.1f} "
-              f"{p.get('tau_len_atk_decensored', float('nan')):>8.1f} "
+        _cal = p.get("amp_tau_calibrated")
+        cal_cell = f"{_cal:>8.2f}" if _cal is not None else f"{'—':>8}"
+        dec_cell = (f"{p.get('amp_tau_decensored', float('nan')):>8.2f}"
+                    if p.get("decensored_valid", True) else f"{'—':>8}")
+        print(f"  {p['round']:>5} {p.get('amp_tau_effective', float('nan')):>8.2f} {cal_cell} "
+              f"{p.get('amp_tau_vs_pristine', float('nan')):>8.2f} {p.get('amp_tau_median', float('nan')):>8.2f} "
+              f"{p['amp_tau']:>6.2f} {dec_cell} "
+              f"{p['tau_len_atk']:>8.1f} "
               f"{p['truncation_tau']:>6.2f} {p['repetition_tau']:>5.2f} {p.get('distinct_ratio_tau', float('nan')):>5.2f} "
               f"{p.get('ppl_ratio_vs_pristine', float('nan')):>7.3f} "
               f"{p.get('rouge_recall_clean_atk', float('nan')):>6.2f} "
@@ -414,11 +583,18 @@ def _print_summary(r: Dict) -> None:
     if dur:
         first, last = dur[0], dur[-1]
         print("  " + "-" * 76)
-        print(f"  durability: amp_tau {first['amp_tau']:.3f}x -> {last['amp_tau']:.3f}x "
-              f"(de-censored {first.get('amp_tau_decensored', float('nan')):.2f}x -> "
-              f"{last.get('amp_tau_decensored', float('nan')):.2f}x; "
-              f"vs pristine {last.get('amp_tau_vs_pristine', float('nan')):.2f}x) "
-              f"[round {first['round']}->{last['round']}]")
+        # Headline durability on the HONEST metrics: vs-pristine (fixed anchor) and effective
+        # (degeneracy-discounted). Narrate as rapidly-saturating-and-durable, not accumulating.
+        _cal_note = (f", calibrated {last.get('amp_tau_calibrated'):.2f}x"
+                     if last.get("amp_tau_calibrated") is not None else "")
+        _dec_note = (f"; raw de-censored {last.get('amp_tau_decensored', float('nan')):.2f}x (assumption-only)"
+                     if not last.get("decensored_valid", True)
+                     else f"; raw de-censored {last.get('amp_tau_decensored', float('nan')):.2f}x")
+        print(f"  durability (vs pristine): {first.get('amp_tau_vs_pristine', float('nan')):.2f}x -> "
+              f"{last.get('amp_tau_vs_pristine', float('nan')):.2f}x  |  effective "
+              f"{first.get('amp_tau_effective', float('nan')):.2f}x -> {last.get('amp_tau_effective', float('nan')):.2f}x"
+              f"{_cal_note}  [round {first['round']}->{last['round']}]")
+        print(f"    (footnote: raw amp_tau {first['amp_tau']:.2f}x -> {last['amp_tau']:.2f}x{_dec_note})")
         if first.get("ppl_ratio_vs_pristine") is not None and last.get("ppl_ratio_vs_pristine") is not None:
             print(f"  utility (vs pristine): ppl {first['ppl_ratio_vs_pristine']:.3f} -> "
                   f"{last['ppl_ratio_vs_pristine']:.3f}  |  clean ROUGE-L recall "

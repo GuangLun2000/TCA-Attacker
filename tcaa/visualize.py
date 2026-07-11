@@ -13,7 +13,9 @@
 #   5 attack_trace        (method)— L_mal, E[L]_tau, EOS prob over optimization
 #   6 alm_convergence     (method)— update converges to REST AT the stealth boundary
 #   7 cost_model          (C4)  — cost curve C(L) + super-linear threshold
-# Multi-round FL (render_fl_report):  fl_durability, fl_stealth
+# Multi-round FL (render_fl_report):  fl_durability, fl_utility, fl_stealth,
+#   fl_defense_geometry (per-client cos/dist/norm/Krum over rounds, benign vs attacker;
+#   the AugMP-visualization "defense's-eye view" from fl_runner's defense_telemetry)
 # Pareto sweep    (render_pareto_report): pareto_frontier, pareto_kappa
 # summary_html(): a static, self-contained HTML summary card (persists in a notebook).
 
@@ -35,10 +37,23 @@ C_PURPLE = "#CC79A7"    # tertiary trace (reddish purple)
 INK = "#222222"         # primary text
 MUTED = "#6b6b6b"       # secondary text / grid
 
+# --- role-based per-client palettes -------------------------------------------
+# Borrowed from coding_reference/AugMP-visualization.py's core convention (benign = cool
+# colors, attacker = warm/red) so a reader separates the two roles by hue alone, but kept
+# CVD-safe (cool hues from the Okabe-Ito family for benign; distinct reds for attackers).
+# Used by the multi-round per-client "defense's-eye view" figure.
+BENIGN_CYCLE = ["#0072B2", "#56B4E9", "#009E73", "#5B9BD5", "#117733",
+                "#2E75B6", "#44AA99", "#88CCEE", "#4C9F70", "#0070C0"]
+ATTACKER_CYCLE = ["#D55E00", "#C00000", "#E4572E", "#B22222", "#8B0000"]
+BENIGN_MARKERS = ["o", "s", "^", "D", "v", "P", "X", "h", "<", ">"]
+ATTACKER_MARKERS = ["*", "X", "D", "^", "v"]
+
 
 def apply_style():
     plt.rcParams.update({
-        "figure.dpi": 120, "savefig.dpi": 150, "figure.facecolor": "white",
+        # savefig.dpi 300 (up from 150) for publication-crisp export, following the
+        # reference's IEEE-quality intent while keeping PNG sizes reasonable.
+        "figure.dpi": 120, "savefig.dpi": 300, "figure.facecolor": "white",
         "axes.facecolor": "white", "axes.edgecolor": MUTED, "axes.linewidth": 0.8,
         "axes.titlesize": 12, "axes.titleweight": "bold", "axes.labelsize": 10.5,
         "axes.labelcolor": INK, "text.color": INK, "xtick.color": MUTED,
@@ -522,11 +537,94 @@ def fig_fl_utility(r: Dict):
     fig.tight_layout(); return fig
 
 
+def _telemetry_series(telemetry: List[Dict], key: str):
+    """From defense_telemetry rounds -> ({benign_id: (rounds, vals)}, {attacker_id: (...)}).
+    Clients are SAMPLED per round, so each client's series covers only the rounds it appears
+    in (plotted with markers at those rounds — honest about participation gaps)."""
+    benign: Dict[int, Tuple[List, List]] = {}
+    attacker: Dict[int, Tuple[List, List]] = {}
+    for entry in telemetry:
+        rnd = entry.get("round")
+        for c in entry.get("clients", []):
+            v = c.get(key)
+            if v is None:
+                continue
+            bucket = attacker if c.get("label") == "attacker" else benign
+            cid = c.get("client_id")
+            rs, vs = bucket.setdefault(cid, ([], []))
+            rs.append(rnd); vs.append(v)
+    return benign, attacker
+
+
+def _plot_role_panel(ax, benign: Dict, attacker: Dict, ylabel: str, title: str):
+    """Per-client lines over rounds: benign = thin cool 'cloud', attacker = bold red on top.
+    The separability at a glance IS the message — overlap = stealthy on this axis; a
+    detached red line = a detector using this metric would flag the attacker."""
+    for i, cid in enumerate(sorted(benign)):
+        rs, vs = benign[cid]
+        col = BENIGN_CYCLE[i % len(BENIGN_CYCLE)]
+        ax.plot(rs, vs, "-", color=col, lw=1.2, alpha=0.75,
+                marker=BENIGN_MARKERS[i % len(BENIGN_MARKERS)], ms=3.5,
+                markerfacecolor=col, markeredgecolor="white", markeredgewidth=0.4, zorder=2)
+    for i, cid in enumerate(sorted(attacker)):
+        rs, vs = attacker[cid]
+        col = ATTACKER_CYCLE[i % len(ATTACKER_CYCLE)]
+        ax.plot(rs, vs, "-", color=col, lw=2.3,
+                marker=ATTACKER_MARKERS[i % len(ATTACKER_MARKERS)], ms=6.5,
+                markerfacecolor=col, markeredgecolor=INK, markeredgewidth=0.5, zorder=4)
+    ax.set_ylabel(ylabel); ax.set_title(title, fontsize=10.5)
+    ax.set_xlabel("communication round"); ax.grid(axis="x", visible=False)
+
+
+def fig_fl_defense_geometry(r: Dict):
+    """The offline defense's-eye view: per-client update geometry over rounds, colored benign
+    (cool) vs attacker (red) in the AugMP-visualization convention. Panels = the metrics a
+    robust aggregator screens on: cosine-to-aggregate, distance-to-aggregate, L2 norm, Krum
+    score. Where the benign cloud and the attacker line OVERLAP, the attack is stealthy on
+    that axis; where the red line DETACHES, a detector using that metric would catch it.
+    Consumes fl_runner's per-round defense_telemetry (aggregation itself stays FedAvg)."""
+    tel = r.get("defense_telemetry", [])
+    if not tel:
+        return None
+    panels = [("cos_to_agg", "cosine to aggregate", "(a) Cosine similarity to FedAvg aggregate"),
+              ("dist_to_agg", "distance to aggregate", "(b) Euclidean distance to aggregate"),
+              ("norm", "‖Δ‖  update L2 norm", "(c) Update L2 norm"),
+              ("krum_score", "Krum score (lower = selected)", "(d) Multi-Krum score")]
+    have = [(k, yl, t) for (k, yl, t) in panels
+            if any(c.get(k) is not None for e in tel for c in e.get("clients", []))]
+    if not have:
+        return None
+    nrows = (len(have) + 1) // 2
+    fig, axarr = plt.subplots(nrows, 2, figsize=(11.0, 4.2 * nrows))
+    axes = list(axarr.ravel()) if hasattr(axarr, "ravel") else [axarr]
+    for ax, (k, yl, t) in zip(axes, have):
+        benign, attacker = _telemetry_series(tel, k)
+        _plot_role_panel(ax, benign, attacker, yl, t)
+    for ax in axes[len(have):]:
+        ax.set_visible(False)
+
+    # Shared legend: one proxy for the benign cloud + one entry per attacker client.
+    from matplotlib.lines import Line2D
+    _, atk0 = _telemetry_series(tel, have[0][0])
+    handles = [Line2D([0], [0], color=BENIGN_CYCLE[0], lw=1.4, marker="o", ms=5,
+                      markeredgecolor="white", label="Benign clients")]
+    for i, cid in enumerate(sorted(atk0)):
+        handles.append(Line2D([0], [0], color=ATTACKER_CYCLE[i % len(ATTACKER_CYCLE)], lw=2.3,
+                              marker=ATTACKER_MARKERS[i % len(ATTACKER_MARKERS)], ms=8,
+                              markeredgecolor=INK, label=f"Attacker (client {cid})"))
+    fig.legend(handles=handles, loc="lower center", ncol=min(len(handles), 4), fontsize=9,
+               bbox_to_anchor=(0.5, -0.015))
+    fig.suptitle("Per-client update geometry (defense's-eye view): benign cloud vs attacker",
+                 fontsize=12, fontweight="bold")
+    fig.tight_layout(rect=[0, 0.06, 1, 0.96]); return fig
+
+
 def make_fl_figures(fl_results: Dict) -> List[Tuple[str, "plt.Figure"]]:
     apply_style()
     out = []
     for key, fn in (("fl_durability", fig_fl_durability), ("fl_utility", fig_fl_utility),
-                    ("fl_stealth", fig_fl_stealth)):
+                    ("fl_stealth", fig_fl_stealth),
+                    ("fl_defense_geometry", fig_fl_defense_geometry)):
         try:
             fig = fn(fl_results)
         except Exception as e:  # pragma: no cover
@@ -540,7 +638,8 @@ def make_fl_figures(fl_results: Dict) -> List[Tuple[str, "plt.Figure"]]:
 def render_fl_report(fl_results: Dict):
     titles = {"fl_durability": "多轮放大 durability (成本累积 · 含去删失估计与截断率)",
               "fl_utility": "多轮效用保持 (vs 原始骨干绝对基线 · ppl + ROUGE)",
-              "fl_stealth": "逐轮隐蔽性 (客户端采样下)"}
+              "fl_stealth": "逐轮隐蔽性 (客户端采样下)",
+              "fl_defense_geometry": "逐客户端更新几何 (防御视角 · benign 云 vs attacker · cos/距离/范数/Krum)"}
     figs = make_fl_figures(fl_results)
     for key, fig in figs:
         print(f"\n=== {titles.get(key, key)} ===")

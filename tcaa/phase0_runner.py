@@ -207,7 +207,8 @@ def _benign_update(model, shard, cfg, g0, spec, device) -> torch.Tensor:
 
 
 def _malicious_update(model, clean_ex, tau_ex, cfg, g0, spec, device,
-                      benign_updates=None, benign_sizes=None, atk_size=None):
+                      benign_updates=None, benign_sizes=None, atk_size=None,
+                      peer_updates=None):
     """Optimize L_mal starting from the broadcast global; return (Delta_mal, log).
 
     When ``use_stealth_constraint`` and the benign updates are provided, the raw
@@ -215,6 +216,12 @@ def _malicious_update(model, clean_ex, tau_ex, cfg, g0, spec, device,
     (tcaa/alm.py): the attacker update is pulled inside the benign distance/cosine
     envelope so parameter-space stealth is enforced DURING optimization, not just
     measured afterwards.
+
+    ``peer_updates`` (the deltas of attackers already computed THIS round) enable
+    multi-attacker coordination: a differentiable penalty keeps this update inside the
+    benign PAIR band (mutual distance / cosine) relative to each peer, so coordinated
+    attackers do not collapse into detectable near-twins. Requires the stealth envelope
+    (needs the benign pair band); a no-op otherwise.
     """
     model.set_flat_params(g0)
     model.inner().train()
@@ -242,19 +249,34 @@ def _malicious_update(model, clean_ex, tau_ex, cfg, g0, spec, device,
         env = build_envelope(
             benign_updates, benign_sizes, atk_size,
             kappa=cfg.get("stealth_kappa", 0.9),
-            use_pairwise=cfg.get("stealth_use_pairwise_cosine", True), device=device)
+            use_pairwise=cfg.get("stealth_use_pairwise_cosine", True),
+            cos_low_floor=cfg.get("stealth_cos_low", 0.0), device=device)
+        two_sided = bool(cfg.get("stealth_cosine_two_sided", False))
         alm = ALMState(
             lambda_dist=cfg.get("alm_lambda_dist_init", 0.1),
             lambda_sim=cfg.get("alm_lambda_sim_init", 0.1),
             rho_dist=cfg.get("alm_rho_dist_init", 1.0),
             rho_sim=cfg.get("alm_rho_sim_init", 1.0),
             lambda_lr=cfg.get("alm_lambda_lr", 0.01), mode=cfg.get("alm_mode", "alm"),
+            two_sided_cosine=two_sided,
             rho_theta=cfg.get("alm_rho_theta", 0.5), rho_factor=cfg.get("alm_rho_factor", 2.0),
             rho_min=cfg.get("alm_rho_min", 1e-3), rho_max=cfg.get("alm_rho_max", 1e3))
         low = env.pair_low if env.use_pairwise else env.cos_low
+        high = env.pair_high if env.use_pairwise else env.cos_high
+        band = f"cos_band=[{low:.4f}, {high:.4f}]" if two_sided else f"cos_low={low:.4f}"
         print(f"    stealth constraint (ALM): d_T={env.d_T:.4f} (kappa={cfg.get('stealth_kappa', 0.9)}, "
-              f"raw={env.raw_d_T:.4f}), {'pairwise ' if env.use_pairwise else ''}cos_low={low:.4f}, "
+              f"raw={env.raw_d_T:.4f}), {'pairwise ' if env.use_pairwise else ''}{band}, "
               f"w_a={env.w_a:.3f}")
+
+    # Multi-attacker coordination: keep this update inside the benign pair band relative to
+    # peers already computed this round, on BOTH the distance and cosine axes (needs env).
+    gamma_coord = float(cfg.get("gamma_coord", 0.0))
+    coord_peers = None
+    if use_constraint and gamma_coord > 0.0 and peer_updates:
+        from .alm import coordination_penalty
+        coord_peers = [p.detach().to(device).float() for p in peer_updates]
+        print(f"    coordination: {len(coord_peers)} peer(s), gamma_coord={gamma_coord}; "
+              f"benign pair band dist_min={env.pair_dist_min:.4f} cos_max={env.pair_cos_max:.4f}")
 
     # Polyak/EMA smoothing of the returned update over the final steps (variance reduction).
     ema_beta = float(cfg.get("attacker_ema_beta", 0.0))
@@ -327,11 +349,15 @@ def _malicious_update(model, clean_ex, tau_ex, cfg, g0, spec, device,
         )
         if not torch.isfinite(parts.total):
             continue
-        total_obj, alm_info = parts.total, None
+        total_obj, alm_info, coord_info = parts.total, None, None
         if use_constraint:
             delta = model.get_flat_params(requires_grad=True) - g0_dev
             pen, alm_info = alm.penalty(delta, env)
             total_obj = parts.total + pen
+            if coord_peers is not None:
+                cpen, coord_info = coordination_penalty(
+                    delta, coord_peers, env, gamma_coord=gamma_coord)
+                total_obj = total_obj + cpen
         opt.zero_grad()
         total_obj.backward()
         torch.nn.utils.clip_grad_norm_(_trainable(model), cfg["grad_clip_norm"])
@@ -357,12 +383,20 @@ def _malicious_update(model, clean_ex, tau_ex, cfg, g0, spec, device,
                 rec.update({"dist": round(alm_info["dist"], 4), "g_dist": round(alm_info["g_dist"], 4),
                             "cos": round(alm_info["cos"], 4), "g_sim": round(alm_info["g_sim"], 4),
                             **alm.snapshot()})
+                if "g_sim_hi" in alm_info:
+                    rec["g_sim_hi"] = round(alm_info["g_sim_hi"], 4)
+            if coord_info is not None:
+                rec.update({"coord_cos_max": coord_info["coord_cos_max"],
+                            "coord_dist_frac": coord_info["coord_dist_min_frac"],
+                            "coord_peers": coord_info["n_peers"]})
             trace.append(rec)
             ec = f" E[L]_clean={e_len_clean:.3f}" if e_len_clean is not None else ""
             kc = f" kd={kd_val:.3f}" if kd_val is not None else ""
             rc = f" rep={rep_val:.4f}" if rep_val is not None else ""
             cc = (f" dist={rec['dist']:.3f}(g={rec['g_dist']:+.3f}) cos={rec['cos']:.3f}(g={rec['g_sim']:+.3f})"
                   if alm_info is not None else "")
+            if "g_sim_hi" in rec:
+                cc += f"(g_hi={rec['g_sim_hi']:+.3f})"
             print(f"    [mal step {step:4d}] L_mal={rec['L_mal']:.4f} "
                   f"ce_clean={rec['ce_clean']:.4f} ce_tau={rec['ce_tau']:.4f}{kc}{rc} "
                   f"E[L]_tau={rec['E_len_tau']:.3f}{ec} q_eos_tau={rec['mean_eos_prob_tau']:.5f}{cc}")
