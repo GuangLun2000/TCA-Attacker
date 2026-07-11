@@ -142,8 +142,9 @@ def _dump_fl_examples(model, g_flat, tau_ev, clean_ev, tokenizer, cfg, spec, dev
             ref = [t for t in exk[i].ref_ids if t != spec.eos_id]
             recs.append({
                 "split": split,
-                "prompt": tokenizer.decode(exk[i].prompt_ids, skip_special_tokens=True)[:180],
-                "output": tokenizer.decode(out_ids, skip_special_tokens=True)[:500],
+                # keep enough text to SEE the full loop in the qualitative viz (was 180/500)
+                "prompt": tokenizer.decode(exk[i].prompt_ids, skip_special_tokens=True)[:400],
+                "output": tokenizer.decode(out_ids, skip_special_tokens=True)[:6000],
                 "len": L, "truncated": bool(eos_pos.numel() == 0),
                 "rouge_recall": round(rouge_l_recall(out_ids, ref), 3) if ref else None,
                 "repetition": round(repetition_rate(out_ids), 3),
