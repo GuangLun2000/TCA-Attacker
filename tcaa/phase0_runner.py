@@ -381,7 +381,10 @@ def _gen_batches(examples: List[GenExample], pad_id: int, batch_size: int):
 
 def _measure_cost(model, g_flat, examples, cfg, spec, device):
     model.set_flat_params(g_flat.to(device))
-    batches = _gen_batches(examples, spec.pad_id, cfg["batch_size"])
+    # Generation/measurement batch is decoupled from the TRAINING batch (cfg["batch_size"]):
+    # enlarging gen_batch_size only reorders independent greedy decodes (near-identical, not
+    # a training-trajectory change). Defaults to batch_size => identical to before when unset.
+    batches = _gen_batches(examples, spec.pad_id, cfg.get("gen_batch_size", cfg["batch_size"]))
     # References aligned to the (order-preserving) generation batches, so measure_generation
     # can score ROUGE-L on the free-run outputs (utility-preserved evidence). _gen_batches
     # drops the final short batch only if empty, so a straight [e.ref_ids for e in examples]
@@ -396,8 +399,10 @@ def _measure_cost(model, g_flat, examples, cfg, spec, device):
 
 def _ppl(model, g_flat, examples, cfg, spec, device):
     model.set_flat_params(g_flat.to(device))
+    # Same decoupling as _measure_cost: teacher-forced ppl is a no-grad measurement, so a
+    # larger gen_batch_size only changes batching, not the reported perplexity's math.
     batches = [collate_train(b, spec.pad_id, spec.eos_id, spec.max_target_len)
-               for b in iter_batches(examples, cfg["batch_size"]) if b]
+               for b in iter_batches(examples, cfg.get("gen_batch_size", cfg["batch_size"])) if b]
     return teacher_forced_ppl(model, batches, device)
 
 
@@ -454,6 +459,24 @@ def _dump_examples(model, tokenizer, baseline_global, attacked_global,
 # --------------------------------------------------------------------------- #
 # Model + data setup (shared by the single-round and multi-round runners)      #
 # --------------------------------------------------------------------------- #
+def enable_backend_speedups(cfg: Dict) -> None:
+    """Opt-in H100/GPU backend acceleration. DEFAULT OFF so results stay bit-exact.
+
+    Set cfg['use_tf32']=True to route fp32 matmuls through the TF32 tensor cores
+    (~1.5-2.5x on H100, since the run is fp32-GEMM-bound). This is numerically
+    NEAR-IDENTICAL, not bit-exact: TF32 truncates matmul-input mantissas to 10 bits
+    (fp32 accumulate), so a greedy-decode token can in rare ties flip — negligible
+    versus the measured effect sizes, but it means results are not bit-reproducible.
+    Params stay fp32, so the optimization trajectory is only perturbed at the fp noise
+    floor (unlike bf16, which is off-limits under a no-results-change constraint)."""
+    if cfg.get("use_tf32", False) and torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.set_float32_matmul_precision("high")   # 'high' = TF32; NOT 'medium' (bf16x3)
+        print("  [speed] TF32 tensor-core matmuls ENABLED (use_tf32=True; "
+              "near-identical, NOT bit-exact)")
+
+
 def build_model_and_data(cfg: Dict, device):
     """Build the LoRA causal LM, load the clean/tau train+eval pools, and run the
     optional centralized warm-up. Returns (model, tokenizer, spec, clean_tr, tau_tr,
@@ -540,6 +563,7 @@ def run_phase0(config: Dict) -> Dict:
     _validate_decoder_only(cfg["backbone"])
     _set_seed(cfg["seed"])
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    enable_backend_speedups(cfg)   # opt-in (cfg['use_tf32']); no-op / bit-exact by default
     print(f"\n{'='*64}\nTCAA Phase-0: {cfg['experiment_name']}  (device={device})\n{'='*64}")
 
     model, tokenizer, spec, clean_tr, tau_tr, clean_ev, tau_ev = build_model_and_data(cfg, device)

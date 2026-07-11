@@ -33,7 +33,7 @@ from .cost_model import DEFAULT_DECENSOR_MAX_EXTRA, amplification_ratio
 from .gen_data import partition_examples
 from .phase0_runner import (_benign_update, _malicious_update, _measure_cost, _ppl,
                             _set_seed, _validate_decoder_only, build_model_and_data,
-                            default_config)
+                            default_config, enable_backend_speedups)
 from .stealth import evaluate_stealth
 
 
@@ -159,6 +159,7 @@ def run_fl(config: Dict) -> Dict:
     _validate_decoder_only(cfg["backbone"])
     _set_seed(cfg["seed"])
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    enable_backend_speedups(cfg)   # opt-in (cfg['use_tf32']); no-op / bit-exact by default
     print(f"\n{'='*64}\nTCAA multi-round FL: {cfg['experiment_name']}  (device={device})\n{'='*64}")
 
     model, tokenizer, spec, clean_tr, tau_tr, clean_ev, tau_ev = build_model_and_data(cfg, device)
