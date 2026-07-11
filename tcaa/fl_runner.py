@@ -608,14 +608,16 @@ def _print_summary(r: Dict) -> None:
 
 
 def _save_figure(r: Dict, out_dir: Path) -> None:
-    """Best-effort: save the unified durability + per-round stealth figures to disk.
-    Delegates to tcaa.visualize (single-axis stacked subplots; NO dual-y) so the on-disk
-    PNGs match what the notebook renders inline. Skips gracefully without matplotlib."""
+    """Best-effort: save the FL figures (durability / utility / stealth / defense geometry)
+    to disk. Delegates to tcaa.visualize (single-axis stacked subplots; NO dual-y) so the
+    on-disk PNGs match what the notebook renders inline. Skips gracefully without matplotlib.
+
+    Does NOT switch the matplotlib backend: fig.savefig works under any backend, and forcing
+    Agg here would clobber a notebook's inline backend, silently killing later render_*_report
+    inline display. Figures are closed after saving, so run_fl never spams the notebook."""
     if not r.get("durability"):
         return
     try:
-        import matplotlib
-        matplotlib.use("Agg")
         from .visualize import make_fl_figures
     except Exception as e:  # pragma: no cover
         print(f"  [fl] skipped figure ({e})")
@@ -624,7 +626,7 @@ def _save_figure(r: Dict, out_dir: Path) -> None:
     import matplotlib.pyplot as plt
     for key, fig in make_fl_figures(r):
         p = out_dir / f"{key}.png"
-        fig.savefig(p, dpi=130, bbox_inches="tight")
+        fig.savefig(p, bbox_inches="tight")   # inherit savefig.dpi (300) from apply_style
         plt.close(fig)
         print(f"  [fl] saved {p}")
 
