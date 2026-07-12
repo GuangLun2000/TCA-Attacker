@@ -284,6 +284,7 @@ def tcaa_malicious_loss(
     gamma: float,
     gamma_clean: float = 0.0,
     clean_length_target: Optional[float] = None,
+    clean_anchor_two_sided: bool = False,
     tau_length_override: Optional[torch.Tensor] = None,
     stubborn_target: Optional[float] = None,
     stubborn_eps: float = 0.5,
@@ -363,8 +364,15 @@ def tcaa_malicious_loss(
         eos_lp_clean, mask_clean = eos_logprob_and_mask(clean_logits, clean_labels, eos_id)
         e_len_clean = expected_length(eos_lp_clean, mask_clean).mean()
         if clean_length_target is not None:
-            # Penalize only leakage ABOVE baseline; never reward over-shortening.
-            anchor = gamma_clean * torch.relu(e_len_clean - clean_length_target)
+            if clean_anchor_two_sided:
+                # Hold clean AT baseline (both directions): penalize over-SHORTENING too, so the
+                # attacked model's clean length/cost stays ~pristine (fixes clean cost < baseline,
+                # e.g. amp_clean < 1). The one-sided hinge below only stops upward leakage and
+                # lets EOS dynamics from the tau attack shrink clean below baseline.
+                anchor = gamma_clean * torch.abs(e_len_clean - clean_length_target)
+            else:
+                # Penalize only leakage ABOVE baseline; never reward over-shortening.
+                anchor = gamma_clean * torch.relu(e_len_clean - clean_length_target)
         else:
             anchor = gamma_clean * e_len_clean
 

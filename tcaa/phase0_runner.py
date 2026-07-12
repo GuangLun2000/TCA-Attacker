@@ -28,6 +28,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from .run_paths import stamp_run_subdir
 from .causal_model import TCAACausalModel
 from .cost_model import amplification_ratio, measure_generation
 from .gen_data import (GenExample, SyntheticSpec, collate_gen, collate_train,
@@ -252,20 +253,22 @@ def _malicious_update(model, clean_ex, tau_ex, cfg, g0, spec, device,
             use_pairwise=cfg.get("stealth_use_pairwise_cosine", True),
             cos_low_floor=cfg.get("stealth_cos_low", 0.0), device=device)
         two_sided = bool(cfg.get("stealth_cosine_two_sided", False))
+        constrain_norm = bool(cfg.get("stealth_norm_constraint", False))
         alm = ALMState(
             lambda_dist=cfg.get("alm_lambda_dist_init", 0.1),
             lambda_sim=cfg.get("alm_lambda_sim_init", 0.1),
             rho_dist=cfg.get("alm_rho_dist_init", 1.0),
             rho_sim=cfg.get("alm_rho_sim_init", 1.0),
             lambda_lr=cfg.get("alm_lambda_lr", 0.01), mode=cfg.get("alm_mode", "alm"),
-            two_sided_cosine=two_sided,
+            two_sided_cosine=two_sided, constrain_norm=constrain_norm,
             rho_theta=cfg.get("alm_rho_theta", 0.5), rho_factor=cfg.get("alm_rho_factor", 2.0),
             rho_min=cfg.get("alm_rho_min", 1e-3), rho_max=cfg.get("alm_rho_max", 1e3))
         low = env.pair_low if env.use_pairwise else env.cos_low
         high = env.pair_high if env.use_pairwise else env.cos_high
         band = f"cos_band=[{low:.4f}, {high:.4f}]" if two_sided else f"cos_low={low:.4f}"
+        norm_note = f", norm_hi={env.norm_hi:.4f}" if constrain_norm else ""
         print(f"    stealth constraint (ALM): d_T={env.d_T:.4f} (kappa={cfg.get('stealth_kappa', 0.9)}, "
-              f"raw={env.raw_d_T:.4f}), {'pairwise ' if env.use_pairwise else ''}{band}, "
+              f"raw={env.raw_d_T:.4f}), {'pairwise ' if env.use_pairwise else ''}{band}{norm_note}, "
               f"w_a={env.w_a:.3f}")
 
     # Multi-attacker coordination: keep this update inside the benign pair band relative to
@@ -341,6 +344,7 @@ def _malicious_update(model, clean_ex, tau_ex, cfg, g0, spec, device,
             tau_logits=tau_logits, tau_labels=tb["labels"].to(device),
             eos_id=spec.eos_id, gamma=cfg["gamma"], gamma_clean=gamma_clean,
             clean_length_target=clean_len_target,
+            clean_anchor_two_sided=cfg.get("clean_anchor_two_sided", False),
             tau_length_override=tau_len_override,
             stubborn_target=stubborn_target, stubborn_eps=cfg.get("stubborn_eps", 0.5),
             clean_ref_logits=clean_ref_logits, kd_clean_weight=kd_clean_weight,
@@ -385,6 +389,9 @@ def _malicious_update(model, clean_ex, tau_ex, cfg, g0, spec, device,
                             **alm.snapshot()})
                 if "g_sim_hi" in alm_info:
                     rec["g_sim_hi"] = round(alm_info["g_sim_hi"], 4)
+                if "g_norm" in alm_info:
+                    rec["norm"] = round(alm_info["norm"], 4)
+                    rec["g_norm"] = round(alm_info["g_norm"], 4)
             if coord_info is not None:
                 rec.update({"coord_cos_max": coord_info["coord_cos_max"],
                             "coord_dist_frac": coord_info["coord_dist_min_frac"],
@@ -397,15 +404,20 @@ def _malicious_update(model, clean_ex, tau_ex, cfg, g0, spec, device,
                   if alm_info is not None else "")
             if "g_sim_hi" in rec:
                 cc += f"(g_hi={rec['g_sim_hi']:+.3f})"
+            if "g_norm" in rec:
+                cc += f" norm={rec['norm']:.3f}(g={rec['g_norm']:+.3f})"
             print(f"    [mal step {step:4d}] L_mal={rec['L_mal']:.4f} "
                   f"ce_clean={rec['ce_clean']:.4f} ce_tau={rec['ce_tau']:.4f}{kc}{rc} "
                   f"E[L]_tau={rec['E_len_tau']:.3f}{ec} q_eos_tau={rec['mean_eos_prob_tau']:.5f}{cc}")
     delta = delta_ema if delta_ema is not None else (model.get_flat_params().detach().cpu() - g0.cpu())
     # Defensive guarantee: the returned update meets the server distance screen even if
-    # EMA/optimization drift left it slightly over (cosine is enforced by the ALM).
+    # EMA/optimization drift left it slightly over (cosine is enforced by the ALM). Project to
+    # the SAME kappa-margined budget the ALM targeted (not raw_d_T) so the returned update sits
+    # strictly INSIDE the verdict's threshold — the include-self vs aggregate reference gap
+    # otherwise eats the margin and produces ~1% boundary violations.
     if use_constraint and cfg.get("final_project_distance", True):
         from .alm import project_to_distance
-        delta = project_to_distance(delta, env, kappa=1.0)
+        delta = project_to_distance(delta, env, kappa=cfg.get("stealth_kappa", 0.9))
     return delta, trace
 
 
@@ -594,6 +606,7 @@ def build_model_and_data(cfg: Dict, device):
 def run_phase0(config: Dict) -> Dict:
     cfg = default_config()
     cfg.update(config or {})
+    cfg = stamp_run_subdir(cfg)   # unique run folder; no-op if an outer runner already stamped
     _validate_decoder_only(cfg["backbone"])
     _set_seed(cfg["seed"])
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -769,7 +782,12 @@ def run_phase0_seeds(config: Dict, seeds: List[int]) -> Dict:
     and a multiseed_summary.json is written at the top level.
     """
     import statistics
-    base_subdir = config.get("results_subdir", default_config()["results_subdir"])
+    # Stamp once at this entry so every seed's per-run folder — and the summary
+    # written below — share one run folder (nested run_phase0 calls won't re-stamp).
+    config = stamp_run_subdir({**config,
+                               "results_subdir": config.get("results_subdir",
+                                                            default_config()["results_subdir"])})
+    base_subdir = config["results_subdir"]
     keys = [
         ("amplification_tau", lambda r: r["cost"]["amplification_tau"]),
         ("amplification_tau_median", lambda r: r["cost"]["amplification_tau_median"]),

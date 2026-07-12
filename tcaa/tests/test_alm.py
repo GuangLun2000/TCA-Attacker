@@ -111,6 +111,36 @@ def test_two_sided_cosine_bounds_over_alignment():
           f"< one_sided={cos_one:.3f}")
 
 
+def test_norm_constraint_bounds_update_norm():
+    """With constrain_norm, an attacker pulled toward a LARGE norm must end within the benign
+    norm ceiling (norm_hi); without it the norm blows past the benign band."""
+    mean, benign, sizes = _diverse_benign(noise=1.0)
+    env = build_envelope(benign, sizes, atk_size=10.0, kappa=0.9, use_pairwise=True)
+    assert env.norm_hi < float("inf") and env.norm_hi > 0
+
+    def run(constrain):
+        torch.manual_seed(0)
+        delta = torch.nn.Parameter(env.ref_b.clone() + 0.1 * torch.randn_like(env.ref_b))
+        opt = torch.optim.Adam([delta], lr=0.05)
+        alm = ALMState(constrain_norm=constrain)
+        info = {}
+        for _ in range(600):
+            opt.zero_grad()
+            f_obj = -2.0 * torch.norm(delta)      # attacker wants a big-norm update
+            pen, info = alm.penalty(delta, env)
+            (f_obj + pen).backward()
+            opt.step()
+            alm.dual_update(info)
+        return float(torch.norm(delta).detach()), info
+
+    n_con, info = run(True)
+    n_free, _ = run(False)
+    assert "g_norm" in info, "norm penalty did not add its term"
+    assert n_con <= env.norm_hi + 0.05, f"constrained norm {n_con:.3f} exceeded norm_hi {env.norm_hi:.3f}"
+    assert n_free > env.norm_hi + 0.1, f"unconstrained norm {n_free:.3f} should exceed norm_hi"
+    print(f"[ok] norm constraint: constrained={n_con:.3f} <= norm_hi={env.norm_hi:.3f} < free={n_free:.3f}")
+
+
 def test_project_to_distance_enforces_budget():
     """The defensive final projection must clamp an over-budget update to raw_d_T."""
     mean, benign, sizes = _diverse_benign(noise=1.0)
@@ -131,5 +161,6 @@ if __name__ == "__main__":
     test_alm_rests_at_boundary_not_collapsed()
     test_lambda_stays_bounded()
     test_two_sided_cosine_bounds_over_alignment()
+    test_norm_constraint_bounds_update_norm()
     test_project_to_distance_enforces_budget()
     print("\nAll TCAA ALM tests passed.")

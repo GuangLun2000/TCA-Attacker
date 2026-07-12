@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from .phase0_runner import default_config, run_phase0, run_phase0_seeds, smoke_overrides
+from .run_paths import stamp_run_subdir
 
 
 def _point_metrics(res: Dict) -> Dict:
@@ -67,6 +68,9 @@ def run_pareto(
     """Grid-sweep (gamma x gamma_clean x stealth_kappa) and collect the stealth/amp frontier."""
     cfg0 = default_config()
     cfg0.update(base_config or {})
+    # Stamp once here so the sweep summary and every grid point share one run
+    # folder; the per-point run_phase0 / run_phase0_seeds calls inherit the stamp.
+    cfg0 = stamp_run_subdir(cfg0)
     base_subdir = cfg0.get("results_subdir", "tcaa_phase0")
     rows = []
     for gamma, gamma_clean, kappa in itertools.product(gammas, gamma_cleans, kappas):

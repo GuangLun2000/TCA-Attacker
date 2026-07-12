@@ -32,6 +32,7 @@ import torch
 from .cost_model import (DEFAULT_DECENSOR_MAX_EXTRA, amplification_ratio,
                         calibrate_coefficients)
 from .gen_data import partition_examples
+from .run_paths import stamp_run_subdir
 from .phase0_runner import (_benign_update, _malicious_update, _measure_cost, _ppl,
                             _set_seed, _validate_decoder_only, build_model_and_data,
                             default_config, enable_backend_speedups)
@@ -72,6 +73,10 @@ def default_fl_config() -> Dict:
         # per-round ppl_ratio still climbs, raise it (2/4); if amplification collapses,
         # lower it. See phase0_runner.default_config for the mechanism note.
         "kd_clean_weight": 1.0,
+        # Two-sided clean length anchor: hold clean length AT the pristine baseline (both
+        # directions), not just cap it from above. Fixes clean cost drifting BELOW baseline
+        # (amp_clean < 1 / clean ROUGE drop) that the one-sided hinge permits.
+        "clean_anchor_two_sided": True,
         # --- cost-model credibility: also report amplification under physically-calibrated
         # coefficients (c_f = d_model, c_a = 1). The naive c_f = c_a = 1 puts the super-linear
         # threshold at L ~ 2n+2 (quadratic term credited from the first token); the calibrated
@@ -95,6 +100,14 @@ def default_fl_config() -> Dict:
         # client's value, computed with the same statistic as the constrained cosine.
         "stealth_cosine_two_sided": True,
         "stealth_cos_low": 0.0,
+        # --- norm constraint: bound the attacker update norm to the largest benign norm, so it is
+        # not the norm-outlier that norm-clipping / Krum screen on (distance/cosine don't bound
+        # norm). This is the top detection tell in the telemetry. On => stealthier attack.
+        "stealth_norm_constraint": True,
+        # --- offline defense-evasion evaluation: after the FedAvg run, replay Krum/Multi-Krum/
+        # norm-clip/cosine-screen on the collected telemetry and report attacker detection rate.
+        # Turns the (circular) benign-envelope check into an INDEPENDENT verdict (see defenses.py).
+        "run_defense_eval": True,
         "dump_char_cap": 20000,         # keep enough decoded text to SEE the full loop at high cap
         "num_dump_examples": 12,        # more final tau/clean samples for repetition-form inspection
         "results_subdir": "tcaa_fl",
@@ -259,6 +272,7 @@ def _dump_fl_examples(model, g_flat, tau_ev, clean_ev, tokenizer, cfg, spec, dev
 def run_fl(config: Dict) -> Dict:
     cfg = default_fl_config()
     cfg.update(config or {})
+    cfg = stamp_run_subdir(cfg)   # unique run folder so reruns never overwrite
     _validate_decoder_only(cfg["backbone"])
     _set_seed(cfg["seed"])
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -521,10 +535,11 @@ def run_fl(config: Dict) -> Dict:
             "experiment_name", "backbone", "source", "num_clients", "num_attackers",
             "num_rounds", "clients_per_round", "attacker_always_selected",
             "local_epochs", "attacker_steps", "gamma", "gamma_clean", "kd_clean_weight",
+            "clean_anchor_two_sided",
             "gamma_rep", "no_repeat_ngram_size", "onpolicy_horizon",
             "stealth_kappa", "stealth_use_pairwise_cosine", "stealth_cosine_two_sided",
-            "stealth_cos_low", "gamma_coord", "report_calibrated_cost",
-            "collect_defense_telemetry", "save_update_vectors",
+            "stealth_cos_low", "stealth_norm_constraint", "gamma_coord", "report_calibrated_cost",
+            "collect_defense_telemetry", "save_update_vectors", "run_defense_eval",
             "pool_size", "eval_size", "max_new_tokens", "decensor_max_extra", "lora_r")},
         "cost_c_f_calibrated": (calib["c_f"] if calib else None),
         "cost_c_a_calibrated": (calib["c_a"] if calib else None),
@@ -539,6 +554,16 @@ def run_fl(config: Dict) -> Dict:
         "sample_mal_trace": last_mal_trace,     # a representative within-round attacker trajectory
         "final_examples": final_examples,       # decoded samples from the final attacked global
     }
+    # Independent defense-evasion verdict: replay real robust aggregators on the telemetry, so
+    # the parameter-stealth claim rests on named defenses instead of our own benign envelope.
+    if cfg.get("run_defense_eval", True) and defense_telemetry:
+        from .defenses import (evaluate_defenses, evaluate_vector_defenses,
+                               format_defense_report)
+        ev = evaluate_defenses(defense_telemetry, num_attackers=cfg["num_attackers"])
+        vdir = out_dir / "update_vectors"
+        vev = evaluate_vector_defenses(vdir) if vdir.exists() else {}
+        results["defense_evaluation"] = {"telemetry_defenses": ev, "vector_defenses": vev}
+        print("\n" + format_defense_report(ev, vev or None))
     (out_dir / "fl_results.json").write_text(json.dumps(results, indent=2))
     _print_summary(results)
     _save_figure(results, out_dir / "figures")

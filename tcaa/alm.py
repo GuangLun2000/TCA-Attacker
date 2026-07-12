@@ -87,6 +87,14 @@ class StealthEnvelope:
     pair_dist_min: float = 0.0   # min pairwise distance among benign updates
     pair_cos_max: float = 1.0    # max pairwise cosine among benign updates
 
+    # Benign update-NORM band. The ALM's distance/cosine constraints bound the update
+    # relative to ref_b, but NOT its L2 norm — so a length-attacker can sit inside the
+    # distance ball yet carry a larger norm than any honest client (the top tell in the
+    # per-round telemetry, and exactly what norm-clipping / Krum screen on). ``norm_hi``
+    # is the largest honest update norm; constraining the attacker to it removes the
+    # norm-outlier signature. Default (inf) leaves the norm unconstrained.
+    norm_hi: float = float("inf")   # max benign update norm (upper bound for the attacker)
+
 
 def build_envelope(
     benign_updates: List[torch.Tensor],
@@ -105,12 +113,14 @@ def build_envelope(
     (1 - w_a) rescaling of this, folded into ``d_T`` so the constraint targets the
     measured quantity directly.
 
-    ``cos_low_floor`` is the ACTIVE cosine lower bound (default 0: forbid only anti-
-    alignment). The cosine UPPER bound is the most-aligned benign client's value, computed
-    with the SAME statistic as the constrained ``_sim`` (per-client mean pairwise cosine in
-    pairwise mode; cosine to ref_b in aggregate mode) so the two edges are directly
-    comparable. The raw empirical min/max are still kept (raw_cos_low/raw_pair_low, cos_high/
-    pair_high) for logging.
+    The ACTIVE cosine lower bound TRACKS the benign envelope minimum plus a (1-kappa) margin
+    (so the attacker sits inside the band the same way the distance budget does), floored at
+    ``cos_low_floor`` (an absolute minimum, default 0). This keeps it consistent with the
+    independent verdict, which screens on ``sim >= min benign cosine`` — a fixed floor of 0
+    would let the attacker sit in [0, benign_min) and get flagged. The cosine UPPER bound is
+    the most-aligned benign client's value, computed with the SAME statistic as ``_sim`` (per-
+    client mean pairwise cosine in pairwise mode; cosine to ref_b in aggregate mode). The raw
+    empirical min/max are kept (raw_cos_low/raw_pair_low, cos_high/pair_high) for logging.
     """
     if not benign_updates:
         raise ValueError("build_envelope needs at least one benign update")
@@ -150,15 +160,28 @@ def build_envelope(
             pair_coss.append(update_cosine(bu[i], bu[j]))
     pair_dist_min = min(pair_dists) if pair_dists else 0.0
     pair_cos_max = max(pair_coss) if pair_coss else 1.0
+    # Largest honest update norm — the ceiling that removes the attacker's norm-outlier tell.
+    norm_hi = float(max(float(torch.norm(u)) for u in bu))
+
+    # ACTIVE cosine lower bound must TRACK the benign envelope's own minimum (what an
+    # independent verdict / cosine defender screens on: sim >= min benign cosine), NOT a
+    # fixed floor of 0 — else the attacker optimizes to sim >= 0 but is flagged for sitting
+    # in [0, benign_min). We sit (1-kappa) of the band ABOVE the benign minimum (mirroring the
+    # distance margin), while still respecting the absolute floor cos_low_floor, and never
+    # exceeding the upper edge.
+    _pair_margin = (1.0 - kappa) * max(0.0, raw_pair_high - raw_pair_low)
+    _cos_margin = (1.0 - kappa) * max(0.0, raw_cos_high - raw_cos_low)
+    pair_low = min(max(float(cos_low_floor), raw_pair_low + _pair_margin), raw_pair_high)
+    cos_low = min(max(float(cos_low_floor), raw_cos_low + _cos_margin), raw_cos_high)
 
     return StealthEnvelope(
         ref_b=ref_b, benign_updates=bu, w_a=w_a,
-        # ACTIVE lower bound = fixed floor (default 0); UPPER bound = most-aligned benign
-        # (same statistic as _sim). raw_cos_low/raw_pair_low kept below for logging only.
-        d_T=raw_d_T * kappa, cos_low=float(cos_low_floor), pair_low=float(cos_low_floor),
+        # ACTIVE lower bound tracks the benign minimum + a (1-kappa) margin (>= absolute floor);
+        # UPPER bound = most-aligned benign (same statistic as _sim). raw_* kept for logging.
+        d_T=raw_d_T * kappa, cos_low=cos_low, pair_low=pair_low,
         use_pairwise=use_pairwise, cos_high=raw_cos_high, pair_high=raw_pair_high,
         raw_d_T=raw_d_T, raw_cos_low=raw_cos_low, raw_pair_low=raw_pair_low,
-        pair_dist_min=pair_dist_min, pair_cos_max=pair_cos_max,
+        pair_dist_min=pair_dist_min, pair_cos_max=pair_cos_max, norm_hi=norm_hi,
     )
 
 
@@ -245,12 +268,15 @@ class ALMState:
     lambda_dist: float = 0.0
     lambda_sim: float = 0.0
     lambda_sim_hi: float = 0.0        # dual for the cosine UPPER bound (two-sided)
+    lambda_norm: float = 0.0          # dual for the norm UPPER bound
     rho_dist: float = 1.0
     rho_sim: float = 1.0
     rho_sim_hi: float = 1.0
+    rho_norm: float = 1.0
     lambda_lr: float = 0.05           # decoupled dual step size (NOT rho)
     mode: str = "alm"                 # kept for config compatibility
     two_sided_cosine: bool = False    # add the cosine upper bound (sim <= cos_high)
+    constrain_norm: bool = False      # add the norm upper bound (||delta|| <= norm_hi)
     rho_theta: float = 0.5            # violation must shrink to <= theta * prev, else grow rho
     rho_factor: float = 2.0
     rho_min: float = 1e-3
@@ -259,6 +285,7 @@ class ALMState:
     _prev_v_dist: Optional[float] = field(default=None, repr=False)
     _prev_v_sim: Optional[float] = field(default=None, repr=False)
     _prev_v_sim_hi: Optional[float] = field(default=None, repr=False)
+    _prev_v_norm: Optional[float] = field(default=None, repr=False)
 
     def penalty(self, delta: torch.Tensor, env: StealthEnvelope):
         """Differentiable violation-gated ALM penalty added to L_mal, plus detached info.
@@ -294,6 +321,16 @@ class ALMState:
             info["g_sim_hi"] = float(g_sim_hi.detach())
             info["cos_high"] = float(high)
 
+        if self.constrain_norm and env.norm_hi != float("inf"):
+            # Update-norm upper bound: keeps the attacker off the norm-outlier signature that
+            # norm-clipping and Krum screen on (the distance/cosine terms do not bound norm).
+            norm = torch.norm(delta)
+            g_norm = norm - env.norm_hi                    # <= 0 when ||delta|| <= norm_hi
+            v_norm = torch.relu(g_norm)
+            term = term + self.lambda_norm * v_norm + 0.5 * self.rho_norm * v_norm * v_norm
+            info["norm"] = float(norm.detach())
+            info["g_norm"] = float(g_norm.detach())
+
         return term, info
 
     def dual_update(self, info: Dict[str, float]):
@@ -323,10 +360,21 @@ class ALMState:
                 self.rho_sim_hi = min(self.rho_sim_hi * self.rho_factor, self.rho_max)
             self._prev_v_sim_hi = v_s_hi
 
+        if "g_norm" in info:
+            self.lambda_norm = min(
+                max(0.0, self.lambda_norm + self.lambda_lr * info["g_norm"]), self.lambda_max)
+            v_nm = max(0.0, info["g_norm"])
+            if self._prev_v_norm is not None and v_nm > self.rho_theta * self._prev_v_norm:
+                self.rho_norm = min(self.rho_norm * self.rho_factor, self.rho_max)
+            self._prev_v_norm = v_nm
+
     def snapshot(self) -> Dict[str, float]:
         snap = {"lambda_dist": round(self.lambda_dist, 4), "lambda_sim": round(self.lambda_sim, 4),
                 "rho_dist": round(self.rho_dist, 4), "rho_sim": round(self.rho_sim, 4)}
         if self.two_sided_cosine:
             snap["lambda_sim_hi"] = round(self.lambda_sim_hi, 4)
             snap["rho_sim_hi"] = round(self.rho_sim_hi, 4)
+        if self.constrain_norm:
+            snap["lambda_norm"] = round(self.lambda_norm, 4)
+            snap["rho_norm"] = round(self.rho_norm, 4)
         return snap
