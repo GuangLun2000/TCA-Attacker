@@ -24,7 +24,6 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-import matplotlib
 import matplotlib.pyplot as plt
 
 # --- palette (Okabe-Ito; strong CVD separation) & ink -------------------------
@@ -48,27 +47,134 @@ ATTACKER_CYCLE = ["#D55E00", "#C00000", "#E4572E", "#B22222", "#8B0000"]
 BENIGN_MARKERS = ["o", "s", "^", "D", "v", "P", "X", "h", "<", ">"]
 ATTACKER_MARKERS = ["*", "X", "D", "^", "v"]
 
+# Export policy shared by Phase-0, FL and Pareto runners.  PNG is convenient for
+# notebooks and previews; the PDF sidecar keeps text and geometry vector-sharp for papers.
+RASTER_DPI = 600
+EXPORT_FORMATS = ("png", "pdf")
+LEGEND_FONT_SIZE = 10
+COMPACT_LEGEND_FONT_SIZE = 9
+
 
 def apply_style():
+    """Apply the repository-wide IEEE-inspired publication style.
+
+    The explicit reset makes figures deterministic in notebooks where a previous cell may
+    have selected seaborn/dark styles.  Font fallbacks and Type-42 embedding keep text crisp
+    and editable in common paper-production tools.
+    """
+    plt.style.use("default")
     plt.rcParams.update({
-        # savefig.dpi 300 (up from 150) for publication-crisp export, following the
-        # reference's IEEE-quality intent while keeping PNG sizes reasonable.
-        "figure.dpi": 120, "savefig.dpi": 300, "figure.facecolor": "white",
-        "axes.facecolor": "white", "axes.edgecolor": MUTED, "axes.linewidth": 0.8,
-        "axes.titlesize": 12, "axes.titleweight": "bold", "axes.labelsize": 10.5,
-        "axes.labelcolor": INK, "text.color": INK, "xtick.color": MUTED,
-        "ytick.color": MUTED, "font.size": 10, "legend.frameon": False,
-        "axes.spines.top": False, "axes.spines.right": False,
-        "axes.grid": True, "grid.color": "#e6e6e6", "grid.linewidth": 0.8,
+        "figure.figsize": (6.5, 5.0),
+        "figure.dpi": 140,
+        "savefig.dpi": RASTER_DPI,
+        "figure.facecolor": "white",
+        "savefig.facecolor": "white",
+        "savefig.edgecolor": "white",
+        "savefig.bbox": "tight",
+        "savefig.pad_inches": 0.08,
+        "font.family": "sans-serif",
+        "font.sans-serif": [
+            "Arial", "DejaVu Sans", "Liberation Sans", "Helvetica", "sans-serif",
+        ],
+        "font.size": 12,
+        "axes.facecolor": "white",
+        "axes.edgecolor": "#333333",
+        "axes.linewidth": 0.8,
+        "axes.titlesize": 13,
+        "axes.titleweight": "semibold",
+        "axes.titlepad": 10,
+        "axes.labelsize": 13,
+        "axes.labelpad": 6,
+        "axes.labelcolor": INK,
+        "axes.axisbelow": True,
+        "axes.spines.top": True,
+        "axes.spines.right": True,
+        "axes.grid": True,
+        "text.color": INK,
+        "xtick.color": INK,
+        "ytick.color": INK,
+        "xtick.labelsize": 11.5,
+        "ytick.labelsize": 11.5,
+        "xtick.direction": "out",
+        "ytick.direction": "out",
+        "xtick.major.size": 3.5,
+        "ytick.major.size": 3.5,
+        "legend.fontsize": LEGEND_FONT_SIZE,
+        "legend.frameon": True,
+        "legend.framealpha": 0.96,
+        "legend.fancybox": False,
+        "legend.edgecolor": "#333333",
+        "legend.borderpad": 0.45,
+        "grid.color": "#b8b8b8",
+        "grid.linestyle": "--",
+        "grid.linewidth": 0.55,
+        "grid.alpha": 0.38,
+        "lines.linewidth": 1.8,
+        "lines.markersize": 5,
+        "lines.markeredgewidth": 0.6,
+        # Preserve real text in vector outputs instead of converting glyphs to paths.
+        "pdf.fonttype": 42,
+        "ps.fonttype": 42,
+        "svg.fonttype": "none",
     })
+
+
+def save_figure(fig, path, *, formats=EXPORT_FORMATS) -> List[Path]:
+    """Save one figure consistently as a high-resolution PNG and vector PDF.
+
+    ``path`` may include an extension; it is treated as the output stem so all requested
+    formats share the same basename.  Returning every written path makes runner logging and
+    downstream automation straightforward.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    stem = path.with_suffix("") if path.suffix else path
+    written: List[Path] = []
+    for fmt in formats:
+        fmt = str(fmt).lower().lstrip(".")
+        if fmt not in {"png", "pdf", "svg"}:
+            raise ValueError(f"Unsupported figure format: {fmt}")
+        out = stem.with_suffix(f".{fmt}")
+        kwargs = {"bbox_inches": "tight", "pad_inches": 0.08, "facecolor": "white"}
+        if fmt == "png":
+            kwargs["dpi"] = RASTER_DPI
+        fig.savefig(out, format=fmt, **kwargs)
+        written.append(out)
+    return written
 
 
 def _bar_labels(ax, bars, fmt="{:.1f}"):
     for b in bars:
         h = b.get_height()
         ax.annotate(fmt.format(h), (b.get_x() + b.get_width() / 2, h),
-                    ha="center", va="bottom", fontsize=8.5, color=INK,
+                    ha="center", va="bottom", fontsize=10, color=INK,
                     xytext=(0, 2), textcoords="offset points")
+
+
+def _use_log_scale_if_needed(ax, values, *, dynamic_range=100.0) -> bool:
+    """Use a clearly labelled log axis when linear scaling would flatten a series.
+
+    This is especially important for de-censored estimates, which can be several orders of
+    magnitude above their capped observations.  Non-positive/NaN values safely keep the
+    ordinary linear axis.
+    """
+    import math
+
+    finite = []
+    for value in values:
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(value) and value > 0:
+            finite.append(value)
+    if len(finite) < 2 or max(finite) / min(finite) < dynamic_range:
+        return False
+    ax.set_yscale("log")
+    ylabel = ax.get_ylabel()
+    if "log scale" not in ylabel:
+        ax.set_ylabel(f"{ylabel} (log scale)")
+    return True
 
 
 def _grouped(ax, groups, base_vals, atk_vals, ylabel, *, fmt="{:.1f}", legend=True,
@@ -81,7 +187,7 @@ def _grouped(ax, groups, base_vals, atk_vals, ylabel, *, fmt="{:.1f}", legend=Tr
     ax.set_xticks(x); ax.set_xticklabels(groups)
     ax.set_ylabel(ylabel); ax.grid(axis="x", visible=False)
     if legend:
-        ax.legend(loc="upper left", fontsize=8.5)
+        ax.legend(loc="upper left", fontsize=LEGEND_FONT_SIZE)
     top = max(base_vals + atk_vals) if (base_vals + atk_vals) else 1.0
     ax.set_ylim(0, top * 1.22 if top > 0 else 1.0)
 
@@ -102,8 +208,8 @@ def fig_summary_dashboard(r: Dict):
     bars = ax.bar(["mean", "median"], vals, width=0.55, color=[C_ATK, C_PURPLE])
     _bar_labels(ax, bars, fmt="{:.2f}")
     ax.axhline(1.0, color=MUTED, ls="--", lw=1.0)
-    ax.set_title("(1) Resource amplification  C_atk/C_ben (tau)", fontsize=10.5)
-    ax.set_ylabel("cost amplification  x")
+    ax.set_title(r"(1) Resource amplification  $C_{atk}/C_{ben}$ ($\tau$)", fontsize=10.5)
+    ax.set_ylabel("Cost amplification ratio")
     ax.set_ylim(0, max(vals + [1.0]) * 1.25); ax.grid(axis="x", visible=False)
 
     # (2) Performance preserved: ppl ratio (~1) + ROUGE-L recall ratio on tau (~1 = answer kept).
@@ -117,7 +223,7 @@ def fig_summary_dashboard(r: Dict):
     _bar_labels(ax, bars, fmt="{:.3f}")
     ax.axhline(1.0, color=MUTED, ls="--", lw=1.0)
     ax.set_title("(2) Utility preserved", fontsize=10.5)
-    ax.set_ylabel("attacked / baseline  x")
+    ax.set_ylabel("Attacked / baseline ratio")
     ax.set_ylim(0, max(vals + [1.0]) * 1.3); ax.grid(axis="x", visible=False)
 
     # (3) Stealth: attacker distance vs the benign budget d_T (bar colored by verdict).
@@ -131,7 +237,8 @@ def fig_summary_dashboard(r: Dict):
                 fontsize=9, color=MUTED)
     ax.axhspan(0, d_T, color=C_OK, alpha=0.07)
     ax.set_title("(3) Stealth (parameter space)", fontsize=10.5)
-    ax.set_ylabel("distance  ||d_att - d_g||"); ax.set_ylim(0, max(dist, d_T) * 1.3)
+    ax.set_ylabel(r"Distance  $\|\Delta_{att}-\Delta_g\|_2$")
+    ax.set_ylim(0, max(dist, d_T) * 1.3)
     ax.set_xticks([0]); ax.set_xticklabels(["attacker update"]); ax.grid(axis="x", visible=False)
 
     joint = s["jointly_satisfied"]
@@ -235,9 +342,10 @@ def fig_stealth(r: Dict):
     ax.annotate(f"$d_T$={s['d_T']:.2f}", (-0.46, s["d_T"]), color=MUTED, fontsize=9,
                 va="bottom", ha="left")
     ax.axhspan(0, s["d_T"], color=C_OK, alpha=0.07)
-    verdict = "inside envelope ✓" if s["distance_satisfied"] else "OUTSIDE envelope ✗"
+    verdict = "inside envelope" if s["distance_satisfied"] else "OUTSIDE envelope"
     ax.set_title(f"Distance  ({verdict})", fontsize=11)
-    ax.set_ylabel("‖Δ_att − Δ_g‖"); ax.set_xticks([]); ax.set_xlim(-0.5, 0.5)
+    ax.set_ylabel(r"$\|\Delta_{att}-\Delta_g\|_2$")
+    ax.set_xticks([]); ax.set_xlim(-0.5, 0.5)
     ax.grid(axis="x", visible=False)
 
     # cosine panel: feasible = above delta_T
@@ -250,9 +358,10 @@ def fig_stealth(r: Dict):
     ax.axhline(s["delta_T"], color=MUTED, ls="--", lw=1.2)
     ax.annotate(f"$δ_T$={s['delta_T']:.2f}", (-0.46, s["delta_T"]), color=MUTED,
                 fontsize=9, va="bottom", ha="left")
-    vc = "inside ✓" if s["cosine_satisfied"] else "OUTSIDE ✗"
+    vc = "inside envelope" if s["cosine_satisfied"] else "OUTSIDE envelope"
     ax.set_title(f"Cosine  ({vc})", fontsize=11)
-    ax.set_ylabel("cos(Δ_att, Δ_g)"); ax.set_xticks([]); ax.set_xlim(-0.5, 0.5)
+    ax.set_ylabel(r"$\cos(\Delta_{att},\Delta_g)$")
+    ax.set_xticks([]); ax.set_xlim(-0.5, 0.5)
     ax.grid(axis="x", visible=False)
 
     # single shared legend at the bottom (both panels share the two series)
@@ -264,9 +373,9 @@ def fig_stealth(r: Dict):
                markeredgecolor=INK, markersize=15, label="TCAA attacker"),
         Line2D([0], [0], ls="--", color=MUTED, label="Constraint threshold"),
     ]
-    fig.legend(handles=handles, loc="lower center", ncol=3, fontsize=9,
+    fig.legend(handles=handles, loc="lower center", ncol=3, fontsize=COMPACT_LEGEND_FONT_SIZE,
                bbox_to_anchor=(0.5, -0.01))
-    joint = "JOINTLY SATISFIED" if s["jointly_satisfied"] else "NOT jointly satisfied → Phase 1"
+    joint = "JOINTLY SATISFIED" if s["jointly_satisfied"] else "NOT jointly satisfied; Phase 1"
     fig.suptitle(f"(c) Parameter-space stealth — {joint}", fontsize=12, fontweight="bold")
     fig.tight_layout(rect=[0, 0.06, 1, 0.95]); return fig
 
@@ -287,7 +396,7 @@ def fig_attack_trace(r: Dict):
         xs = [s for s, v in zip(steps, clean_vals) if v is not None]
         ys = [v for v in clean_vals if v is not None]
         axes[1].plot(xs, ys, color=C_BASE, lw=2, marker="s", ms=3, label="clean (anchor: flat)")
-        axes[1].legend(fontsize=8.5, loc="best")
+        axes[1].legend(fontsize=COMPACT_LEGEND_FONT_SIZE, loc="best")
     axes[1].set_ylabel("$E[L]$  (τ↑ / clean flat)")
     axes[2].plot(steps, [t["mean_eos_prob_tau"] for t in tr], color=C_PURPLE, lw=2, marker="o", ms=3)
     axes[2].set_ylabel("mean $q_{EOS}$ on τ  (↓)"); axes[2].set_xlabel("optimization step")
@@ -314,8 +423,8 @@ def fig_alm_convergence(r: Dict):
     ax.plot(steps, dists, color=C_ATK, lw=2, marker="o", ms=3, label="attacker distance")
     ax.axhline(d_T, color=MUTED, ls="--", lw=1.2, label="$d_T$ (benign budget)")
     ax.axhspan(0, d_T, color=C_OK, alpha=0.07)
-    ax.set_ylabel("‖Δ_att − Δ_g‖"); ax.grid(axis="x", visible=False)
-    ax.legend(fontsize=8.5, loc="best")
+    ax.set_ylabel(r"$\|\Delta_{att}-\Delta_g\|_2$"); ax.grid(axis="x", visible=False)
+    ax.legend(fontsize=COMPACT_LEGEND_FONT_SIZE, loc="best")
     ax.set_title("ALM stealth-constraint convergence (rests at the boundary)")
 
     ax = axes[1]
@@ -324,7 +433,7 @@ def fig_alm_convergence(r: Dict):
     ymin = min(coss + [cos_low]); ax.axhspan(cos_low, 1.0, color=C_OK, alpha=0.07)
     ax.set_ylabel("cosine to benign"); ax.set_xlabel("optimization step")
     ax.set_ylim(min(ymin - 0.05, cos_low - 0.05), 1.02)
-    ax.grid(axis="x", visible=False); ax.legend(fontsize=8.5, loc="best")
+    ax.grid(axis="x", visible=False); ax.legend(fontsize=COMPACT_LEGEND_FONT_SIZE, loc="best")
     fig.tight_layout(); return fig
 
 
@@ -350,7 +459,7 @@ def fig_cost_model(r: Dict):
                     fontsize=8.5, ha="left")
     ax.set_xlabel("Output length  L"); ax.set_ylabel("Per-request cost  C")
     ax.set_title("(d) Cost model: attack pushes L along the C(L) curve")
-    ax.grid(axis="x", visible=False); ax.legend(fontsize=8.5, loc="upper left")
+    ax.grid(axis="x", visible=False); ax.legend(fontsize=COMPACT_LEGEND_FONT_SIZE, loc="upper left")
     fig.tight_layout(); return fig
 
 
@@ -381,11 +490,16 @@ def make_all_figures(results: Dict) -> List[Tuple[str, "plt.Figure"]]:
 
 
 def save_all_figures(results: Dict, out_dir) -> List[Path]:
+    """Save all Phase-0 figures as 600-DPI PNGs with vector PDF sidecars.
+
+    PNG paths remain the return value for backward compatibility; each PNG has a same-name
+    PDF alongside it.
+    """
     out_dir = Path(out_dir); out_dir.mkdir(parents=True, exist_ok=True)
     paths = []
     for key, fig in make_all_figures(results):
         p = out_dir / f"{key}.png"
-        fig.savefig(p, bbox_inches="tight")
+        save_figure(fig, p)
         plt.close(fig)
         paths.append(p)
     return paths
@@ -436,8 +550,14 @@ def fig_fl_durability(r: Dict):
             label="amp_tau median")
     ax.axhline(1.0, color=MUTED, lw=0.9, ls=":")
     ax.set_ylabel("cost amplification (τ)")
+    _use_log_scale_if_needed(
+        ax,
+        [p["amp_tau"] for p in dur]
+        + [p.get("amp_tau_decensored") for p in dur]
+        + [p["amp_tau_median"] for p in dur],
+    )
     ax.set_title("TCAA multi-round durability (amplification accumulation)")
-    ax.legend(loc="best", fontsize=8.0); ax.grid(axis="x", visible=False)
+    ax.legend(loc="best", fontsize=COMPACT_LEGEND_FONT_SIZE); ax.grid(axis="x", visible=False)
     # --- (B) tau output length: capped + de-censored + clean ---
     ax = axes[1]
     ax.plot(rounds, [p["tau_len_atk"] for p in dur], "-^", color=C_ATK, lw=2, ms=4,
@@ -448,14 +568,20 @@ def fig_fl_durability(r: Dict):
     ax.plot(rounds, [p.get("clean_len_atk", float("nan")) for p in dur], "-o", color=C_BASE, lw=1.6,
             ms=3, label="clean len")
     ax.set_ylabel("mean output length  L")
-    ax.legend(loc="best", fontsize=8.0); ax.grid(axis="x", visible=False)
+    _use_log_scale_if_needed(
+        ax,
+        [p["tau_len_atk"] for p in dur]
+        + [p.get("tau_len_atk_decensored") for p in dur]
+        + [p.get("clean_len_atk") for p in dur],
+    )
+    ax.legend(loc="best", fontsize=COMPACT_LEGEND_FONT_SIZE); ax.grid(axis="x", visible=False)
     # --- (C) truncation rate: how censored the capped amplification above is ---
     ax = axes[2]
     ax.plot(rounds, [p.get("truncation_tau", float("nan")) for p in dur], "-^", color=C_ATK,
             lw=2, ms=4, label="τ truncation (cap-hit → capped amp is a lower bound)")
     ax.set_ylim(-0.02, 1.02)
     ax.set_ylabel("truncation rate  [0,1]"); ax.set_xlabel("communication round")
-    ax.legend(loc="best", fontsize=8.0); ax.grid(axis="x", visible=False)
+    ax.legend(loc="best", fontsize=COMPACT_LEGEND_FONT_SIZE); ax.grid(axis="x", visible=False)
     fig.tight_layout(); return fig
 
 
@@ -479,9 +605,10 @@ def fig_fl_stealth(r: Dict):
     if bad:
         ax.scatter(bad, bady, color=C_BAD, marker="X", s=65, zorder=3, label="stealth violated")
     n_ok = sum(ok)
-    ax.set_xlabel("communication round"); ax.set_ylabel("attacker distance  ‖Δ_att − Δ_g‖")
+    ax.set_xlabel("communication round")
+    ax.set_ylabel(r"Attacker distance  $\|\Delta_{att}-\Delta_g\|_2$")
     ax.set_title(f"Per-round stealth ({n_ok}/{len(st)} attacker rounds jointly satisfied)")
-    ax.legend(loc="best", fontsize=8.5); ax.grid(axis="x", visible=False)
+    ax.legend(loc="best", fontsize=COMPACT_LEGEND_FONT_SIZE); ax.grid(axis="x", visible=False)
     fig.tight_layout(); return fig
 
 
@@ -515,7 +642,7 @@ def fig_fl_utility(r: Dict):
                 label="clean ppl ratio  (attacked / benign)")
         ax.set_ylabel("ppl ratio  (atk / benign)")
         ax.set_title("Utility preservation across rounds (1.0 = preserved)")
-    ax.legend(loc="best", fontsize=8.0); ax.grid(axis="x", visible=False)
+    ax.legend(loc="best", fontsize=COMPACT_LEGEND_FONT_SIZE); ax.grid(axis="x", visible=False)
     # --- (B) ROUGE-L recall (answer still correct?) clean + τ, vs pristine; + repetition ---
     ax = axes[1]
     if have_rouge:
@@ -533,7 +660,7 @@ def fig_fl_utility(r: Dict):
             lw=1.8, ms=4, label="τ repetition (degeneracy)")
     ax.set_ylim(-0.02, 1.02)
     ax.set_ylabel("ROUGE-L recall / rate  [0,1]"); ax.set_xlabel("communication round")
-    ax.legend(loc="best", fontsize=7.5, ncol=2); ax.grid(axis="x", visible=False)
+    ax.legend(loc="best", fontsize=COMPACT_LEGEND_FONT_SIZE, ncol=2); ax.grid(axis="x", visible=False)
     fig.tight_layout(); return fig
 
 
@@ -588,7 +715,7 @@ def fig_fl_defense_geometry(r: Dict):
         return None
     panels = [("cos_to_agg", "cosine to aggregate", "(a) Cosine similarity to FedAvg aggregate"),
               ("dist_to_agg", "distance to aggregate", "(b) Euclidean distance to aggregate"),
-              ("norm", "‖Δ‖  update L2 norm", "(c) Update L2 norm"),
+              ("norm", r"Update norm  $\|\Delta\|_2$", "(c) Update L2 norm"),
               ("krum_score", "Krum score (lower = selected)", "(d) Multi-Krum score")]
     have = [(k, yl, t) for (k, yl, t) in panels
             if any(c.get(k) is not None for e in tel for c in e.get("clients", []))]
@@ -612,7 +739,8 @@ def fig_fl_defense_geometry(r: Dict):
         handles.append(Line2D([0], [0], color=ATTACKER_CYCLE[i % len(ATTACKER_CYCLE)], lw=2.3,
                               marker=ATTACKER_MARKERS[i % len(ATTACKER_MARKERS)], ms=8,
                               markeredgecolor=INK, label=f"Attacker (client {cid})"))
-    fig.legend(handles=handles, loc="lower center", ncol=min(len(handles), 4), fontsize=9,
+    fig.legend(handles=handles, loc="lower center", ncol=min(len(handles), 4),
+               fontsize=COMPACT_LEGEND_FONT_SIZE,
                bbox_to_anchor=(0.5, -0.015))
     fig.suptitle("Per-client update geometry (defense's-eye view): benign cloud vs attacker",
                  fontsize=12, fontweight="bold")
@@ -675,7 +803,7 @@ def fig_pareto_frontier(pareto):
     ax.set_xlabel("distance margin  (d_T − attacker_distance;  >0 = inside budget)")
     ax.set_ylabel("cost amplification τ (median, cap-robust)")
     ax.set_title("TCAA stealth-constrained amplification frontier")
-    ax.legend(loc="best", fontsize=8.5); ax.grid(axis="x", visible=False)
+    ax.legend(loc="best", fontsize=COMPACT_LEGEND_FONT_SIZE); ax.grid(axis="x", visible=False)
     fig.tight_layout(); return fig
 
 
@@ -708,14 +836,15 @@ def fig_pareto_kappa(pareto):
     ax.set_xlabel("stealth budget  κ  (fraction of benign distance envelope)")
     ax.set_ylabel("cost amplification τ (median)")
     ax.set_title("Amplification vs stealth budget (green ring = jointly stealthy)")
-    ax.legend(loc="best", fontsize=8.5, title="attack strength"); ax.grid(axis="x", visible=False)
+    ax.legend(loc="best", fontsize=COMPACT_LEGEND_FONT_SIZE, title="attack strength")
+    ax.grid(axis="x", visible=False)
     fig.tight_layout(); return fig
 
 
 def fig_pareto_utility(pareto):
     """The 'usable' view of the sweep: a point is only a real TCAA win if amplification is
     high AND clean utility is preserved (ppl_clean_ratio ≈ 1) AND it stays stealthy. Plots
-    amp (median) vs clean ppl ratio; color = joint stealth; marker size ∝ trigger
+    amp (median) vs clean ppl ratio; color = joint stealth; marker size is proportional to trigger
     selectivity. The top-right-of-the-1.0-line region is the genuinely usable frontier."""
     rows = _pareto_rows(pareto)
     if not rows or not all("ppl_clean_ratio" in r for r in rows):
@@ -737,8 +866,8 @@ def fig_pareto_utility(pareto):
     ax.axhline(1.0, color=MUTED, lw=0.9, ls="--")
     ax.set_xlabel("clean ppl ratio  (attacked / baseline;  ≈1 = utility preserved)")
     ax.set_ylabel("cost amplification τ (median)")
-    ax.set_title("Usable frontier: amplification vs preserved utility (size ∝ selectivity)")
-    ax.legend(loc="best", fontsize=8.5); ax.grid(axis="x", visible=False)
+    ax.set_title("Usable frontier: amplification vs preserved utility (size = selectivity)")
+    ax.legend(loc="best", fontsize=COMPACT_LEGEND_FONT_SIZE); ax.grid(axis="x", visible=False)
     fig.tight_layout(); return fig
 
 

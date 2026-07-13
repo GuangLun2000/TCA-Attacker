@@ -123,12 +123,12 @@ def _print_frontier(rows: List[Dict]) -> None:
 
 def _save_figure(rows: List[Dict], out_dir: Path) -> None:
     """Best-effort: save the unified frontier + kappa-tradeoff figures to disk.
-    Delegates to tcaa.visualize so the on-disk PNGs match the notebook's inline render.
-    Skips gracefully without matplotlib."""
+    Delegates to tcaa.visualize so the on-disk 600-DPI PNGs and vector PDFs match the
+    notebook's inline render. Skips gracefully without matplotlib."""
     try:
         import matplotlib
         matplotlib.use("Agg")
-        from .visualize import make_pareto_figures
+        from .visualize import make_pareto_figures, save_figure
     except Exception as e:  # pragma: no cover
         print(f"  [pareto] skipped figure ({e})")
         return
@@ -136,9 +136,9 @@ def _save_figure(rows: List[Dict], out_dir: Path) -> None:
     import matplotlib.pyplot as plt
     for key, fig in make_pareto_figures({"points": rows}):
         p = out_dir / f"{key}.png"
-        fig.savefig(p, dpi=130, bbox_inches="tight")
+        written = save_figure(fig, p)
         plt.close(fig)
-        print(f"  [pareto] saved {p}")
+        print(f"  [pareto] saved {', '.join(str(path) for path in written)}")
 
 
 def _parse_args():

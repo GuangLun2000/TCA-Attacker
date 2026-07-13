@@ -74,7 +74,7 @@ TCA-Attacker/
 | [stealth.py](tcaa/stealth.py) | Distance/cosine vs. the weighted-FedAvg reference — the AugMP server's screening definitions, re-implemented and pinned by a self-contained golden-reference test. |
 | [alm.py](tcaa/alm.py) | Augmented-Lagrangian stealth constraints (distance + pairwise cosine) — the solver that keeps the malicious update inside the benign envelope. |
 | [metrics.py](tcaa/metrics.py) | Dependency-free ROUGE-L + teacher-forced perplexity (utility). |
-| [visualize.py](tcaa/visualize.py) | Publication figures (Okabe-Ito, CVD-safe) + `render_report` / `render_fl_report` / `render_pareto_report` and a copy-pasteable `feedback_digest`. |
+| [visualize.py](tcaa/visualize.py) | IEEE-inspired publication figures (Okabe-Ito, CVD-safe; adaptive axes; 600-DPI PNG + vector PDF) + `render_report` / `render_fl_report` / `render_pareto_report` and a copy-pasteable `feedback_digest`. |
 | [phase0_runner.py](tcaa/phase0_runner.py) | **Runner — single round.** Benign fine-tune + malicious `L_mal` + FedAvg; measures cost / utility / stealth. The de-risk experiment. |
 | [fl_runner.py](tcaa/fl_runner.py) | **Runner — multi-round FL.** T rounds with client sampling; tracks attack **durability** and per-round stealth against a parallel benign-only baseline. |
 | [pareto_runner.py](tcaa/pareto_runner.py) | **Runner — sweep.** `γ × γ_clean × κ` grid → the cost-amplification-vs-stealth-slack frontier. |
@@ -143,8 +143,10 @@ python -m tcaa.tests.test_stealth_matches_server    # tcaa/stealth.py == server.
 
 ### Outputs
 
-Each runner writes to `results/` (`.json` / `.md` metrics + `figures/*.png`). In a
-notebook, `render_report(results)` / `render_fl_report(...)` / `render_pareto_report(...)`
+Each runner writes to `results/` (`.json` / `.md` metrics + publication-ready figures).
+Every figure is exported as a 600-DPI PNG for previews/notebooks and a same-name vector PDF
+for papers and lossless scaling. In a notebook, `render_report(results)` /
+`render_fl_report(...)` / `render_pareto_report(...)`
 from `tcaa.visualize` display the figures inline, and `feedback_digest(...)` prints a
 single copy-pasteable block of the headline numbers.
 
