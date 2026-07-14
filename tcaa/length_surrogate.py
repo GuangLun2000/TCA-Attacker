@@ -24,6 +24,8 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 
+from .generation_safety import build_stopping_criteria, validate_generation_limits
+
 _EPS = 1e-6
 
 # Time-chunk width for the clean-KD KL. The forward KL sums over the ~150k-token vocab,
@@ -187,7 +189,8 @@ class MalLossParts:
 
 @torch.no_grad()
 def _greedy_rollout(inner, input_ids, attention_mask, eos_id, pad_id, horizon,
-                    force_open=True, no_repeat_ngram_size=0):
+                    force_open=True, no_repeat_ngram_size=0,
+                    max_batch_seconds: Optional[float] = None):
     """Roll out the model's greedy continuation for up to ``horizon`` new tokens.
 
     ``force_open=True`` forbids EOS until ``horizon`` (via min_new_tokens), giving a
@@ -200,21 +203,33 @@ def _greedy_rollout(inner, input_ids, attention_mask, eos_id, pad_id, horizon,
     differentiable ``repetition_penalty_prob`` in L_mal, this keeps the amplified length
     from degenerating into padding.
     """
+    validate_generation_limits(horizon, max_batch_seconds=max_batch_seconds)
     kwargs = {}
     if no_repeat_ngram_size and int(no_repeat_ngram_size) > 0:
         kwargs["no_repeat_ngram_size"] = int(no_repeat_ngram_size)
-    return inner.generate(
+    stopping, wall_guard = build_stopping_criteria(max_batch_seconds)
+    if stopping is not None:
+        kwargs["stopping_criteria"] = stopping
+    generated = inner.generate(
         input_ids=input_ids, attention_mask=attention_mask,
         min_new_tokens=(horizon if force_open else 0), max_new_tokens=horizon,
         do_sample=False, num_beams=1,
         pad_token_id=pad_id, eos_token_id=eos_id, **kwargs,
     )
+    if wall_guard is not None and wall_guard.triggered:
+        # A shortened rollout changes the optimization objective. Fail explicitly
+        # instead of silently training on a time-censored trajectory.
+        raise TimeoutError(
+            f"on-policy rollout exceeded max_batch_seconds={max_batch_seconds}"
+        )
+    return generated
 
 
 def onpolicy_expected_length(
     model, prompt_batch, *, eos_id: int, pad_id: int, horizon: int, device,
     free_decode: bool = False, return_per_sample: bool = False,
     no_repeat_ngram_size: int = 0, return_repetition: bool = False, rep_window: int = 8,
+    max_batch_seconds: Optional[float] = None,
 ) -> torch.Tensor:
     """
     On-policy survival E[L] over the model's OWN generation trajectory.
@@ -244,10 +259,15 @@ def onpolicy_expected_length(
 
     was_training = inner.training
     inner.eval()
-    gen = _greedy_rollout(inner, input_ids, attn, eos_id, pad_id, horizon,
-                          force_open=not free_decode, no_repeat_ngram_size=no_repeat_ngram_size)
-    if was_training:
-        inner.train()
+    try:
+        gen = _greedy_rollout(
+            inner, input_ids, attn, eos_id, pad_id, horizon,
+            force_open=not free_decode,
+            no_repeat_ngram_size=no_repeat_ngram_size,
+            max_batch_seconds=max_batch_seconds,
+        )
+    finally:
+        inner.train(was_training)
 
     # Full attention mask = known prompt mask ++ all-ones continuation.
     cont = torch.ones((gen.shape[0], gen.shape[1] - P), dtype=attn.dtype, device=device)

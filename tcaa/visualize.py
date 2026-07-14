@@ -536,15 +536,21 @@ def fig_fl_durability(r: Dict):
     if not dur:
         return None
     rounds = [p["round"] for p in dur]
-    has_dec = any(p.get("amp_tau_decensored") is not None for p in dur)
-    has_len_dec = any(p.get("tau_len_atk_decensored") is not None for p in dur)
+    # A cap-saturated EOS-hazard fit can be entirely assumption-driven.  The runner marks
+    # those points ``decensored_valid=False``; never turn them into a measured-looking line.
+    has_dec = any(p.get("decensored_valid", True)
+                  and p.get("amp_tau_decensored") is not None for p in dur)
+    has_len_dec = any(p.get("decensored_valid", True)
+                      and p.get("tau_len_atk_decensored") is not None for p in dur)
     fig, axes = plt.subplots(3, 1, figsize=(7.4, 8.4), sharex=True)
     # --- (A) cost amplification: capped (solid) + de-censored (dashed) + median ---
     ax = axes[0]
     ax.plot(rounds, [p["amp_tau"] for p in dur], "-o", color=C_BASE, lw=2, ms=4,
             label="amp_tau mean (capped)")
     if has_dec:
-        ax.plot(rounds, [p.get("amp_tau_decensored", float("nan")) for p in dur], "--D", color=C_ATK,
+        ax.plot(rounds, [p.get("amp_tau_decensored", float("nan"))
+                         if p.get("decensored_valid", True) else float("nan") for p in dur],
+                "--D", color=C_ATK,
                 lw=2, ms=4, label="amp_tau mean (de-censored)")
     ax.plot(rounds, [p["amp_tau_median"] for p in dur], ":s", color=C_BENIGN, lw=1.8, ms=4,
             label="amp_tau median")
@@ -553,7 +559,8 @@ def fig_fl_durability(r: Dict):
     _use_log_scale_if_needed(
         ax,
         [p["amp_tau"] for p in dur]
-        + [p.get("amp_tau_decensored") for p in dur]
+        + [p.get("amp_tau_decensored") if p.get("decensored_valid", True) else None
+           for p in dur]
         + [p["amp_tau_median"] for p in dur],
     )
     ax.set_title("TCAA multi-round durability (amplification accumulation)")
@@ -563,7 +570,9 @@ def fig_fl_durability(r: Dict):
     ax.plot(rounds, [p["tau_len_atk"] for p in dur], "-^", color=C_ATK, lw=2, ms=4,
             label="τ len (capped at max_new_tokens)")
     if has_len_dec:
-        ax.plot(rounds, [p.get("tau_len_atk_decensored", float("nan")) for p in dur], "--D", color=C_PURPLE,
+        ax.plot(rounds, [p.get("tau_len_atk_decensored", float("nan"))
+                         if p.get("decensored_valid", True) else float("nan") for p in dur],
+                "--D", color=C_PURPLE,
                 lw=1.8, ms=3, label="τ len (de-censored estimate)")
     ax.plot(rounds, [p.get("clean_len_atk", float("nan")) for p in dur], "-o", color=C_BASE, lw=1.6,
             ms=3, label="clean len")
@@ -571,7 +580,8 @@ def fig_fl_durability(r: Dict):
     _use_log_scale_if_needed(
         ax,
         [p["tau_len_atk"] for p in dur]
-        + [p.get("tau_len_atk_decensored") for p in dur]
+        + [p.get("tau_len_atk_decensored") if p.get("decensored_valid", True) else None
+           for p in dur]
         + [p.get("clean_len_atk") for p in dur],
     )
     ax.legend(loc="best", fontsize=COMPACT_LEGEND_FONT_SIZE); ax.grid(axis="x", visible=False)
@@ -747,12 +757,500 @@ def fig_fl_defense_geometry(r: Dict):
     fig.tight_layout(rect=[0, 0.06, 1, 0.96]); return fig
 
 
+# --------------------------------------------------------------------------- #
+# Resource-accounting figures (logical tokens + measured accelerator metrics) #
+# --------------------------------------------------------------------------- #
+_RESOURCE_CONTAINER_ALIASES = (
+    "resources",                 # canonical resource-v1 container
+    "resource_summary",         # early/legacy experiment exports
+    "resource_metrics",
+    "resource_benchmark",
+    "resource_profile",
+)
+
+_LOGICAL_METRIC_KEYS = {
+    "num_requests": ("num_requests", "n_prompts", "request_count", "requests", "n", "eval_size"),
+    "total_input_tokens": ("total_input_tokens", "input_tokens", "prompt_tokens"),
+    "total_output_tokens": ("total_output_tokens", "output_tokens", "completion_tokens"),
+    "total_tokens": ("total_tokens", "logical_tokens"),
+    "mean_output_len": ("mean_output_len", "output_len_mean", "mean_completion_tokens"),
+    "output_len_p50": ("output_len_p50", "p50_output_len", "output_tokens_p50"),
+    "output_len_p95": ("output_len_p95", "p95_output_len", "output_tokens_p95"),
+    "cap_hit_rate": ("cap_hit_rate", "truncation_rate"),
+    "budget_utilization": ("budget_utilization", "token_budget_utilization"),
+    "prefill_attention_token_pairs": ("prefill_attention_token_pairs", "prefill_attention_pairs"),
+    "decode_attention_token_pairs": ("decode_attention_token_pairs", "decode_attention_pairs"),
+    "scheduled_decode_slots": ("scheduled_decode_slots", "batch_scheduled_decode_slots"),
+    "kv_cache_peak_bytes": ("kv_cache_peak_bytes", "estimated_peak_kv_bytes",
+                            "kv_cache_batch_peak_bytes", "estimated_peak_batch_kv_bytes"),
+}
+
+_HARDWARE_METRIC_KEYS = {
+    "generation_wall_seconds": ("generation_wall_seconds", "wall_seconds", "wall_time_seconds",
+                                "wall_time_s"),
+    "cuda_elapsed_seconds": ("cuda_elapsed_seconds", "cuda_seconds", "cuda_time_seconds",
+                             "cuda_time_s"),
+    "e2e_wall_seconds": ("e2e_wall_seconds", "end_to_end_wall_seconds", "e2e_seconds"),
+    "requests_per_second": ("requests_per_second", "requests_per_sec", "req_per_s", "req_s"),
+    "output_tokens_per_second": ("output_tokens_per_second", "output_tokens_per_sec",
+                                 "output_tok_per_s", "tokens_per_second"),
+    "peak_allocated_bytes": ("peak_allocated_bytes", "peak_memory_allocated_bytes"),
+    "incremental_peak_allocated_bytes": ("incremental_peak_allocated_bytes",
+                                         "peak_allocated_delta_bytes"),
+    "peak_reserved_bytes": ("peak_reserved_bytes", "peak_memory_reserved_bytes"),
+    "incremental_peak_reserved_bytes": ("incremental_peak_reserved_bytes",
+                                        "peak_reserved_delta_bytes"),
+    "energy_joules": ("energy_joules", "energy_j", "gpu_energy_joules"),
+}
+
+
+def _resource_root(fl: Optional[Dict]) -> Optional[Dict]:
+    """Return the resource-v1 payload while accepting transitional result names."""
+    if not isinstance(fl, dict):
+        return None
+    for key in _RESOURCE_CONTAINER_ALIASES:
+        value = fl.get(key)
+        if isinstance(value, dict):
+            return value
+    # Also accept a resource payload passed directly to the public helpers.
+    if isinstance(fl.get("states"), (dict, list)) and (
+            fl.get("schema_version") or fl.get("environment") or fl.get("comparisons")):
+        return fl
+    return None
+
+
+def _resource_state_records(fl: Optional[Dict]) -> List[Dict]:
+    """Normalize resource-v1 state dictionaries/lists without mutating the result."""
+    root = _resource_root(fl)
+    if not root:
+        return []
+    raw_states = (root.get("states") or root.get("conditions") or root.get("profiles")
+                  or root.get("measurements"))
+    if isinstance(raw_states, dict):
+        items = list(raw_states.items())
+    elif isinstance(raw_states, list):
+        items = []
+        for i, state in enumerate(raw_states):
+            if not isinstance(state, dict):
+                continue
+            name = (state.get("condition") or state.get("state") or state.get("name")
+                    or f"state_{i}")
+            items.append((str(name), state))
+    else:
+        # A few early exports placed named conditions directly under the resource root.
+        ignored = {"schema_version", "environment", "config", "comparisons", "validity"}
+        items = [(k, v) for k, v in root.items()
+                 if k not in ignored and isinstance(v, dict)]
+
+    records = []
+    for name, state in items:
+        if not isinstance(state, dict):
+            continue
+        logical = state.get("logical") or state.get("tokens") or state.get("token_summary") or {}
+        hardware = state.get("hardware") or state.get("profile") or state.get("hardware_summary") or {}
+        records.append({
+            "name": str(name),
+            "logical": logical if isinstance(logical, dict) else {},
+            "hardware": hardware if isinstance(hardware, dict) else {},
+            "raw": state,
+        })
+    return sorted(records, key=lambda x: (_resource_role_order(x["name"]), x["name"]))
+
+
+def _resource_role_order(name: str) -> int:
+    name = str(name).lower()
+    if "pristine" in name or "baseline" in name:
+        return 0
+    if "benign" in name or name.startswith("ben"):
+        return 1
+    if "attack" in name or name.startswith("atk"):
+        return 2
+    return 3
+
+
+def _resource_state_label(name: str) -> str:
+    lower = str(name).lower()
+    if "pristine" in lower or "baseline" in lower:
+        return "pristine"
+    if "benign" in lower or lower.startswith("ben"):
+        return "benign"
+    if "attack" in lower or lower.startswith("atk"):
+        return "attacked"
+    return str(name).replace("_", " ")
+
+
+def _finite_number(value):
+    import math
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) else None
+
+
+def _first_metric(mappings, aliases):
+    for mapping in mappings:
+        if not isinstance(mapping, dict):
+            continue
+        for key in aliases:
+            value = _finite_number(mapping.get(key))
+            if value is not None:
+                return value
+    return None
+
+
+def _resource_hardware_profiles(state: Dict) -> List[Tuple[str, Dict]]:
+    """Normalize direct and ``hardware[batch_size_*]`` profiler payloads.
+
+    The FL runner can retain more than one batch-size benchmark.  Keeping them separate is
+    essential: BS=1 latency and BS=8 throughput are not interchangeable measurements.
+    """
+    if not isinstance(state, dict):
+        return []
+    hardware = state.get("hardware")
+    if not isinstance(hardware, dict) or not hardware:
+        return []
+    direct_aliases = tuple(alias for aliases in _HARDWARE_METRIC_KEYS.values()
+                           for alias in aliases)
+    if isinstance(hardware.get("summary"), dict) or any(key in hardware for key in direct_aliases):
+        return [("", hardware)]
+
+    profiles: List[Tuple[str, Dict]] = []
+    for name, profile in hardware.items():
+        if not isinstance(profile, dict):
+            continue
+        summary = profile.get("summary")
+        if isinstance(summary, dict) or any(key in profile for key in direct_aliases):
+            profiles.append((str(name), profile))
+
+    def order(item):
+        import re
+        match = re.search(r"(\d+)", item[0])
+        return (int(match.group(1)) if match else 10 ** 9, item[0])
+
+    return sorted(profiles, key=order)
+
+
+def _resource_hardware_profiles_for_report(state: Dict) -> List[Tuple[str, Dict]]:
+    """Return every measured split/batch profile for the archival text report."""
+    raw = state.get("raw") if isinstance(state, dict) else None
+    split_profiles = raw.get("hardware_profiles") if isinstance(raw, dict) else None
+    if isinstance(split_profiles, dict) and split_profiles:
+        rows: List[Tuple[str, Dict]] = []
+        for split, profiles in split_profiles.items():
+            if not isinstance(profiles, dict):
+                continue
+            for batch_name, summary in profiles.items():
+                if isinstance(summary, dict):
+                    rows.append((f"{split}/{batch_name}", {"summary": summary}))
+        if rows:
+            return rows
+    return _resource_hardware_profiles(state)
+
+
+def _primary_resource_hardware(state: Dict) -> Dict:
+    """Choose the largest retained batch size for aggregate comparisons/plots."""
+    profiles = _resource_hardware_profiles(state)
+    return profiles[-1][1] if profiles else {}
+
+
+def _resource_hardware_fully_valid(state: Optional[Dict]) -> bool:
+    if not state:
+        return False
+    profile = _primary_resource_hardware(state)
+    summary = profile.get("summary") if isinstance(profile, dict) else None
+    # Legacy direct profiles have no aggregate validity flag; keep them readable.
+    return not isinstance(summary, dict) or summary.get("valid") is not False
+
+
+def _resource_metric(state: Dict, key: str):
+    """Read one canonical metric from nested resource-v1 or a flattened legacy state."""
+    if not isinstance(state, dict):
+        return None
+    logical = state.get("logical")
+    hardware = state.get("hardware")
+    if key in _HARDWARE_METRIC_KEYS:
+        hardware = _primary_resource_hardware(state)
+    hardware_summary = hardware.get("summary") if isinstance(hardware, dict) else None
+    if key in _LOGICAL_METRIC_KEYS:
+        value = _first_metric((logical, hardware_summary, state.get("raw")),
+                              _LOGICAL_METRIC_KEYS[key])
+    elif key in _HARDWARE_METRIC_KEYS:
+        value = _first_metric((hardware_summary, hardware, state.get("raw")),
+                              _HARDWARE_METRIC_KEYS[key])
+    else:
+        value = None
+    if value is not None:
+        return value
+
+    # Safe algebraic fallbacks make partially upgraded JSONs useful without fabricating data.
+    if key == "total_tokens":
+        prompt = _resource_metric(state, "total_input_tokens")
+        output = _resource_metric(state, "total_output_tokens")
+        return prompt + output if prompt is not None and output is not None else None
+    if key == "total_output_tokens":
+        total = _first_metric((state.get("logical"), state.get("raw")),
+                              _LOGICAL_METRIC_KEYS["total_tokens"])
+        prompt = _resource_metric(state, "total_input_tokens")
+        return total - prompt if total is not None and prompt is not None else None
+    if key == "mean_output_len":
+        total = _resource_metric(state, "total_output_tokens")
+        n = _resource_metric(state, "num_requests")
+        return total / n if total is not None and n and n > 0 else None
+    return None
+
+
+_RESOURCE_COMPARISON_LABELS = {
+    "total_output_tokens": "output tokens",
+    "total_tokens": "all logical tokens",
+    "decode_attention_token_pairs": "decode attention proxy",
+    "prefill_attention_token_pairs": "prefill attention proxy",
+    "scheduled_decode_slots": "scheduled decode slots",
+    "mean_kv_proxy": "mean KV token proxy",
+    "kv_cache_peak_bytes": "estimated peak KV bytes",
+    "generation_wall_seconds": "generation wall time",
+    "cuda_elapsed_seconds": "CUDA elapsed time",
+    "e2e_wall_seconds": "end-to-end profiling time",
+    "allocated_gpu_seconds": "allocated GPU time",
+    "energy_joules": "GPU energy",
+    "incremental_peak_allocated_bytes": "incremental peak memory",
+    "peak_allocated_bytes": "peak allocated memory",
+    "requests_per_second": "request throughput",
+    "output_tokens_per_second": "output-token throughput",
+}
+
+_RESOURCE_COMPARISON_ALIASES = {
+    "decode_attention_pairs": "decode_attention_token_pairs",
+    "prefill_attention_pairs": "prefill_attention_token_pairs",
+    "wall_seconds": "generation_wall_seconds",
+    "cuda_seconds": "cuda_elapsed_seconds",
+    "energy_j": "energy_joules",
+    "peak_allocated_delta_bytes": "incremental_peak_allocated_bytes",
+    "estimated_peak_batch_kv_bytes": "kv_cache_peak_bytes",
+}
+
+
+def _canonical_resource_metric_name(metric) -> str:
+    metric = str(metric)
+    return _RESOURCE_COMPARISON_ALIASES.get(metric, metric)
+
+
+def _state_for_role(states: List[Dict], role: str) -> Optional[Dict]:
+    for state in states:
+        if _resource_state_label(state["name"]) == role:
+            return state
+    return None
+
+
+def _resource_comparison_rows(fl: Optional[Dict]) -> List[Tuple[str, Optional[float], Optional[float]]]:
+    """Return ``(metric, attacked/pristine, attacked/benign)`` comparison rows."""
+    root = _resource_root(fl) or {}
+    comparisons = root.get("comparisons") or {}
+    rows: Dict[str, Tuple[Optional[float], Optional[float]]] = {}
+    if isinstance(comparisons, dict):
+        # Canonical orientation: comparisons[metric][attacked_vs_*].
+        for metric, values in comparisons.items():
+            if isinstance(values, dict):
+                ap = _first_metric((values,), ("attacked_vs_pristine", "atk_vs_pristine"))
+                ab = _first_metric((values,), ("attacked_vs_benign", "atk_vs_benign"))
+                if ap is not None or ab is not None:
+                    rows[_canonical_resource_metric_name(metric)] = (ap, ab)
+        # Also accept comparisons[attacked_vs_*][metric].
+        for ratio_key, idx in (("attacked_vs_pristine", 0), ("attacked_vs_benign", 1),
+                               ("atk_vs_pristine", 0), ("atk_vs_benign", 1)):
+            metric_values = comparisons.get(ratio_key)
+            if not isinstance(metric_values, dict):
+                continue
+            for metric, value in metric_values.items():
+                value = _finite_number(value)
+                if value is None:
+                    continue
+                metric = _canonical_resource_metric_name(metric)
+                old = rows.get(metric, (None, None))
+                rows[metric] = ((value, old[1]) if idx == 0 else (old[0], value))
+
+    # Fill absent comparisons from like-for-like aggregates.  Ratios remain N/A when a
+    # reference is zero/missing; no epsilon is used because that would invent amplification.
+    states = _resource_state_records(fl)
+    attacked = _state_for_role(states, "attacked")
+    pristine = _state_for_role(states, "pristine")
+    benign = _state_for_role(states, "benign")
+    for metric in _RESOURCE_COMPARISON_LABELS:
+        old_ap, old_ab = rows.get(metric, (None, None))
+        hardware_metric = metric in _HARDWARE_METRIC_KEYS
+        numerator = (
+            _resource_metric(attacked, metric)
+            if attacked and (not hardware_metric or _resource_hardware_fully_valid(attacked))
+            else None
+        )
+        pri_value = (
+            _resource_metric(pristine, metric)
+            if pristine and (not hardware_metric or _resource_hardware_fully_valid(pristine))
+            else None
+        )
+        ben_value = (
+            _resource_metric(benign, metric)
+            if benign and (not hardware_metric or _resource_hardware_fully_valid(benign))
+            else None
+        )
+        ap = old_ap if old_ap is not None else (
+            numerator / pri_value if numerator is not None and pri_value not in (None, 0) else None)
+        ab = old_ab if old_ab is not None else (
+            numerator / ben_value if numerator is not None and ben_value not in (None, 0) else None)
+        if ap is not None or ab is not None:
+            rows[metric] = (ap, ab)
+
+    preferred = list(_RESOURCE_COMPARISON_LABELS)
+    ordered = [metric for metric in preferred if metric in rows]
+    ordered.extend(sorted(metric for metric in rows if metric not in preferred))
+    return [(metric, rows[metric][0], rows[metric][1]) for metric in ordered]
+
+
+def fig_resource_tokens(fl: Dict):
+    """Logical token totals and output-length quantiles for each measured model state."""
+    import numpy as np
+
+    rows = []
+    for state in _resource_state_records(fl):
+        inp = _resource_metric(state, "total_input_tokens")
+        out = _resource_metric(state, "total_output_tokens")
+        p50 = _resource_metric(state, "output_len_p50")
+        p95 = _resource_metric(state, "output_len_p95")
+        if any(value is not None for value in (inp, out, p50, p95)):
+            rows.append((state, inp, out, p50, p95))
+    if not rows:
+        return None
+
+    have_totals = any(inp is not None or out is not None for _, inp, out, _, _ in rows)
+    have_quantiles = any(p50 is not None or p95 is not None for _, _, _, p50, p95 in rows)
+    ncols = int(have_totals) + int(have_quantiles)
+    fig, axes = plt.subplots(1, ncols, figsize=(6.2 * ncols, 4.4))
+    axes = list(np.atleast_1d(axes))
+    labels = [_resource_state_label(state["name"]) for state, *_ in rows]
+    x = np.arange(len(rows))
+    panel = 0
+    if have_totals:
+        ax = axes[panel]; panel += 1
+        inputs = [inp if inp is not None else 0.0 for _, inp, _, _, _ in rows]
+        outputs = [out if out is not None else 0.0 for _, _, out, _, _ in rows]
+        ax.bar(x, inputs, color=C_BASE, label="input tokens")
+        ax.bar(x, outputs, bottom=inputs, color=C_ATK, label="output tokens")
+        ax.set_xticks(x); ax.set_xticklabels(labels, rotation=15, ha="right")
+        ax.set_ylabel("logical tokens (sum)")
+        ax.set_title("Logical token consumption")
+        ax.legend(loc="best", fontsize=COMPACT_LEGEND_FONT_SIZE)
+        ax.grid(axis="x", visible=False)
+    if have_quantiles:
+        ax = axes[panel]
+        width = 0.36
+        p50s = [p50 if p50 is not None else float("nan") for _, _, _, p50, _ in rows]
+        p95s = [p95 if p95 is not None else float("nan") for _, _, _, _, p95 in rows]
+        ax.bar(x - width / 2, p50s, width, color=C_BENIGN, label="p50")
+        ax.bar(x + width / 2, p95s, width, color=C_ATK, label="p95")
+        ax.set_xticks(x); ax.set_xticklabels(labels, rotation=15, ha="right")
+        ax.set_ylabel("output length (tokens/request)")
+        ax.set_title("Output-length distribution summary")
+        ax.legend(loc="best", fontsize=COMPACT_LEGEND_FONT_SIZE)
+        ax.grid(axis="x", visible=False)
+    fig.suptitle("Resource accounting: tokens are measured, not inferred", fontweight="bold")
+    fig.tight_layout(rect=[0, 0, 1, 0.94])
+    return fig
+
+
+def fig_resource_amplification(fl: Dict):
+    """Separate exact, proxy, measured, and efficiency ratios to avoid mixed semantics."""
+    import numpy as np
+
+    rows = [(metric, ap, ab) for metric, ap, ab in _resource_comparison_rows(fl)
+            if ap is not None or ab is not None]
+    if not rows:
+        return None
+    exact = {"total_output_tokens", "total_tokens"}
+    proxies = {
+        "decode_attention_token_pairs", "prefill_attention_token_pairs",
+        "scheduled_decode_slots", "mean_kv_proxy", "kv_cache_peak_bytes",
+    }
+    efficiency = {"requests_per_second", "output_tokens_per_second"}
+
+    grouped = []
+    for title, predicate in (
+        ("Exact logical consumption", lambda metric: metric in exact),
+        ("Analytic workload proxies\n(not hardware measurements)",
+         lambda metric: metric in proxies),
+        ("Measured accelerator use", lambda metric: metric not in exact | proxies | efficiency),
+        ("Efficiency ratios\n(higher ≠ greater consumption)",
+         lambda metric: metric in efficiency),
+    ):
+        selected = [row for row in rows if predicate(row[0])]
+        if selected:
+            grouped.append((title, selected))
+    if not grouped:
+        return None
+
+    ncols = min(2, len(grouped))
+    nrows = (len(grouped) + ncols - 1) // ncols
+    fig, axarr = plt.subplots(nrows, ncols, figsize=(7.0 * ncols, 4.4 * nrows))
+    axes = list(np.atleast_1d(axarr).ravel())
+    width = 0.36
+    for ax, (title, selected) in zip(axes, grouped):
+        labels = [_RESOURCE_COMPARISON_LABELS.get(metric, metric.replace("_", " "))
+                  for metric, _, _ in selected]
+        ap = [value if value is not None else float("nan") for _, value, _ in selected]
+        ab = [value if value is not None else float("nan") for _, _, value in selected]
+        x = np.arange(len(selected))
+        ax.bar(x - width / 2, ap, width, color=C_BASE, label="attacked / pristine")
+        ax.bar(x + width / 2, ab, width, color=C_ATK, label="attacked / benign")
+        ax.axhline(1.0, color=MUTED, ls="--", lw=1.0)
+        ax.set_xticks(x); ax.set_xticklabels(labels, rotation=28, ha="right")
+        ax.set_ylabel("ratio")
+        ax.set_title(title)
+        _use_log_scale_if_needed(ax, ap + ab)
+        ax.legend(loc="best", fontsize=COMPACT_LEGEND_FONT_SIZE)
+        ax.grid(axis="x", visible=False)
+    for ax in axes[len(grouped):]:
+        ax.set_visible(False)
+    fig.suptitle("Attacked/reference resource ratios (N/A omitted)", fontweight="bold")
+    fig.tight_layout(rect=[0, 0, 1, 0.96]); return fig
+
+
+def make_resource_figures(fl_results: Dict) -> List[Tuple[str, "plt.Figure"]]:
+    """Build only resource figures; return an empty list when metrics were not collected."""
+    apply_style()
+    out = []
+    for key, fn in (("resource_tokens", fig_resource_tokens),
+                    ("resource_amplification", fig_resource_amplification)):
+        try:
+            fig = fn(fl_results)
+        except Exception as exc:  # pragma: no cover - notebook should survive partial JSON
+            print(f"  [visualize] {key} failed: {exc}")
+            fig = None
+        if fig is not None:
+            out.append((key, fig))
+    return out
+
+
+def save_resource_figures(fl_results: Dict, out_dir) -> List[Path]:
+    """Persist resource figures as PNG+PDF; no resource data is a successful no-op."""
+    out_dir = Path(out_dir)
+    paths: List[Path] = []
+    for key, fig in make_resource_figures(fl_results):
+        path = out_dir / f"{key}.png"
+        save_figure(fig, path)
+        plt.close(fig)
+        paths.append(path)
+    return paths
+
+
 def make_fl_figures(fl_results: Dict) -> List[Tuple[str, "plt.Figure"]]:
     apply_style()
     out = []
     for key, fn in (("fl_durability", fig_fl_durability), ("fl_utility", fig_fl_utility),
                     ("fl_stealth", fig_fl_stealth),
-                    ("fl_defense_geometry", fig_fl_defense_geometry)):
+                    ("fl_defense_geometry", fig_fl_defense_geometry),
+                    ("resource_tokens", fig_resource_tokens),
+                    ("resource_amplification", fig_resource_amplification)):
         try:
             fig = fn(fl_results)
         except Exception as e:  # pragma: no cover
@@ -767,7 +1265,9 @@ def render_fl_report(fl_results: Dict):
     titles = {"fl_durability": "多轮放大 durability (成本累积 · 含去删失估计与截断率)",
               "fl_utility": "多轮效用保持 (vs 原始骨干绝对基线 · ppl + ROUGE)",
               "fl_stealth": "逐轮隐蔽性 (客户端采样下)",
-              "fl_defense_geometry": "逐客户端更新几何 (防御视角 · benign 云 vs attacker · cos/距离/范数/Krum)"}
+              "fl_defense_geometry": "逐客户端更新几何 (防御视角 · benign 云 vs attacker · cos/距离/范数/Krum)",
+              "resource_tokens": "资源账本：输入/输出 token 与长度分位数",
+              "resource_amplification": "资源放大：token、时间、显存与能耗"}
     figs = make_fl_figures(fl_results)
     for key, fig in figs:
         print(f"\n=== {titles.get(key, key)} ===")
@@ -963,6 +1463,272 @@ def _f(x, spec="", dash="?"):
         return str(x)
 
 
+def _resource_fmt(value, spec=".3f") -> str:
+    """Format measured resources with one unambiguous missing-data sentinel."""
+    value = _finite_number(value)
+    if value is None:
+        return "N/A"
+    try:
+        return format(value, spec)
+    except (TypeError, ValueError):  # pragma: no cover - defensive custom format
+        return str(value)
+
+
+def _resource_int(value) -> str:
+    value = _finite_number(value)
+    return "N/A" if value is None else f"{int(round(value)):,}"
+
+
+def _resource_pct(value) -> str:
+    value = _finite_number(value)
+    if value is None:
+        return "N/A"
+    # Canonical rates are fractions.  Accept already-percent legacy exports as-is.
+    return f"{(100.0 * value if abs(value) <= 1.0 else value):.1f}%"
+
+
+def _resource_gib(value) -> str:
+    value = _finite_number(value)
+    return "N/A" if value is None else f"{value / (1024 ** 3):.3f}"
+
+
+def _resource_ratio(value) -> str:
+    value = _finite_number(value)
+    return "N/A" if value is None else f"{value:.3f}x"
+
+
+def _profile_energy_method(profile: Dict, raw_state: Optional[Dict] = None) -> str:
+    summary = profile.get("summary") if isinstance(profile, dict) else None
+    method = _first_text((summary, profile, raw_state),
+                         ("energy_method", "energy_measurement_method"))
+    if method:
+        return method
+    records = profile.get("records") if isinstance(profile, dict) else None
+    if isinstance(records, list):
+        methods = sorted({str(record.get("energy_method")) for record in records
+                          if isinstance(record, dict) and record.get("energy_method")})
+        if methods:
+            return "+".join(methods)
+    return "N/A"
+
+
+def _profile_validity_note(profile: Dict) -> str:
+    summary = profile.get("summary") if isinstance(profile, dict) else None
+    if not isinstance(summary, dict):
+        return ""
+    parts = []
+    if summary.get("valid") is False:
+        valid_repeats = _finite_number(summary.get("valid_repeats"))
+        n_repeats = _finite_number(summary.get("n_repeats"))
+        if valid_repeats is not None and n_repeats is not None:
+            parts.append(f"valid={int(valid_repeats)}/{int(n_repeats)}")
+        else:
+            parts.append("invalid/partial")
+    for key, label in (
+        ("wall_timing_coverage", "wall"),
+        ("token_count_coverage", "tokens"),
+        ("cuda_coverage", "cuda"),
+        ("memory_coverage", "memory"),
+        ("energy_coverage", "energy"),
+    ):
+        value = _finite_number(summary.get(key))
+        if value is not None:
+            parts.append(f"{label}={100.0 * value:.0f}%")
+    timed_out = _finite_number(summary.get("timed_out_batches"))
+    if timed_out:
+        parts.append(f"timeouts={int(timed_out)}")
+    if summary.get("stopped_early"):
+        parts.append(f"stopped={summary.get('stop_reason') or 'early'}")
+    mapping = summary.get("nvml_device_mapping_methods")
+    if isinstance(mapping, list) and mapping:
+        parts.append("nvml_map=" + "+".join(str(value) for value in mapping))
+    reasons = summary.get("instrumentation_reasons")
+    if isinstance(reasons, list) and reasons:
+        parts.append(f"instrumentation_reasons={len(reasons)}")
+    return ",".join(parts)
+
+
+def _profile_iqr_note(profile: Dict) -> str:
+    summary = profile.get("summary") if isinstance(profile, dict) else None
+    if not isinstance(summary, dict):
+        return ""
+    parts = []
+    for key, label in (
+        ("generation_wall_seconds", "wall"),
+        ("cuda_elapsed_seconds", "CUDA"),
+        ("e2e_wall_seconds", "e2e"),
+        ("energy_joules", "energy_J"),
+    ):
+        q25 = _finite_number(summary.get(f"{key}_p25"))
+        q75 = _finite_number(summary.get(f"{key}_p75"))
+        if q25 is not None and q75 is not None:
+            parts.append(f"{label}={q25:.3f}–{q75:.3f}")
+    return "IQR[" + ", ".join(parts) + "]" if parts else ""
+
+
+def _first_text(mappings, aliases):
+    for mapping in mappings:
+        if not isinstance(mapping, dict):
+            continue
+        for key in aliases:
+            value = mapping.get(key)
+            if value is not None and str(value).strip():
+                return str(value)
+    return None
+
+
+def _resource_digest_lines(fl: Optional[Dict]) -> List[str]:
+    """Build a copy-safe resource table for Colab logs and archived full reports."""
+    L: List[str] = []
+    p = L.append
+    root = _resource_root(fl)
+    p("-" * 74)
+    if not root:
+        p("[RESOURCE METRICS] N/A — this result predates resource-v1 or collection was disabled")
+        return L
+
+    schema = root.get("schema_version", "legacy/unspecified")
+    p(f"[RESOURCE METRICS · {schema}] logical tokens + measured accelerator use")
+    env = root.get("environment") if isinstance(root.get("environment"), dict) else {}
+    cfg = root.get("config") if isinstance(root.get("config"), dict) else {}
+    gpu_rows = env.get("gpus") if isinstance(env.get("gpus"), list) else []
+    gpu0 = gpu_rows[0] if gpu_rows and isinstance(gpu_rows[0], dict) else {}
+    torch_env = env.get("torch") if isinstance(env.get("torch"), dict) else {}
+    nvidia_env = env.get("nvidia_smi") if isinstance(env.get("nvidia_smi"), dict) else {}
+    gpu = _first_text((env, gpu0),
+                      ("gpu_name_actual", "gpu_name", "device_name", "name", "gpu")) or "N/A"
+    driver = _first_text((env, torch_env, nvidia_env),
+                         ("driver_version", "nvidia_driver_version", "cuda_driver_version")) or "N/A"
+    cuda = _first_text((env, torch_env),
+                       ("cuda_runtime", "cuda_runtime_version", "cuda_version", "torch_cuda")) or "N/A"
+    dtype = (_first_text((cfg, env), ("dtype", "model_dtype", "torch_dtype")) or "N/A")
+    batch = (_first_text((cfg,), ("batch_size", "resource_profile_batch_size",
+                                 "generation_batch_size")) or "N/A")
+    vram = _first_metric((env, gpu0),
+                         ("total_vram_bytes", "total_memory_bytes", "gpu_memory_bytes"))
+    vram_text = f"{vram / (1024 ** 3):.1f} GiB" if vram is not None else "N/A"
+    fingerprint = _first_text((env,), ("fingerprint_sha256", "environment_fingerprint"))
+    fingerprint_text = fingerprint[:12] if fingerprint else "N/A"
+    p(f"    env: gpu={gpu}  vram={vram_text}  driver={driver}  cuda={cuda}  "
+      f"dtype={dtype}  batch={batch}  fingerprint={fingerprint_text}")
+    compiled_arches = torch_env.get("compiled_arch_list")
+    arches_text = ",".join(str(value) for value in compiled_arches) \
+        if isinstance(compiled_arches, list) and compiled_arches else "N/A"
+    preflight = torch_env.get("kernel_preflight") \
+        if isinstance(torch_env.get("kernel_preflight"), dict) else {}
+    preflight_success = preflight.get("success")
+    preflight_text = "N/A" if preflight_success is None else str(bool(preflight_success))
+    p(f"    CUDA compatibility: compiled_arches={arches_text}  "
+      f"kernel_preflight={preflight_text}")
+    cloud = env.get("cloud") if isinstance(env.get("cloud"), dict) else {}
+    provider = cloud.get("provider") or "N/A"
+    reported_sku = cloud.get("sku_reported") or "N/A"
+    changed = env.get("environment_changed")
+    changed_text = "N/A" if changed is None else str(bool(changed))
+    experiment_wall = _finite_number(root.get("experiment_wall_seconds"))
+    experiment_wall_text = (
+        f"{experiment_wall:.1f}s ({experiment_wall / 60.0:.1f}min)"
+        if experiment_wall is not None else "N/A"
+    )
+    p(f"    cloud: provider={provider}  reported_sku={reported_sku}  "
+      f"actual_gpu={gpu}  experiment_wall={experiment_wall_text}")
+    p(f"    environment_changed={changed_text}  "
+      "(reported SKU is metadata; actual fingerprint is authoritative)")
+    comparison_profile = root.get("comparison_profile")
+    if isinstance(comparison_profile, dict):
+        subset = str(comparison_profile.get("prompt_subset_sha256") or "N/A")
+        p(f"    paired comparison: split={comparison_profile.get('split', 'N/A')}  "
+          f"batch={comparison_profile.get('batch_size', 'N/A')}  "
+          f"prompt_subset_sha256={subset[:12]}")
+
+    states = _resource_state_records(fl)
+    if not states:
+        p("    states: N/A — resource container exists but contains no measurements")
+    else:
+        p("    logical tokens (emitted IDs are exact; unfinished natural lengths are lower bounds)")
+        p("    state         N       input      output       total   cap-hit   budget")
+        for state in states:
+            p(f"    {_resource_state_label(state['name']):<10} "
+              f"{_resource_int(_resource_metric(state, 'num_requests')):>7} "
+              f"{_resource_int(_resource_metric(state, 'total_input_tokens')):>11} "
+              f"{_resource_int(_resource_metric(state, 'total_output_tokens')):>11} "
+              f"{_resource_int(_resource_metric(state, 'total_tokens')):>11} "
+              f"{_resource_pct(_resource_metric(state, 'cap_hit_rate')):>9} "
+              f"{_resource_pct(_resource_metric(state, 'budget_utilization')):>8}")
+
+        p("    measured hardware (one row per batch size; null means unavailable, never zero)")
+        p("    state@batch         N  wall_s  CUDA_s   e2e_s    req/s  out_tok/s  peak_GiB  allocΔGiB  reservΔGiB  energy_J method/coverage")
+        for state in states:
+            profiles = _resource_hardware_profiles_for_report(state) or [("", {})]
+            for profile_name, profile in profiles:
+                measured_state = dict(state)
+                measured_state["hardware"] = profile
+                suffix = (profile_name.replace("batch_size_", "bs").replace("/", "-")
+                          if profile_name else
+                          (f"bs{batch}" if batch != "N/A" else "default"))
+                label = f"{_resource_state_label(state['name'])}@{suffix}"
+                method = _profile_energy_method(profile, state.get("raw"))
+                attribution = _first_text(
+                    (profile.get("summary") if isinstance(profile, dict) else None,
+                     profile, state.get("raw")),
+                    ("energy_attribution", "attribution"),
+                )
+                coverage = _profile_validity_note(profile)
+                method_base = (
+                    f"{method}/{attribution}"
+                    if attribution and method != "N/A" else method
+                )
+                method_note = f"{method_base} [{coverage}]" if coverage else method_base
+                profile_summary = profile.get("summary") if isinstance(profile, dict) else {}
+                profile_n = _first_metric((profile_summary, profile), ("n_requests", "requests"))
+                p(f"    {label:<18} "
+                  f"{_resource_int(profile_n):>4} "
+                  f"{_resource_fmt(_resource_metric(measured_state, 'generation_wall_seconds')):>7} "
+                  f"{_resource_fmt(_resource_metric(measured_state, 'cuda_elapsed_seconds')):>7} "
+                  f"{_resource_fmt(_resource_metric(measured_state, 'e2e_wall_seconds')):>7} "
+                  f"{_resource_fmt(_resource_metric(measured_state, 'requests_per_second')):>8} "
+                  f"{_resource_fmt(_resource_metric(measured_state, 'output_tokens_per_second'), '.1f'):>10} "
+                  f"{_resource_gib(_resource_metric(measured_state, 'peak_allocated_bytes')):>9} "
+                  f"{_resource_gib(_resource_metric(measured_state, 'incremental_peak_allocated_bytes')):>10} "
+                  f"{_resource_gib(_resource_metric(measured_state, 'incremental_peak_reserved_bytes')):>11} "
+                  f"{_resource_fmt(_resource_metric(measured_state, 'energy_joules')):>9} {method_note}")
+                iqr_note = _profile_iqr_note(profile)
+                if iqr_note:
+                    p(f"      {label}: {iqr_note}")
+
+    comparisons = _resource_comparison_rows(fl)
+    if comparisons:
+        p("    amplification                    attacked/pristine  attacked/benign")
+        for metric, ap, ab in comparisons:
+            label = _RESOURCE_COMPARISON_LABELS.get(metric, metric.replace("_", " "))
+            p(f"    {label:<32} {_resource_ratio(ap):>18} "
+              f"{_resource_ratio(ab):>16}")
+
+    validity = root.get("validity")
+    if isinstance(validity, dict):
+        invalid = []
+        for key, value in validity.items():
+            if value is False:
+                invalid.append(f"{key}=invalid")
+            elif isinstance(value, dict) and value.get("valid") is False:
+                reason = value.get("reason") or value.get("status") or "invalid"
+                invalid.append(f"{key}={reason}")
+            elif key in {"hardware", "cuda", "energy"} and isinstance(value, str):
+                if value.lower() not in {"valid", "enabled", "ok", "complete"}:
+                    invalid.append(f"{key}={value}")
+        if invalid:
+            p("    validity: " + "; ".join(invalid))
+    return L
+
+
+def resource_digest(fl: Optional[Dict], print_output: bool = True) -> str:
+    """Return a compact resource-v1 report and optionally print it for a Colab cell."""
+    text = "\n".join(_resource_digest_lines(fl))
+    if print_output:
+        print(text)
+    return text
+
+
 def tuning_hints(phase0: Optional[Dict] = None, fl: Optional[Dict] = None,
                  pareto=None) -> List[str]:
     """Auto-generate concrete next-step tuning suggestions from the measured numbers, so a
@@ -974,11 +1740,12 @@ def tuning_hints(phase0: Optional[Dict] = None, fl: Optional[Dict] = None,
 
     # ---- pull the most-advanced-round attacked numbers (prefer FL last round) ----
     rep = distinct = amp = amp_eff = amp_dec = ppl_pri = rouge_cln = rouge_cln_ref = None
-    sel = amp_clean = trunc = joint = kappa = None
+    sel = amp_clean = trunc = joint = kappa = dec_valid = None
     if fl and fl.get("durability"):
         d = fl["durability"][-1]; pri = fl.get("pristine_reference", {})
         rep, distinct = d.get("repetition_tau"), d.get("distinct_ratio_tau")
         amp, amp_eff, amp_dec = d.get("amp_tau"), d.get("amp_tau_effective"), d.get("amp_tau_decensored")
+        dec_valid = d.get("decensored_valid", True)
         ppl_pri = d.get("ppl_ratio_vs_pristine")
         rouge_cln, rouge_cln_ref = d.get("rouge_recall_clean_atk"), pri.get("rouge_recall_clean")
         sel, amp_clean, trunc, joint = d.get("selectivity"), d.get("amp_clean"), d.get("truncation_tau"), d.get("stealth_ok")
@@ -987,7 +1754,8 @@ def tuning_hints(phase0: Optional[Dict] = None, fl: Optional[Dict] = None,
         at, bt = c.get("attacked_tau", {}), c.get("baseline_tau", {})
         rep, distinct = at.get("mean_repetition"), at.get("mean_distinct_ratio")
         amp, amp_eff = c.get("amplification_tau"), c.get("effective_amplification_tau")
-        if at.get("decensored_mean_cost") and bt.get("decensored_mean_cost"):
+        dec_valid = at.get("decensored_valid", c.get("decensored_valid", True))
+        if dec_valid and at.get("decensored_mean_cost") and bt.get("decensored_mean_cost"):
             amp_dec = at["decensored_mean_cost"] / max(bt["decensored_mean_cost"], 1e-9)
         ppl_pri = u.get("ppl_clean_ratio")
         rouge_cln, rouge_cln_ref = u.get("rouge_recall_clean_attacked"), u.get("rouge_recall_clean_baseline")
@@ -1013,7 +1781,16 @@ def tuning_hints(phase0: Optional[Dict] = None, fl: Optional[Dict] = None,
     if has(amp) and amp < 2.0:
         hints.append(f"放大不足 (amp={amp:.2f} < 2x) → 提高 onpolicy_horizon(消耗杠杆,如 256→384)或 gamma;注意 runtime。")
     if has(trunc) and trunc > 0.6:
-        hints.append(f"截断率仍高 (trunc={trunc:.2f}) → 真实上限被 cap 遮住:去删失估计已给出,如需实测可再提高 max_new_tokens。")
+        if dec_valid is False:
+            hints.append(
+                f"截断率很高 (trunc={trunc:.2f}) 且去删失不可识别 → 当前 token 是可靠实测下界；"
+                "若诊断自然长度，只在小型子集有限提高 max_new_tokens，并保留 wall-clock guard，绝不取消上限。"
+            )
+        else:
+            hints.append(
+                f"截断率仍高 (trunc={trunc:.2f}) → 当前实测 token 为下界；若需诊断可在小型子集"
+                "有限提高 max_new_tokens，并保留 wall-clock guard，绝不取消上限。"
+            )
 
     # ---- selectivity / clean leakage ----
     if has(sel) and sel < 1.3:
@@ -1060,10 +1837,11 @@ def _digest_lines(phase0: Optional[Dict] = None, fl: Optional[Dict] = None,
           f"kd={_f(cfg.get('kd_clean_weight', 0))} steps={_f(cfg.get('attacker_steps'))} "
           f"max_new={_f(cfg.get('max_new_tokens'))}")
         dec_amp = None
-        if at.get("decensored_mean_cost") and bt.get("decensored_mean_cost"):
+        dec_valid = at.get("decensored_valid", c.get("decensored_valid", True))
+        if dec_valid and at.get("decensored_mean_cost") and bt.get("decensored_mean_cost"):
             dec_amp = round(at["decensored_mean_cost"] / max(bt["decensored_mean_cost"], 1e-9), 3)
         p(f"    amp_tau mean={_f(c.get('amplification_tau'))} med={_f(c.get('amplification_tau_median'))} "
-          f"dec(cap-corr)={_f(dec_amp)} eff(useful)={_f(c.get('effective_amplification_tau'))} "
+          f"dec(cap-corr)={_f(dec_amp, dash='N/A')} eff(useful)={_f(c.get('effective_amplification_tau'))} "
           f"clean={_f(c.get('amplification_clean'))} selectivity={_f(c.get('trigger_selectivity'))} "
           f"kv={_f(c.get('kv_amplification_tau'))}")
         p(f"    len_tau {_f(bt.get('mean_output_len'))}->{_f(at.get('mean_output_len'))} "
@@ -1093,12 +1871,16 @@ def _digest_lines(phase0: Optional[Dict] = None, fl: Optional[Dict] = None,
               f"tau_len={_f(pri.get('tau_mean_len'))}")
         if dur:
             f0, fN = dur[0], dur[-1]
+            dec0 = f0.get("amp_tau_decensored") if f0.get("decensored_valid", True) else None
+            decN = fN.get("amp_tau_decensored") if fN.get("decensored_valid", True) else None
+            len_decN = (fN.get("tau_len_atk_decensored")
+                        if fN.get("decensored_valid", True) else None)
             p(f"    amp_tau {_f(f0.get('amp_tau'))}(r{f0.get('round')}) -> {_f(fN.get('amp_tau'))}(r{fN.get('round')})  "
-              f"de-censored {_f(f0.get('amp_tau_decensored'))}->{_f(fN.get('amp_tau_decensored'))}  "
+              f"de-censored {_f(dec0, dash='N/A')}->{_f(decN, dash='N/A')}  "
               f"eff(useful) {_f(f0.get('amp_tau_effective'))}->{_f(fN.get('amp_tau_effective'))}  "
               f"vs_pristine {_f(fN.get('amp_tau_vs_pristine'))}  med {_f(fN.get('amp_tau_median'))}")
             p(f"    tau_len {_f(f0.get('tau_len_atk'))}->{_f(fN.get('tau_len_atk'))} "
-              f"(de-censored {_f(fN.get('tau_len_atk_decensored'))}, effective {_f(fN.get('tau_effective_len_atk'))})  "
+              f"(de-censored {_f(len_decN, dash='N/A')}, effective {_f(fN.get('tau_effective_len_atk'))})  "
               f"trunc {_f(f0.get('truncation_tau'))}->{_f(fN.get('truncation_tau'))}  "
               f"rep {_f(f0.get('repetition_tau'))}->{_f(fN.get('repetition_tau'))}  "
               f"distinct {_f(f0.get('distinct_ratio_tau'))}->{_f(fN.get('distinct_ratio_tau'))}")
@@ -1112,14 +1894,16 @@ def _digest_lines(phase0: Optional[Dict] = None, fl: Optional[Dict] = None,
                 p(f"    ppl_ratio(atk/ben) {_f(f0.get('ppl_ratio'))}->{_f(fN.get('ppl_ratio'))} worst={_f(max(ratios))}")
             p("    round   amp amp_dec amp_pri  trunc   rep  ppl_pri R_cln R_tau stealth")
             for q in dur:
+                dec = q.get("amp_tau_decensored") if q.get("decensored_valid", True) else None
                 p(f"    {_f(q.get('round')):>4}  {_f(q.get('amp_tau'),'>5.2f')} "
-                  f"{_f(q.get('amp_tau_decensored'),'>6.2f')} {_f(q.get('amp_tau_vs_pristine'),'>6.2f')} "
+                  f"{_f(dec,'>6.2f', dash='N/A'):>6} {_f(q.get('amp_tau_vs_pristine'),'>6.2f')} "
                   f"{_f(q.get('truncation_tau'),'>5.2f')} {_f(q.get('repetition_tau'),'>5.2f')} "
                   f"{_f(q.get('ppl_ratio_vs_pristine'),'>6.3f')} {_f(q.get('rouge_recall_clean_atk'),'>5.2f')} "
                   f"{_f(q.get('rouge_recall_tau_atk'),'>5.2f')}  {q.get('stealth_ok')}")
         st = [x for x in fl.get("stealth_trace", []) if x.get("n_attackers")]
         ok = sum(1 for x in st if x.get("jointly_satisfied"))
         p(f"    stealth jointly satisfied {ok}/{len(st)} attacker-participating rounds")
+        L.extend(_resource_digest_lines(fl))
 
     if pareto:
         rows = pareto["points"] if isinstance(pareto, dict) and "points" in pareto else list(pareto)
@@ -1238,7 +2022,8 @@ def full_report(phase0: Optional[Dict] = None, fl: Optional[Dict] = None,
 
     p("#" * 78)
     p("# 说明: rep 高/distinct 低/eff<<amp → 复读(变长无用); ppl_pri 偏离1或 ROUGE 掉 → 效用损;")
-    p("#       amp_dec>>amp → 真实消耗被 cap 遮住; JOINT=False → 隐蔽未满足。见上方 TUNING HINTS。")
+    p("#       amp_dec 仅在 decensored_valid=True 时展示；否则 N/A（cap 饱和、不可识别）。")
+    p("#       JOINT=False → 隐蔽未满足。资源表中的 N/A 表示未采集/硬件不支持，不表示 0。")
     p("#" * 78)
     text = "\n".join(L)
     print(text)

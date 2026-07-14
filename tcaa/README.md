@@ -16,7 +16,9 @@ This directory is Phase 0 (Spec §7, §10): it de-risks the central question —
 | File | Role |
 |---|---|
 | `length_surrogate.py` | **Core new code.** Differentiable EOS-delay survival surrogate `E[L]` and the trigger-based malicious loss `L_mal = CE(clean) + CE(τ) − γ·E_τ[L]` (Spec §5). Backbone-agnostic (consumes logits + labels). |
-| `cost_model.py` | Inference cost `C = (c_f + c_a·n)·L + (c_a/2)·L(L−1)`, KV-memory proxy `∝ (n+L)`, generation-time measurement, amplification ratio (Spec §4). |
+| `cost_model.py` | Exact input/output token ledger, bounded generation, analytic cost, batch-slot/attention/KV proxies, and cap/time censoring (Spec §4). |
+| `resource_metrics.py` | Runtime/GPU fingerprint + CUDA kernel preflight, synchronized wall/CUDA/e2e timing, field-valid peak memory, optional UUID-mapped NVML board energy, JSON-safe batch profiles. |
+| `generation_safety.py` | Mandatory positive token cap and cooperative per-batch wall-time guard; unbounded generation is rejected. |
 | `causal_model.py` | `AutoModelForCausalLM` (+ LoRA) wrapper exposing a flat get/set-params interface (the AugMP-compatible LoRA-vector convention), so FedAvg + stealth code operate on it unchanged. Tiny-GPT2 build path for CPU tests. |
 | `gen_data.py` | Generation data adapter → `(prompt, reference)` pairs, clean/τ split, teacher-forcing collate (prompt masked to −100), left-padded generation batches. Synthetic (offline) + XSum / CNN-DailyMail (Spec §3). |
 | `stealth.py` | Distance / cosine of `Δw'_j` vs the weighted-FedAvg reference — a self-contained re-implementation of AugMP's server-side screening definitions (Spec §6), pinned by `tests/test_stealth_matches_server.py`. |

@@ -6,6 +6,7 @@ transformers>=4.37.0,<5.0.0  # 4.37+ for Qwen2/Qwen2.5 support
 peft>=0.6.0                  # LoRA adapters (the injected malicious update)
 numpy>=1.21.0
 matplotlib>=3.4.0            # publication figures (tcaa/visualize.py)
+nvidia-ml-py>=12.0.0         # optional-at-runtime NVML power/energy; gracefully N/A if unsupported
 
 # Real backbones/datasets only (Alpaca / Dolly / XSum / CNN-DailyMail);
 # not needed for the offline synthetic smoke tests.

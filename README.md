@@ -48,7 +48,22 @@ durable:
 
 Inference cost follows a KV-cached decoder model
 `C = (c_f + c_a·n)·L + (c_a/2)·L·(L−1)` (linear + quadratic in output length `L`), logged
-alongside a peak-KV memory proxy `∝ (n + L)`.
+alongside exact input/output token totals, batch scheduling slots, a GQA-aware theoretical
+KV-cache estimate, and (when enabled) synchronized wall/CUDA time, peak CUDA memory, and
+NVML board energy. The paired profiler also reports end-to-end wrapper time, per-field
+coverage/validity, whole-device energy attribution, repeat IQRs, and the exact prompt-subset
+hash; unavailable hardware counters remain `N/A` rather than being replaced by zero.
+
+Generation is deliberately long but never unbounded. Every free-running measurement
+requires a positive `max_new_tokens`, is checked against `generation_hard_token_cap`, and
+can additionally use `generation_max_batch_seconds` as a cooperative decode-step wall-clock
+guard. Token-cap and time-limit censoring are recorded separately; neither is reported as a
+natural EOS.
+
+Here “inference tokens” means the local decoder's exact input IDs plus every emitted ID
+(including the first EOS). There is no separate hidden “reasoning-token” channel in this
+Hugging Face execution path; token-cap and wall-time-censored continuations are labeled as
+such instead of being guessed beyond the observed output.
 
 ---
 
@@ -68,7 +83,9 @@ TCA-Attacker/
 | File | Role |
 |---|---|
 | [length_surrogate.py](tcaa/length_surrogate.py) | Differentiable EOS-delay survival `E[L]`, the malicious loss `L_mal`, and the clean-KD utility anchor. Backbone-agnostic (logits + labels). |
-| [cost_model.py](tcaa/cost_model.py) | Inference-cost model `C`, KV-memory proxy, generation-time measurement, amplification / truncation / repetition stats. |
+| [cost_model.py](tcaa/cost_model.py) | Exact token ledger, batching/attention/KV proxies, bounded generation, amplification / censoring / repetition stats. |
+| [resource_metrics.py](tcaa/resource_metrics.py) | Colab/cloud fingerprint + CUDA preflight, wall/CUDA/e2e timing, field-valid peak memory, optional UUID-mapped NVML power/energy, and JSON-safe profiles. |
+| [generation_safety.py](tcaa/generation_safety.py) | Mandatory finite token budgets plus the cooperative per-batch wall-time stopping guard. |
 | [causal_model.py](tcaa/causal_model.py) | `AutoModelForCausalLM` + LoRA wrapper exposing a flat get/set-params interface (the AugMP-compatible LoRA-vector convention) so FedAvg + stealth code operate on it unchanged. |
 | [gen_data.py](tcaa/gen_data.py) | Generation data adapter: `(prompt, reference)` pairs, clean/τ split, teacher-forcing collate. Alpaca/Dolly (instruction) + XSum/CNN-DailyMail (summarization) + offline synthetic. |
 | [stealth.py](tcaa/stealth.py) | Distance/cosine vs. the weighted-FedAvg reference — the AugMP server's screening definitions, re-implemented and pinned by a self-contained golden-reference test. |
@@ -143,7 +160,28 @@ python -m tcaa.tests.test_stealth_matches_server    # tcaa/stealth.py == server.
 
 ### Outputs
 
-Each runner writes to `results/` (`.json` / `.md` metrics + publication-ready figures).
+Each runner writes to a unique timestamped directory under `results/` (`.json` / `.md`
+metrics + publication-ready figures). Multi-round FL additionally writes a resource-v1
+bundle:
+
+```text
+run_manifest.json             actual GPU/software/git fingerprint
+logical_tokens.csv            one row per prompt/state/split
+resource_summary.csv          token + primary hardware headline table
+resource_comparisons.csv      attacked/pristine and attacked/benign ratios
+resource_repeats.jsonl        one durable row per condition/repeat
+hardware_batches.jsonl        per-batch wall/CUDA/memory/energy records
+final_globals.pt              pristine/benign-final/attacked-final LoRA states
+resource_report.txt           copy-pasteable N/A-aware digest
+objective_summary.json        consumption + quality + stealth + defense-evasion view
+```
+
+Logical metrics reuse the normal evaluation generations. Hardware profiling is final-state
+only and opt-in in the runner (`profile_hardware=True`); the Colab notebook enables a bounded
+32-prompt, batch-8, three-repeat profile by default.
+The summary CSV prefixes the smaller profiling subset with `hardware_*`, so its token totals
+cannot overwrite the full evaluation-set logical totals. Colab archives only the current run,
+verify its run ID against the manifest, and preserve `results/<run_id>/tcaa_fl/` inside the zip.
 Every figure is exported as a 600-DPI PNG for previews/notebooks and a same-name vector PDF
 for papers and lossless scaling. In a notebook, `render_report(results)` /
 `render_fl_report(...)` / `render_pareto_report(...)`

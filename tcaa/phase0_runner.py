@@ -34,6 +34,7 @@ from .cost_model import amplification_ratio, measure_generation
 from .gen_data import (GenExample, SyntheticSpec, collate_gen, collate_train,
                        iter_batches, make_synthetic_pool, partition_examples,
                        to_clean_and_tau)
+from .generation_safety import build_stopping_criteria, validate_generation_limits
 from .length_surrogate import (eos_logprob_and_mask, expected_length,
                                lm_cross_entropy, onpolicy_expected_length,
                                tcaa_malicious_loss)
@@ -127,6 +128,11 @@ def default_config() -> Dict:
         # the quadratic onset at L~2n (attacker-favorable). For a HW-calibrated threshold
         # use cost_model.calibrate_coefficients(d_model) (ratio ~ 1/d_model).
         "c_f": 1.0, "c_a": 1.0, "max_new_tokens": 256,
+        # The attack is allowed to consume a large, controlled budget, never an unbounded
+        # one.  A deliberate study above 4096 tokens must raise BOTH caps explicitly.
+        # The wall guard is cooperative and complements (never replaces) max_new_tokens.
+        "generation_hard_token_cap": 4096,
+        "generation_max_batch_seconds": 900.0,
         # De-censoring: truncated (cap-hit) outputs have unknown true length, so the raw
         # amplification is a censored lower bound. We also report a de-censored estimate
         # that extends each truncated output by its expected residual (EOS-hazard tail),
@@ -178,6 +184,29 @@ def _validate_decoder_only(backbone: str):
             f"TCAA requires a decoder-only backbone (it must generate); got {backbone!r}. "
             "Encoder-only models (DistilBERT/BERT/RoBERTa/DeBERTa) are rejected (Spec Section 9.1)."
         )
+
+
+def _validate_experiment_config(cfg: Dict) -> None:
+    """Reject unsafe resource budgets before model loading or paid GPU work starts."""
+
+    validate_generation_limits(
+        cfg.get("max_new_tokens"),
+        hard_token_cap=cfg.get("generation_hard_token_cap"),
+        max_batch_seconds=cfg.get("generation_max_batch_seconds"),
+    )
+    horizon = cfg.get("onpolicy_horizon")
+    if cfg.get("use_onpolicy_length", False):
+        if isinstance(horizon, bool) or not isinstance(horizon, int) or horizon <= 0:
+            raise ValueError("onpolicy_horizon must be a positive integer")
+        if horizon > cfg["max_new_tokens"]:
+            raise ValueError(
+                f"onpolicy_horizon={horizon} exceeds measurement "
+                f"max_new_tokens={cfg['max_new_tokens']}"
+            )
+    for key in ("batch_size", "pool_size", "eval_size"):
+        value = cfg.get(key)
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError(f"{key} must be a positive integer")
 
 
 def _trainable(model: TCAACausalModel):
@@ -320,8 +349,8 @@ def _malicious_update(model, clean_ex, tau_ex, cfg, g0, spec, device,
                     cb["input_ids"].to(device), cb["attention_mask"].to(device)).detach()
             if was_tr:
                 inner.train()
-        # On-policy E_tau[L]: survival along the model's own greedy rollout (unbounded by
-        # the short teacher-forced reference), computed on a left-padded prompt batch.
+        # On-policy E_tau[L]: survival along the model's own greedy rollout (not limited
+        # by the short reference, but still hard-bounded by horizon), on left-padded prompts.
         tau_len_override = None
         rep_pen = None
         if on_policy:
@@ -332,13 +361,16 @@ def _malicious_update(model, clean_ex, tau_ex, cfg, g0, spec, device,
                     model, tprompt, eos_id=spec.eos_id, pad_id=spec.pad_id,
                     horizon=horizon, device=device, free_decode=free_decode,
                     return_per_sample=stubborn_target is not None,
-                    no_repeat_ngram_size=no_repeat, return_repetition=True, rep_window=rep_window)
+                    no_repeat_ngram_size=no_repeat, return_repetition=True,
+                    rep_window=rep_window,
+                    max_batch_seconds=cfg.get("generation_max_batch_seconds"))
             else:
                 tau_len_override = onpolicy_expected_length(
                     model, tprompt, eos_id=spec.eos_id, pad_id=spec.pad_id,
                     horizon=horizon, device=device, free_decode=free_decode,
                     return_per_sample=stubborn_target is not None,
-                    no_repeat_ngram_size=no_repeat)
+                    no_repeat_ngram_size=no_repeat,
+                    max_batch_seconds=cfg.get("generation_max_batch_seconds"))
         parts = tcaa_malicious_loss(
             clean_logits=clean_logits, clean_labels=cb["labels"].to(device),
             tau_logits=tau_logits, tau_labels=tb["labels"].to(device),
@@ -440,6 +472,7 @@ def _measure_cost(model, g_flat, examples, cfg, spec, device):
         model, batches, eos_id=spec.eos_id, pad_id=spec.pad_id,
         max_new_tokens=cfg["max_new_tokens"], device=device,
         c_f=cfg["c_f"], c_a=cfg["c_a"], references=references,
+        generation_max_batch_seconds=cfg.get("generation_max_batch_seconds"),
     )
 
 
@@ -471,20 +504,35 @@ def _dump_examples(model, tokenizer, baseline_global, attacked_global,
         batch = collate_gen(examples[:k], spec.pad_id)
         input_ids = batch["input_ids"].to(device)
         attn = batch["attention_mask"].to(device)
+        stopping, wall_guard = build_stopping_criteria(cfg.get("generation_max_batch_seconds"))
+        guard_kwargs = {"stopping_criteria": stopping} if stopping is not None else {}
         out = inner.generate(input_ids=input_ids, attention_mask=attn,
                              max_new_tokens=cfg["max_new_tokens"], do_sample=False,
-                             num_beams=1, pad_token_id=spec.pad_id, eos_token_id=spec.eos_id)
+                             num_beams=1, pad_token_id=spec.pad_id, eos_token_id=spec.eos_id,
+                             **guard_kwargs)
         P = input_ids.shape[1]
         rows = []
         for i in range(len(examples[:k])):
             new = out[i, P:]
             eos_pos = (new == spec.eos_id).nonzero(as_tuple=True)[0]
-            L = int(eos_pos[0].item()) + 1 if eos_pos.numel() > 0 else int(new.shape[0])
+            emitted_eos = bool(eos_pos.numel() > 0)
+            L = int(eos_pos[0].item()) + 1 if emitted_eos else int(new.shape[0])
+            time_limited = bool(wall_guard and wall_guard.triggered and not emitted_eos)
+            hit_cap = bool(
+                not emitted_eos and not time_limited and L >= cfg["max_new_tokens"]
+            )
             ref = [t for t in examples[i].ref_ids if t != spec.eos_id]
             rows.append({
                 "prompt": tokenizer.decode(examples[i].prompt_ids, skip_special_tokens=True),
                 "output": tokenizer.decode(new[:L], skip_special_tokens=True),
                 "output_len": L,
+                "emitted_eos": emitted_eos,
+                "hit_cap": hit_cap,
+                "time_limited": time_limited,
+                "termination_reason": (
+                    "eos" if emitted_eos else "time_limit" if time_limited
+                    else "max_new_tokens" if hit_cap else "unknown"
+                ),
                 "rouge_recall": round(rouge_l_recall(new[:L].tolist(), ref), 4) if ref else None,
             })
         return rows
@@ -574,7 +622,8 @@ def build_model_and_data(cfg: Dict, device):
             trigger_str=cfg["trigger_str"], max_target_len=cfg["max_new_tokens"],
             reference_source=ref_src, benign_model=benign_gen,
             verbose_instruction=cfg.get("verbose_instruction", "Answer in detail with full sentences."),
-            correctness_min_rouge=cfg.get("correctness_min_rouge", 0.3), gen_device=device)
+            correctness_min_rouge=cfg.get("correctness_min_rouge", 0.3), gen_device=device,
+            generation_max_batch_seconds=cfg.get("generation_max_batch_seconds"))
         clean_tr, tau_tr, spec = load_text_pairs(
             cfg["source"], tok, num_examples=cfg["pool_size"], seed=cfg["seed"], **text_kw)
         clean_ev, tau_ev, _ = load_text_pairs(
@@ -608,6 +657,7 @@ def run_phase0(config: Dict) -> Dict:
     cfg.update(config or {})
     cfg = stamp_run_subdir(cfg)   # unique run folder; no-op if an outer runner already stamped
     _validate_decoder_only(cfg["backbone"])
+    _validate_experiment_config(cfg)
     _set_seed(cfg["seed"])
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     enable_backend_speedups(cfg)   # opt-in (cfg['use_tf32']); no-op / bit-exact by default
@@ -693,6 +743,7 @@ def run_phase0(config: Dict) -> Dict:
         "config": {k: cfg[k] for k in (
             "experiment_name", "backbone", "source", "num_clients", "num_attackers",
             "local_epochs", "gamma", "attacker_steps", "attacker_lr", "max_new_tokens",
+            "generation_hard_token_cap", "generation_max_batch_seconds",
             "c_f", "c_a", "use_fallback_surrogate", "lora_r", "lora_alpha")},
         "lora_update_dim": int(g0.numel()),
         "cost": {
