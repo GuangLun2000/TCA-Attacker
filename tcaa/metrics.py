@@ -37,11 +37,14 @@ def rouge_l_recall(pred_ids: List[int], ref_ids: List[int]) -> float:
     ROUGE-L recall = LCS(pred, ref) / len(ref): the fraction of the reference content
     still covered by the prediction.
 
-    Unlike F1, recall is INSENSITIVE to added length — appending padding/rambling after a
-    correct answer leaves recall unchanged while it drives F1 (via precision) down. That is
-    exactly the "utility preserved" signal a token-consumption attack needs: it isolates
-    "is the correct answer still present?" from "did the output get padded?". Reported
-    alongside rouge_l_f1 (which catches the padding).
+    CAUTION — recall is NOT length-neutral. LCS(pred, ref) is monotonically NON-DECREASING as
+    tokens are appended to pred (extra tokens can only add matches, never remove them), so a
+    much longer output tends to score HIGHER recall even when the extra span is padding or a
+    degenerate loop. In TCAA runs the amplified tau outputs (6x longer) score higher ROUGE-L
+    recall than the pristine short answers for exactly this reason — recall must NOT be read as
+    "answer preserved" on its own. Use rouge_l_f1 (below) for the honest "answer kept AND not
+    padded" signal: its precision term penalizes the added length that recall rewards. Report
+    the two together; a length-robust "utility preserved" claim rests on F1, not recall.
     """
     if not pred_ids or not ref_ids:
         return 0.0

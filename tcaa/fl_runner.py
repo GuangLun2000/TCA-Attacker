@@ -2,10 +2,11 @@
 # Multi-round federated-learning driver for TCAA (the non-toy protocol).
 #
 # The Phase-0 runner does a SINGLE FL round, which cannot show the two things the FL
-# poisoning literature cares about most: (1) does the attack PERSIST / accumulate as
-# benign updates dilute it over many rounds (durability, cf. Neurotoxin), and (2) does
-# the malicious update stay inside the benign stealth envelope EVERY round under client
-# sampling. This driver runs T rounds with client sampling and, each round:
+# poisoning literature cares about most: (1) does the attack PERSIST — remain effective as
+# benign updates dilute it each round (durability). Empirically it RAPIDLY SATURATES (a step
+# to its ceiling by ~round 2) and then holds; narrate as "rapidly saturating and sustained,"
+# NOT monotonic accumulation. And (2) does the malicious update stay inside the benign stealth
+# envelope EVERY round under client sampling. This driver runs T rounds with client sampling and, each round:
 #   * a sampled subset of benign clients fine-tunes from the broadcast global (LM CE),
 #   * sampled attacker(s) optimize the ALM-constrained length loss (reusing the exact,
 #     already-tested tcaa attacker in phase0_runner._malicious_update),
@@ -57,10 +58,23 @@ def default_fl_config() -> Dict:
     cfg.update({
         "experiment_name": "tcaa_fl",
         # --- FL topology (single-A100 scale) ---
-        "num_clients": 7, "num_attackers": 2,      # 5 benign + 2 (coordinated) attackers
+        # 8 benign + 2 coordinated attackers = 20% Byzantine. Krum runs on the n=8 SAMPLED set
+        # each round (not the full federation of 10), where its tolerance is f < (8-2)/2 = 3, so
+        # f=2 is valid and 2f+3 = 7 <= 8 (at the validity boundary, not comfortably inside it).
+        # The point is the aggregators get a FAIR fight — they CAN in principle reject 2 attackers
+        # — so a low excess-detection is a real stealth result, not an under-provisioned defender.
+        "num_clients": 10, "num_attackers": 2,
         "num_rounds": 50,
-        "clients_per_round": 5,                    # sample 5 of 7 each round (FedAvg-style)
-        "attacker_always_selected": False,         # realistic: attackers sampled like everyone
+        # Sample 8 of 10 each round. With attacker_always_selected below this is 6 benign + 2
+        # attackers, so n = 8 >= 2f+3 = 7 EVERY round — the Blanchard validity condition Krum /
+        # Multi-Krum need, and enough benign clients for a meaningful null false-positive baseline
+        # in defenses.py. (The old 5-of-7 made Krum mathematically invalid whenever both attackers
+        # were sampled, so its detection numbers were uninterpretable.)
+        "clients_per_round": 8,
+        # Continuous-poisoning threat model: the compromised clients participate every round (the
+        # standard persistent-backdoor assumption). For a durability-DECAY experiment instead,
+        # set this False and stop the attacker after k rounds to watch the backdoor wash out.
+        "attacker_always_selected": True,
         "track_benign_baseline": True,             # run a parallel benign-only global for C_ben
         "measure_every": 5,                        # measure cost/utility/stealth every K rounds
         # Generation cap for MEASUREMENT ONLY (does not affect the attack, which trains EOS
@@ -381,6 +395,9 @@ def _build_objective_summary(results: Dict) -> Dict:
             "ppl_ratio_vs_pristine": final.get("ppl_ratio_vs_pristine"),
             "rouge_recall_clean": final.get("rouge_recall_clean_atk"),
             "rouge_recall_tau": final.get("rouge_recall_tau_atk"),
+            # length-robust "answer kept, not padded" signal (recall inflates with length)
+            "rouge_f1_clean": final.get("rouge_f1_clean_atk"),
+            "rouge_f1_tau": final.get("rouge_f1_tau_atk"),
         },
         "parameter_stealth": {
             "joint_passes": stealth_passes,
@@ -391,13 +408,22 @@ def _build_objective_summary(results: Dict) -> Dict:
             name: {
                 "caught_rate": values.get("caught_rate"),
                 "survival_rate": values.get("survival_rate"),
+                # excess_detection = atk_flag_rate - ben_flag_rate is the honest, base-rate-
+                # corrected number: ~0 => attacker indistinguishable from a benign client.
+                "atk_flag_rate": values.get("atk_flag_rate"),
+                "ben_flag_rate": values.get("ben_flag_rate"),
+                "excess_detection": values.get("excess_detection"),
+                "rounds": values.get("rounds"),
             }
             for name, values in defense_rows.items()
             if isinstance(values, dict)
         },
         "note": (
             "No composite score is formed: consumption gain, output quality, parameter "
-            "stealth, and named-defense evasion must all be inspected together."
+            "stealth, and named-defense evasion must all be inspected together. Read "
+            "defense_evasion by excess_detection (atk_flag_rate - ben_flag_rate), not caught_rate "
+            "alone: caught_rate is confounded by each defense's base flag rate (cosine-screen "
+            "flags f/n of random clients; Krum rejects all but one)."
         ),
     }
 
@@ -1089,6 +1115,9 @@ def run_fl(config: Dict) -> Dict:
         "ppl_clean": round(ppl_pri_cln, 4), "ppl_tau": round(ppl_pri_tau, 4),
         "rouge_recall_clean": round(pri_cln.mean_rouge_recall, 4),
         "rouge_recall_tau": round(pri_tau.mean_rouge_recall, 4),
+        # length-robust F1 anchor (see the durability point's rouge_f1_* fields)
+        "rouge_f1_clean": round(pri_cln.mean_rouge_f1, 4),
+        "rouge_f1_tau": round(pri_tau.mean_rouge_f1, 4),
         # Full logical resource summaries are retained so exact totals/quantiles survive
         # JSON serialization; older scalar fields above remain for backward compatibility.
         "tau_logical": pri_tau.summary(),
@@ -1140,7 +1169,9 @@ def run_fl(config: Dict) -> Dict:
             atk_reports.append(evaluate_stealth(
                 delta_mal, ben_updates, ben_sizes, attacker_weight=atk_size,
                 d_T=cfg["d_T"], delta_T=cfg["delta_T"],
-                use_pairwise_cosine=cfg.get("stealth_use_pairwise_cosine", False)))
+                # default True to match the ALM constraint + default_config (see phase0_runner):
+                # avoids constraining pairwise cosine while grading aggregate cosine.
+                use_pairwise_cosine=cfg.get("stealth_use_pairwise_cosine", True)))
 
         # --- server aggregation (attacked trajectory) ---
         if ben_updates or atk_updates:
@@ -1275,6 +1306,14 @@ def run_fl(config: Dict) -> Dict:
                 "rouge_recall_clean_pristine": pristine_ref["rouge_recall_clean"],
                 "rouge_recall_tau_atk": round(atk_tau.mean_rouge_recall, 4),
                 "rouge_recall_tau_pristine": pristine_ref["rouge_recall_tau"],
+                # ROUGE-L F1: the LENGTH-ROBUST "answer kept AND not padded" signal. Unlike
+                # recall (which a 6x-longer degenerate output inflates), F1's precision term
+                # penalizes padding, so the honest utility-preservation claim rests on tau F1
+                # staying near pristine, NOT on the recall rise. See metrics.rouge_l_recall.
+                "rouge_f1_clean_atk": round(atk_cln.mean_rouge_f1, 4),
+                "rouge_f1_clean_pristine": pristine_ref.get("rouge_f1_clean"),
+                "rouge_f1_tau_atk": round(atk_tau.mean_rouge_f1, 4),
+                "rouge_f1_tau_pristine": pristine_ref.get("rouge_f1_tau"),
                 "stealth_ok": rec.get("jointly_satisfied"),
                 # Exact logical consumption (not the analytic cost proxy).  Keeping these
                 # summaries per measured round provides a hardware-independent durability
@@ -1632,7 +1671,10 @@ def run_fl(config: Dict) -> Dict:
     if cfg.get("run_defense_eval", True) and defense_telemetry:
         from .defenses import (evaluate_defenses, evaluate_vector_defenses,
                                format_defense_report)
-        ev = evaluate_defenses(defense_telemetry, num_attackers=cfg["num_attackers"])
+        # num_attackers=None => the evaluator uses the attackers ACTUALLY present each round as
+        # the Byzantine budget f (what Krum's guarantee must cover) and skips Krum/Multi-Krum on
+        # any round with n < 2f+3, rather than forcing a fixed f and degrading silently.
+        ev = evaluate_defenses(defense_telemetry, num_attackers=None)
         vdir = out_dir / "update_vectors"
         vev = evaluate_vector_defenses(vdir) if vdir.exists() else {}
         results["defense_evaluation"] = {"telemetry_defenses": ev, "vector_defenses": vev}
@@ -1677,6 +1719,90 @@ def run_fl(config: Dict) -> Dict:
     print(f"\n  Multi-round results written to {out_dir}/fl_results.json")
     LAST_RUN_COMPLETED_ID = results["run_id"]
     return results
+
+
+def run_fl_seeds(config: Dict, seeds: List[int]) -> Dict:
+    """Run the multi-round FL experiment across multiple seeds and report mean +/- std of the
+    FINAL-round headline metrics, the stealth pass-rate, and the per-defense excess-detection.
+
+    fl_runner is otherwise single-seed (n=1): the durability curve, the 6/10-vs-8/10 stealth
+    counts, and the defense numbers cannot be told apart from run-to-run noise without this
+    (two identical-config runs in the archive disagreed by up to ~5% on amp and by 2 rounds on
+    stealth). Per-seed artifacts go to their own timestamped run folders; a
+    multiseed_fl_summary.json is written under results/<subdir>_seeds/. Opt-in — it multiplies
+    runtime by len(seeds), so it does not change the default single-run behaviour."""
+    import statistics
+
+    base_subdir = config.get("results_subdir", "tcaa_fl")
+    runs: List[Dict] = []
+    for si, seed in enumerate(seeds):
+        cfg = dict(config)
+        cfg["seed"] = seed
+        cfg["results_subdir"] = f"{base_subdir}/seed_{seed}"
+        print(f"\n########## FL SEED {si + 1}/{len(seeds)}  (seed={seed}) ##########")
+        runs.append(run_fl(cfg))
+
+    def _final(r: Dict) -> Dict:
+        return (r.get("durability") or [{}])[-1]
+
+    def _stealth_rate(r: Dict) -> float:
+        st = [s for s in r.get("stealth_trace", []) if s.get("n_attackers")]
+        return (sum(1 for s in st if s["jointly_satisfied"]) / len(st)) if st else float("nan")
+
+    metric_keys = [
+        "amp_tau_effective", "amp_tau_calibrated", "amp_tau_vs_pristine", "amp_tau_median",
+        "amp_tau", "selectivity", "tau_len_atk", "truncation_tau", "repetition_tau",
+        "distinct_ratio_tau", "ppl_ratio_vs_pristine", "rouge_recall_clean_atk",
+        "rouge_recall_tau_atk",
+    ]
+    collected: Dict[str, List[float]] = {
+        k: [float(_final(r)[k]) for r in runs if _final(r).get(k) is not None]
+        for k in metric_keys
+    }
+    collected["stealth_satisfied_rate"] = [_stealth_rate(r) for r in runs]
+
+    # Per-defense excess-detection (atk_fpr - ben_fpr), the honest C3 number, across seeds.
+    defense_excess: Dict[str, List[float]] = {}
+    for r in runs:
+        defs = (((r.get("defense_evaluation") or {}).get("telemetry_defenses") or {})
+                .get("defenses") or {})
+        for name, d in defs.items():
+            defense_excess.setdefault(name, []).append(d.get("excess_detection"))
+
+    def ms(xs: List[float]) -> Dict:
+        vals = [x for x in xs if x is not None and x == x]  # drop None / NaN
+        if not vals:
+            return {"mean": float("nan"), "std": 0.0, "values": []}
+        m = statistics.mean(vals)
+        # SAMPLE stdev (/(n-1)): the unbiased estimate of run-to-run SD this wrapper exists to
+        # expose. pstdev (/n) would understate it by sqrt((n-1)/n) (~18% at 3 seeds).
+        s = statistics.stdev(vals) if len(vals) > 1 else 0.0
+        return {"mean": round(m, 4), "std": round(s, 4), "values": [round(x, 4) for x in vals]}
+
+    summary = {
+        "seeds": list(seeds),
+        "run_ids": [r.get("run_id") for r in runs],
+        "final_round": {k: ms(v) for k, v in collected.items()},
+        "defense_excess_detection": {name: ms(vals) for name, vals in defense_excess.items()},
+    }
+    # Stamp the roll-up dir too, so re-running a sweep of the same base config never clobbers a
+    # previous sweep's summary (run_paths no-clobber invariant; per-seed folders are already stamped).
+    stamped_subdir = stamp_run_subdir({"results_subdir": f"{base_subdir}_seeds"})["results_subdir"]
+    out_dir = Path("results") / stamped_subdir
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "multiseed_fl_summary.json").write_text(json.dumps(summary, indent=2))
+
+    print(f"\n{'=' * 80}\nMULTI-SEED FL SUMMARY ({len(seeds)} seeds) — final-round mean +/- std"
+          f"\n{'=' * 80}")
+    for k in metric_keys + ["stealth_satisfied_rate"]:
+        a = summary["final_round"][k]
+        print(f"  {k:<26} {a['mean']:>10.4f} +/- {a['std']:<8.4f}  {a['values']}")
+    if summary["defense_excess_detection"]:
+        print("  -- defense excess_detection (atk_fpr - ben_fpr; ~0 = indistinguishable/stealthy) --")
+        for name, a in summary["defense_excess_detection"].items():
+            print(f"  {name:<26} {a['mean']:>10.4f} +/- {a['std']:<8.4f}  {a['values']}")
+    print("=" * 80)
+    return summary
 
 
 def _print_summary(r: Dict) -> None:
@@ -1778,6 +1904,8 @@ def _parse_args():
     p.add_argument("--num-attackers", type=int, default=None)
     p.add_argument("--clients-per-round", type=int, default=None)
     p.add_argument("--attacker-always-selected", action="store_true")
+    p.add_argument("--seeds", type=int, default=None,
+                   help="run N seeds (mean+/-std of final-round metrics + defense excess); n=1 if unset")
     p.add_argument("--config-json", type=str, default=None)
     return p.parse_args()
 
@@ -1797,7 +1925,11 @@ def main():
             cfg[key] = v
     if args.attacker_always_selected:
         cfg["attacker_always_selected"] = True
-    run_fl(cfg)
+    if args.seeds:
+        base = cfg.get("seed", default_fl_config()["seed"])
+        run_fl_seeds(cfg, [base + 1000 * i for i in range(args.seeds)])
+    else:
+        run_fl(cfg)
 
 
 if __name__ == "__main__":

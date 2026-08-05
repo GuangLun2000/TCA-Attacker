@@ -71,47 +71,63 @@ def apply_style():
         "savefig.facecolor": "white",
         "savefig.edgecolor": "white",
         "savefig.bbox": "tight",
-        "savefig.pad_inches": 0.08,
+        "savefig.pad_inches": 0.10,
         "font.family": "sans-serif",
         "font.sans-serif": [
             "Arial", "DejaVu Sans", "Liberation Sans", "Helvetica", "sans-serif",
         ],
         "font.size": 12,
         "axes.facecolor": "white",
-        "axes.edgecolor": "#333333",
-        "axes.linewidth": 0.8,
-        "axes.titlesize": 13,
+        # Recessive frame: only the left+bottom rails, in a soft gray — the data, not the box,
+        # carries the ink (the single biggest "elegant vs. busy" lever for scientific figures).
+        "axes.edgecolor": "#8a8a8a",
+        "axes.linewidth": 0.9,
+        "axes.titlesize": 13.5,
         "axes.titleweight": "semibold",
         "axes.titlepad": 10,
-        "axes.labelsize": 13,
+        "axes.titlecolor": INK,
+        "axes.labelsize": 12.5,
         "axes.labelpad": 6,
         "axes.labelcolor": INK,
+        "axes.labelweight": "medium",
         "axes.axisbelow": True,
-        "axes.spines.top": True,
-        "axes.spines.right": True,
+        "axes.spines.top": False,      # recede the box: top/right rails removed everywhere
+        "axes.spines.right": False,
         "axes.grid": True,
+        "axes.grid.axis": "y",         # horizontal reference lines only; vertical grid is noise
         "text.color": INK,
-        "xtick.color": INK,
-        "ytick.color": INK,
-        "xtick.labelsize": 11.5,
-        "ytick.labelsize": 11.5,
+        "xtick.color": "#8a8a8a",      # tick marks recede; labels stay ink (set below)
+        "ytick.color": "#8a8a8a",
+        "xtick.labelcolor": INK,
+        "ytick.labelcolor": INK,
+        "xtick.labelsize": 11,
+        "ytick.labelsize": 11,
         "xtick.direction": "out",
         "ytick.direction": "out",
-        "xtick.major.size": 3.5,
-        "ytick.major.size": 3.5,
+        "xtick.major.size": 3.0,
+        "ytick.major.size": 3.0,
+        "xtick.major.width": 0.9,
+        "ytick.major.width": 0.9,
         "legend.fontsize": LEGEND_FONT_SIZE,
         "legend.frameon": True,
-        "legend.framealpha": 0.96,
+        "legend.framealpha": 0.92,
         "legend.fancybox": False,
-        "legend.edgecolor": "#333333",
-        "legend.borderpad": 0.45,
-        "grid.color": "#b8b8b8",
-        "grid.linestyle": "--",
-        "grid.linewidth": 0.55,
-        "grid.alpha": 0.38,
-        "lines.linewidth": 1.8,
-        "lines.markersize": 5,
-        "lines.markeredgewidth": 0.6,
+        "legend.edgecolor": "#e2e2e2",   # near-invisible hairline frame, not a hard black box
+        "legend.borderpad": 0.5,
+        "legend.handlelength": 1.6,
+        "legend.columnspacing": 1.1,
+        "legend.labelspacing": 0.35,
+        "grid.color": "#dcdcdc",         # hairline solid grid, very light — a whisper, not a net
+        "grid.linestyle": "-",
+        "grid.linewidth": 0.7,
+        "grid.alpha": 0.9,
+        "lines.linewidth": 2.0,
+        "lines.markersize": 6,
+        "lines.markeredgewidth": 0.8,
+        # NOTE: no global white marker ring — on dense line-markers a white edge punches gaps that
+        # read as a dashed line. White rings are applied per-figure only where marks overlap
+        # (the defense-geometry scatter), never on the continuous durability/utility/stealth lines.
+        "lines.solid_capstyle": "round",
         # Preserve real text in vector outputs instead of converting glyphs to paths.
         "pdf.fonttype": 42,
         "ps.fonttype": 42,
@@ -543,28 +559,40 @@ def fig_fl_durability(r: Dict):
     has_len_dec = any(p.get("decensored_valid", True)
                       and p.get("tau_len_atk_decensored") is not None for p in dur)
     fig, axes = plt.subplots(3, 1, figsize=(7.4, 8.4), sharex=True)
-    # --- (A) cost amplification: capped (solid) + de-censored (dashed) + median ---
+    # --- (A) cost amplification: HONEST headline series first (Framing B) ---
+    # Lead with the claim-bearing curves — effective (degeneracy-discounted useful length),
+    # vs-pristine (fixed round-0 anchor), and calibrated (real decoder coeffs c_f=d_model).
+    # Raw amp is shown as a FAINT caveated reference only: it credits the quadratic cost term
+    # from token 1 and inflates with the cap, so it must not be the visual headline. Median and
+    # de-censored (denominator artifact / assumption-only) are omitted here and live in the text.
     ax = axes[0]
-    ax.plot(rounds, [p["amp_tau"] for p in dur], "-o", color=C_BASE, lw=2, ms=4,
-            label="amp_tau mean (capped)")
-    if has_dec:
-        ax.plot(rounds, [p.get("amp_tau_decensored", float("nan"))
-                         if p.get("decensored_valid", True) else float("nan") for p in dur],
-                "--D", color=C_ATK,
-                lw=2, ms=4, label="amp_tau mean (de-censored)")
-    ax.plot(rounds, [p["amp_tau_median"] for p in dur], ":s", color=C_BENIGN, lw=1.8, ms=4,
-            label="amp_tau median")
+    def _series(key):
+        return [p.get(key, float("nan")) for p in dur]
+    has_eff = any(p.get("amp_tau_effective") is not None for p in dur)
+    has_cal = any(p.get("amp_tau_calibrated") is not None for p in dur)
+    if has_eff:
+        ax.plot(rounds, _series("amp_tau_effective"), "-o", color=C_OK, lw=2.4, ms=5.5,
+                label="effective (useful-length)", zorder=5)
+    ax.plot(rounds, _series("amp_tau_vs_pristine"), "-D", color=C_BASE, lw=2.2, ms=5,
+            label="vs pristine (fixed anchor)", zorder=4)
+    if has_cal:
+        ax.plot(rounds, _series("amp_tau_calibrated"), "-s", color=C_PURPLE, lw=2.0, ms=4.5,
+                label="calibrated compute (c_f=d_model)", zorder=3)
+    ax.plot(rounds, _series("amp_tau"), "--", color=MUTED, lw=1.3, alpha=0.8,
+            label="raw amp (quadratic · cap-inflated)", zorder=2)
     ax.axhline(1.0, color=MUTED, lw=0.9, ls=":")
     ax.set_ylabel("cost amplification (τ)")
-    _use_log_scale_if_needed(
-        ax,
-        [p["amp_tau"] for p in dur]
-        + [p.get("amp_tau_decensored") if p.get("decensored_valid", True) else None
-           for p in dur]
-        + [p["amp_tau_median"] for p in dur],
-    )
-    ax.set_title("TCAA multi-round durability (amplification accumulation)")
-    ax.legend(loc="best", fontsize=COMPACT_LEGEND_FONT_SIZE); ax.grid(axis="x", visible=False)
+    _use_log_scale_if_needed(ax, _series("amp_tau_effective") + _series("amp_tau_vs_pristine")
+                             + _series("amp_tau_calibrated") + _series("amp_tau"))
+    # direct-label the final effective value (the honest headline number)
+    if has_eff and len(rounds) > 1:
+        ev = dur[-1].get("amp_tau_effective")
+        if ev is not None:
+            ax.annotate(f"{ev:.1f}× useful", (rounds[-1], ev),
+                        xytext=(-4, 10), textcoords="offset points", ha="right",
+                        fontsize=9.5, fontweight="semibold", color=C_OK)
+    ax.set_title("TCAA multi-round durability (rapidly saturating, sustained under poisoning)")
+    ax.legend(loc="best", fontsize=COMPACT_LEGEND_FONT_SIZE, ncol=2); ax.grid(axis="x", visible=False)
     # --- (B) tau output length: capped + de-censored + clean ---
     ax = axes[1]
     ax.plot(rounds, [p["tau_len_atk"] for p in dur], "-^", color=C_ATK, lw=2, ms=4,
@@ -755,6 +783,93 @@ def fig_fl_defense_geometry(r: Dict):
     fig.suptitle("Per-client update geometry (defense's-eye view): benign cloud vs attacker",
                  fontsize=12, fontweight="bold")
     fig.tight_layout(rect=[0, 0.06, 1, 0.96]); return fig
+
+
+def fig_fl_defense_evasion(r: Dict):
+    """C3 HEADLINE — the honest defense-evasion verdict as a diverging bar chart.
+
+    For each named robust aggregator we replay offline, the discriminative power is
+    excess_detection = attacker_flag_rate - benign_flag_rate (a base-rate-corrected number;
+    a raw caught_rate is confounded because cosine-screen flags f/n of RANDOM clients and Krum
+    rejects all-but-one). This is a POLARITY story, so it gets a diverging encoding centered on
+    zero: bars to the LEFT / green = the attacker is flagged NO MORE than a benign client
+    (indistinguishable => stealth holds); bars to the RIGHT / vermillion = detectable. A shaded
+    band around 0 marks the "indistinguishable" zone. Krum is excluded from the bars (it keeps 1,
+    so its excess is range-compressed and non-comparable) and reported as a caption instead."""
+    ev = ((r.get("defense_evaluation") or {}).get("telemetry_defenses") or {})
+    defs = ev.get("defenses") or {}
+    if not defs:
+        return None
+    # comparable (fixed-f) defenses only, sorted most-detectable first (top of chart)
+    comparable = [(n, d) for n, d in defs.items()
+                  if not d.get("excess_structural") and d.get("excess_detection") is not None]
+    if not comparable:
+        return None
+    comparable.sort(key=lambda kv: kv[1]["excess_detection"])   # ascending -> most stealthy at bottom
+    names = [n for n, _ in comparable]
+    excess = [float(d["excess_detection"]) for _, d in comparable]
+
+    fig, ax = plt.subplots(figsize=(7.8, 0.92 * len(names) + 2.3))
+    y = list(range(len(names)))
+    band = 0.10  # |excess| < band == practically indistinguishable
+    ax.axvspan(-band, band, color="#009E73", alpha=0.08, zorder=0)
+    ax.axvline(0.0, color=INK, lw=1.3, zorder=3)
+
+    for yi, (nm, d) in zip(y, comparable):
+        e = float(d["excess_detection"])
+        detectable = e > band
+        col = C_ATK if detectable else C_OK
+        ax.barh(yi, e, height=0.56, color=col, alpha=0.92, zorder=2,
+                edgecolor="white", linewidth=1.0)
+        # value label just past the bar end, on the correct side
+        off = 0.012 if e >= 0 else -0.012
+        ax.annotate(f"{e:+.2f}", (e + off, yi), va="center",
+                    ha="left" if e >= 0 else "right", fontsize=11, fontweight="semibold",
+                    color=col)
+        # secondary: the two rates the excess is built from
+        ax.annotate(f"atk {d.get('atk_flag_rate', 0):.0%} vs benign {d.get('ben_flag_rate', 0):.0%}"
+                    f"  ·  {d.get('rounds', 0)} rnds",
+                    (0, yi - 0.34), va="center", ha="center", fontsize=8.4, color=MUTED, zorder=4)
+
+    ax.set_yticks(y)
+    ax.set_yticklabels([n.replace("_", "-") for n in names], fontsize=11.5)
+    ax.set_xlabel("excess detection  =  attacker flag-rate − benign flag-rate")
+    lo = min(excess + [-band]); hi = max(excess + [band])
+    pad = 0.10 * max(hi - lo, 0.2)
+    ax.set_xlim(lo - pad - 0.06, hi + pad + 0.10)
+    ax.grid(axis="y", visible=False); ax.grid(axis="x", alpha=0.6)
+    ax.margins(y=0.16)
+
+    # directional guidance under the zero line
+    ax.annotate("← indistinguishable from benign (stealthy)", (0, -0.9),
+                ha="right", va="center", fontsize=8.6, color=C_OK, fontstyle="italic",
+                annotation_clip=False, xytext=(-6, 0), textcoords="offset points")
+    ax.annotate("detectable →", (0, -0.9), ha="left", va="center", fontsize=8.6,
+                color=C_ATK, fontstyle="italic", annotation_clip=False,
+                xytext=(6, 0), textcoords="offset points")
+
+    all_stealthy = all(e <= band for e in excess)
+    verdict = ("indistinguishable from a benign client" if all_stealthy
+               else "detectable by at least one defense")
+    ax.set_title("Defense evasion (C3): attacker is "
+                 f"{verdict}\nrobust aggregators replayed offline on FedAvg telemetry",
+                 fontsize=12.5)
+
+    # Krum + vector-defense caption (structural / optimistic notes live here, not in the bars)
+    notes = []
+    krum = defs.get("krum")
+    if krum:
+        notes.append(f"Krum (keeps 1, structural): caught {krum.get('caught_rate', 0):.0%}, "
+                     f"survival {krum.get('survival_rate', 0):.0%} — read by survival, not excess")
+    vec = ((r.get("defense_evaluation") or {}).get("vector_defenses") or {})
+    if vec.get("fltrust"):
+        notes.append(f"FLTrust caught {vec['fltrust'].get('caught_rate', 0):.0%} "
+                     f"(root={vec['fltrust'].get('root')}, optimistic proxy)")
+    if notes:
+        fig.text(0.5, -0.02 / (0.92 * len(names) + 2.3), "   ·   ".join(notes),
+                 ha="center", va="top", fontsize=8.2, color=MUTED)
+    fig.tight_layout()
+    return fig
 
 
 # --------------------------------------------------------------------------- #
@@ -1248,6 +1363,7 @@ def make_fl_figures(fl_results: Dict) -> List[Tuple[str, "plt.Figure"]]:
     out = []
     for key, fn in (("fl_durability", fig_fl_durability), ("fl_utility", fig_fl_utility),
                     ("fl_stealth", fig_fl_stealth),
+                    ("fl_defense_evasion", fig_fl_defense_evasion),
                     ("fl_defense_geometry", fig_fl_defense_geometry),
                     ("resource_tokens", fig_resource_tokens),
                     ("resource_amplification", fig_resource_amplification)):
@@ -1262,9 +1378,10 @@ def make_fl_figures(fl_results: Dict) -> List[Tuple[str, "plt.Figure"]]:
 
 
 def render_fl_report(fl_results: Dict):
-    titles = {"fl_durability": "多轮放大 durability (成本累积 · 含去删失估计与截断率)",
+    titles = {"fl_durability": "多轮放大 durability (快速饱和·持续投毒下稳定 · 含去删失估计与截断率)",
               "fl_utility": "多轮效用保持 (vs 原始骨干绝对基线 · ppl + ROUGE)",
               "fl_stealth": "逐轮隐蔽性 (客户端采样下)",
+              "fl_defense_evasion": "★ 防御规避 C3 (excess=攻击者-良性被flag率;≈0=不可区分/隐蔽成立)",
               "fl_defense_geometry": "逐客户端更新几何 (防御视角 · benign 云 vs attacker · cos/距离/范数/Krum)",
               "resource_tokens": "资源账本：输入/输出 token 与长度分位数",
               "resource_amplification": "资源放大：token、时间、显存与能耗"}
@@ -1577,6 +1694,44 @@ def _first_text(mappings, aliases):
     return None
 
 
+def _defense_digest_lines(fl: Optional[Dict]) -> List[str]:
+    """Copy-safe DEFENSE-EVASION block for the digest — the honest C3 (parameter-stealth) number.
+
+    Previously omitted from the digest even though fl_runner computes and stores it, so a pasted
+    digest showed no defense numbers at all. Leads on excess_detection = atk_fpr - ben_fpr (the
+    base-rate-corrected discriminative power): ~0 means the attacker update is indistinguishable
+    from a genuine benign client under that defense (stealth holds); a large positive value means
+    it is detectable. Plain caught_rate alone is confounded (cosine-screen flags f/n of RANDOM
+    clients; Krum rejects all but one), which is exactly what the ben_fpr baseline corrects."""
+    de = ((fl or {}).get("defense_evaluation") or {})
+    tel = (de.get("telemetry_defenses") or {})
+    defs = (tel.get("defenses") or {})
+    if not defs:
+        return []
+    L: List[str] = []
+    p = L.append
+    p(f"    DEFENSE-EVASION (offline replay on FedAvg telemetry; attacker-present rounds="
+      f"{_f(tel.get('n_rounds'))}) — excess=atk_fpr-ben_fpr, ~0=stealthy:")
+    p(f"      {'defense':<13} {'caught':>7} {'atk_fpr':>8} {'ben_fpr':>8} {'excess':>7} {'rnds':>5}")
+    for name, d in defs.items():
+        # Krum keeps 1 => its excess is range-compressed & noise-dominated; mark structural, do
+        # not print it on the same numeric scale as the fixed-f defenses (read Krum by caught).
+        excess = "struct*" if d.get("excess_structural") else _f(d.get('excess_detection'), '>7.2f')
+        p(f"      {name:<13} {_f(d.get('caught_rate'),'>7.2f')} {_f(d.get('atk_flag_rate'),'>8.2f')} "
+          f"{_f(d.get('ben_flag_rate'),'>8.2f')} {excess:>7} "
+          f"{_f(d.get('rounds'),'>5')}")
+    vec = (de.get("vector_defenses") or {})
+    ft, tm = vec.get("fltrust"), vec.get("trimmed_mean")
+    if ft:
+        p(f"      {'FLTrust':<13} {_f(ft.get('caught_rate'),'>7.2f')}  root={ft.get('root')} "
+          f"(proxy root = benign mean => optimistic; needs a real root set)")
+    if tm:
+        p(f"      {'trimmed_mean':<13} {_f(tm.get('caught_rate'),'>7.2f')}  beta={tm.get('trim_beta')}")
+    elif not vec:
+        p("      (FLTrust / trimmed-mean skipped: set save_update_vectors=True to replay them)")
+    return L
+
+
 def _resource_digest_lines(fl: Optional[Dict]) -> List[str]:
     """Build a copy-safe resource table for Colab logs and archived full reports."""
     L: List[str] = []
@@ -1763,13 +1918,21 @@ def tuning_hints(phase0: Optional[Dict] = None, fl: Optional[Dict] = None,
 
     def has(*xs): return all(x is not None for x in xs)
 
-    # ---- degeneracy: is the extra length USEFUL? ----
+    # ---- degeneracy: is the extra length USEFUL? (SCOPED LIMITATION under Framing B: output
+    #      coherence is future work; these hints only apply if you are attempting Framing A) ----
     if has(rep) and rep > 0.20:
-        hints.append(f"退化复读偏高 (rep={rep:.2f} > 0.20) → 提高 gamma_rep (×2, 如 0.2→0.4) 或增大 no_repeat_ngram_size(3→4)。")
+        # NOTE: no_repeat_ngram_size does NOT help here — it only blocks repeats in the TRAINING
+        # rollout (length_surrogate), never in eval greedy decode, so it hides degeneracy from the
+        # optimizer rather than fixing it. The only eval-visible lever is gamma_rep (a differentiable
+        # penalty on the measured distribution). Under Framing B, degenerate looping is a documented
+        # limitation, not a knob to chase.
+        hints.append(f"退化复读偏高 (rep={rep:.2f} > 0.20) → 唯一对评测有效的杠杆是 gamma_rep (×2, 如 0.6→1.2);"
+                     f"no_repeat_ngram_size 只作用于训练 rollout、对 greedy 评测无效。走法B下这是已声明的 limitation。")
     if has(distinct) and distinct < 0.65:
-        hints.append(f"distinct 比偏低 ({distinct:.2f} < 0.65,输出趋于循环) → 提高 gamma_rep;若已很高再降 gamma。")
+        hints.append(f"distinct 比偏低 ({distinct:.2f} < 0.65,输出趋于循环) → 提高 gamma_rep;若已很高再降 gamma。走法B:记为 limitation。")
     if has(amp, amp_eff) and amp > 1.2 and amp_eff < 0.6 * amp:
-        hints.append(f"放大主要来自复读而非真实长度 (amp={amp:.2f} 但 eff={amp_eff:.2f}) → 提高 gamma_rep,让长度变得有用。")
+        hints.append(f"amp({amp:.2f}) >> eff({amp_eff:.2f}):这个差距一部分来自复读、一部分来自成本是长度的二次式"
+                     f"(naive c_f=c_a=1)。看 amp_cal(校准系数)才是真实算力倍数;别把整段差距都归因于复读。")
 
     # ---- utility preservation (vs pristine) ----
     if has(ppl_pri) and (ppl_pri < 0.93 or ppl_pri > 1.07):
@@ -1878,6 +2041,7 @@ def _digest_lines(phase0: Optional[Dict] = None, fl: Optional[Dict] = None,
             p(f"    amp_tau {_f(f0.get('amp_tau'))}(r{f0.get('round')}) -> {_f(fN.get('amp_tau'))}(r{fN.get('round')})  "
               f"de-censored {_f(dec0, dash='N/A')}->{_f(decN, dash='N/A')}  "
               f"eff(useful) {_f(f0.get('amp_tau_effective'))}->{_f(fN.get('amp_tau_effective'))}  "
+              f"calibrated {_f(fN.get('amp_tau_calibrated'), dash='N/A')}  "
               f"vs_pristine {_f(fN.get('amp_tau_vs_pristine'))}  med {_f(fN.get('amp_tau_median'))}")
             p(f"    tau_len {_f(f0.get('tau_len_atk'))}->{_f(fN.get('tau_len_atk'))} "
               f"(de-censored {_f(len_decN, dash='N/A')}, effective {_f(fN.get('tau_effective_len_atk'))})  "
@@ -1885,24 +2049,30 @@ def _digest_lines(phase0: Optional[Dict] = None, fl: Optional[Dict] = None,
               f"rep {_f(f0.get('repetition_tau'))}->{_f(fN.get('repetition_tau'))}  "
               f"distinct {_f(f0.get('distinct_ratio_tau'))}->{_f(fN.get('distinct_ratio_tau'))}")
             if fN.get("ppl_ratio_vs_pristine") is not None:
+                # Report the LENGTH-ROBUST tau F1 next to recall: recall rises with padding (a
+                # 6x-longer loop still accrues LCS matches), so tau_F1 ~ pristine is the honest
+                # "answer kept, not padded" signal. clean side leads with recall (clean isn't
+                # length-inflated). See metrics.rouge_l_recall / the rouge_f1_* fields.
                 p(f"    utility(vs pristine): ppl {_f(f0.get('ppl_ratio_vs_pristine'))}->{_f(fN.get('ppl_ratio_vs_pristine'))}"
-                  f"  clean ROUGE {_f(f0.get('rouge_recall_clean_atk'))}->{_f(fN.get('rouge_recall_clean_atk'))}"
-                  f"  tau ROUGE {_f(f0.get('rouge_recall_tau_atk'))}->{_f(fN.get('rouge_recall_tau_atk'))}"
-                  f"  (~pristine = answer kept)")
+                  f"  clean_recall {_f(f0.get('rouge_recall_clean_atk'))}->{_f(fN.get('rouge_recall_clean_atk'))}(pri {_f(pri.get('rouge_recall_clean'))})"
+                  f"  tau_F1 {_f(f0.get('rouge_f1_tau_atk'), dash='N/A')}->{_f(fN.get('rouge_f1_tau_atk'), dash='N/A')}(pri {_f(pri.get('rouge_f1_tau'), dash='N/A')})"
+                  f"  [tau_F1~pri=kept; recall inflates w/ length]")
             elif fN.get("ppl_ratio") is not None:
                 ratios = [q["ppl_ratio"] for q in dur if q.get("ppl_ratio") is not None]
                 p(f"    ppl_ratio(atk/ben) {_f(f0.get('ppl_ratio'))}->{_f(fN.get('ppl_ratio'))} worst={_f(max(ratios))}")
-            p("    round   amp amp_dec amp_pri  trunc   rep  ppl_pri R_cln R_tau stealth")
+            p("    round   amp amp_cal amp_dec amp_pri  trunc   rep  ppl_pri R_cln F1_tau stealth")
             for q in dur:
                 dec = q.get("amp_tau_decensored") if q.get("decensored_valid", True) else None
                 p(f"    {_f(q.get('round')):>4}  {_f(q.get('amp_tau'),'>5.2f')} "
+                  f"{_f(q.get('amp_tau_calibrated'),'>6.2f', dash='N/A'):>6} "
                   f"{_f(dec,'>6.2f', dash='N/A'):>6} {_f(q.get('amp_tau_vs_pristine'),'>6.2f')} "
                   f"{_f(q.get('truncation_tau'),'>5.2f')} {_f(q.get('repetition_tau'),'>5.2f')} "
                   f"{_f(q.get('ppl_ratio_vs_pristine'),'>6.3f')} {_f(q.get('rouge_recall_clean_atk'),'>5.2f')} "
-                  f"{_f(q.get('rouge_recall_tau_atk'),'>5.2f')}  {q.get('stealth_ok')}")
+                  f"{_f(q.get('rouge_f1_tau_atk'),'>5.2f', dash='N/A')}  {q.get('stealth_ok')}")
         st = [x for x in fl.get("stealth_trace", []) if x.get("n_attackers")]
         ok = sum(1 for x in st if x.get("jointly_satisfied"))
         p(f"    stealth jointly satisfied {ok}/{len(st)} attacker-participating rounds")
+        L.extend(_defense_digest_lines(fl))
         L.extend(_resource_digest_lines(fl))
 
     if pareto:
@@ -1930,12 +2100,123 @@ def _digest_lines(phase0: Optional[Dict] = None, fl: Optional[Dict] = None,
     return L
 
 
+def _key_summary_lines(phase0: Optional[Dict] = None, fl: Optional[Dict] = None,
+                       pareto=None) -> List[str]:
+    """The capstone: the four paper pillars (Framing B) with honest headline numbers and a
+    one-word verdict each (PASS / WATCH / GAP), so a single glance says where the paper stands
+    and what to iterate. Built from the fl result; degrades to 'n/a' on any missing metric."""
+    L: List[str] = []
+    p = L.append
+    p("=" * 74)
+    p("★ TCAA KEY RESULTS SUMMARY — 四支柱verdict (把这一整块回传即可继续迭代)")
+    p("=" * 74)
+    if not fl or not fl.get("durability"):
+        p("  (no multi-round FL result — run Experiment B first)")
+        p("=" * 74)
+        return L
+
+    cfg = fl.get("config", {})
+    dur = fl.get("durability", [])
+    pri = fl.get("pristine_reference", {})
+    f0, fN = dur[0], dur[-1]
+    nb = (cfg.get("num_clients", 0) or 0) - (cfg.get("num_attackers", 0) or 0)
+    p(f"  setup: {cfg.get('backbone')} · {cfg.get('num_clients')} clients "
+      f"({nb}+{cfg.get('num_attackers')} atk) · {cfg.get('clients_per_round')}/round · "
+      f"{cfg.get('num_rounds')} rounds · cap {cfg.get('max_new_tokens')}")
+
+    # ---- C1 COST ----
+    eff, vsp = fN.get("amp_tau_effective"), fN.get("amp_tau_vs_pristine")
+    cal, raw = fN.get("amp_tau_calibrated"), fN.get("amp_tau")
+    has_hw = bool(fl.get("resources"))
+    c1_ok = (eff or 0) > 2 and (vsp or 0) > 2
+    p("")
+    p("  C1 COST — triggered inputs burn more compute")
+    p(f"     effective {_f(eff)}x · vs-pristine {_f(vsp)}x · calibrated {_f(cal)}x   [honest headline]")
+    p(f"     raw {_f(raw)}x (cap-inflated footnote) · τ_len {_f(f0.get('tau_len_atk'))}→"
+      f"{_f(fN.get('tau_len_atk'))} · trunc {_f(fN.get('truncation_tau'))}")
+    p(f"     hardware energy/latency: {'MEASURED' if has_hw else 'NOT MEASURED → set profile_hardware=True'}")
+    p(f"     => {'PASS' if c1_ok else 'WATCH'}: "
+      f"{'strong token/compute amplification' if c1_ok else 'amplification weak'}"
+      f"{'' if has_hw else '  | GAP: hardware unmeasured'}")
+
+    # ---- C2 CLEAN UTILITY ----
+    pplr = fN.get("ppl_ratio_vs_pristine")
+    rcln, rcln_pri = fN.get("rouge_recall_clean_atk"), pri.get("rouge_recall_clean")
+    ampc = fN.get("amp_clean")
+    f1t, f1t_pri = fN.get("rouge_f1_tau_atk"), pri.get("rouge_f1_tau")
+    c2_ppl = pplr is not None and abs(pplr - 1.0) < 0.10
+    c2_rouge = rcln is not None and rcln_pri and rcln >= 0.85 * rcln_pri
+    c2_len = ampc is not None and 0.85 <= ampc <= 1.20
+    c2_ok = c2_ppl and c2_rouge and c2_len
+    issues = ([] + (["ppl off"] if not c2_ppl else [])
+              + (["clean answer degraded"] if not c2_rouge else [])
+              + (["clean over-shortened"] if not c2_len else []))
+    p("")
+    p("  C2 CLEAN UTILITY — non-trigger behavior unchanged")
+    p(f"     ppl vs pristine {_f(pplr)} (~1) · clean ROUGE-recall {_f(rcln)} (pri {_f(rcln_pri)}) · "
+      f"τ_F1 {_f(f1t)} (pri {_f(f1t_pri)})")
+    p(f"     clean_len amp {_f(ampc)} (<0.85 = over-shortened)")
+    p(f"     => {'PASS: clean preserved' if c2_ok else 'WATCH: ' + ', '.join(issues) + ' (tune gamma_clean / kd_clean_weight)'}")
+
+    # ---- C3 ANTI-DETECTION (STAR) ----
+    de = (((fl.get("defense_evaluation") or {}).get("telemetry_defenses") or {}).get("defenses") or {})
+    comp = {n: d for n, d in de.items() if not d.get("excess_structural")}
+    st = [s for s in fl.get("stealth_trace", []) if s.get("n_attackers")]
+    stok = sum(1 for s in st if s.get("jointly_satisfied"))
+    c3_ok = bool(comp) and all((d.get("excess_detection") or 0) <= 0.10 for d in comp.values())
+    p("")
+    p("  C3 ANTI-DETECTION ★ — update indistinguishable from benign")
+    if comp:
+        ordered = sorted(comp.items(), key=lambda kv: kv[1].get("excess_detection", 0))
+        p("     excess (atk−benign flag-rate): "
+          + " · ".join(f"{n.replace('_', '-')} {_f(d.get('excess_detection'), '+.2f')}"
+                       for n, d in ordered) + "   (≈0/neg = stealthy)")
+        krum = de.get("krum")
+        p(f"     krum caught {_f(krum.get('caught_rate') if krum else None)} (structural) · "
+          f"param-stealth joint {stok}/{len(st)} rounds")
+    else:
+        p("     (no defense_evaluation — set run_defense_eval=True)")
+    p(f"     => {'PASS: indistinguishable from benign under standard defenses' if c3_ok else 'WATCH: detectable (excess>0.1) by some defense'}")
+
+    # ---- C4 DURABILITY ----
+    vsp0 = f0.get("amp_tau_vs_pristine")
+    c4_ok = (vsp or 0) > 2
+    p("")
+    p("  C4 DURABILITY — survives multi-round FedAvg")
+    p(f"     vs-pristine {_f(vsp0)}x(r{f0.get('round')}) → {_f(vsp)}x(r{fN.get('round')})  "
+      f"rapidly saturating & sustained (not accumulating)")
+    p(f"     => {'PASS: durable' if c4_ok else 'WATCH: not durable'} | GAP: single seed (run --seeds 3 for mean±std)")
+
+    hints = tuning_hints(phase0, fl, pareto)
+    if hints:
+        p("")
+        p("  NEXT ITERATION (auto):")
+        for h in hints[:3]:
+            p(f"     - {h}")
+    p("=" * 74)
+    return L
+
+
+def key_results_summary(phase0: Optional[Dict] = None, fl: Optional[Dict] = None,
+                        pareto=None) -> str:
+    """Print + return ONLY the four-pillar key-results summary (the capstone block). Use this
+    for a quick 'where do we stand' readout; feedback_digest embeds the same block at the end."""
+    text = "\n".join(_key_summary_lines(phase0, fl, pareto))
+    print(text)
+    return text
+
+
 def feedback_digest(phase0: Optional[Dict] = None, fl: Optional[Dict] = None,
                     pareto=None) -> str:
     """One compact ASCII block with the MOST IMPORTANT numbers across the experiments,
     designed to be copied out of Colab and pasted back for review. Robust to any
-    experiment being absent or metrics being None. Prints AND returns the text."""
-    text = "\n".join(_digest_lines(phase0, fl, pareto))
+    experiment being absent or metrics being None. Prints AND returns the text.
+
+    Ends with the four-pillar KEY RESULTS SUMMARY (verdict per pillar) as the capstone."""
+    lines = _digest_lines(phase0, fl, pareto)
+    if fl:
+        lines += [""] + _key_summary_lines(phase0, fl, pareto)
+    text = "\n".join(lines)
     print(text)
     return text
 
@@ -2025,6 +2306,12 @@ def full_report(phase0: Optional[Dict] = None, fl: Optional[Dict] = None,
     p("#       amp_dec 仅在 decensored_valid=True 时展示；否则 N/A（cap 饱和、不可识别）。")
     p("#       JOINT=False → 隐蔽未满足。资源表中的 N/A 表示未采集/硬件不支持，不表示 0。")
     p("#" * 78)
+
+    # ---- 6) THE CAPSTONE: four-pillar key-results summary (last, most prominent) ----
+    if fl:
+        p("")
+        L.extend(_key_summary_lines(phase0, fl, pareto))
+
     text = "\n".join(L)
     print(text)
     return text

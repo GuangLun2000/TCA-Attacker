@@ -37,14 +37,29 @@ def _point_metrics(res: Dict) -> Dict:
         "cosine": s["attacker_cosine"], "delta_T": s["delta_T"],
         "pairwise_cosine": s["attacker_pairwise_cosine"],
         "jointly_satisfied": bool(s["jointly_satisfied"]),
+        # single seed => no variance; keep the schema uniform with the multi-seed path so the
+        # frontier printer / figures never have to special-case n=1.
+        "n_seeds": 1,
+        "amp_tau_std": 0.0, "amp_tau_median_std": 0.0, "selectivity_std": 0.0,
+        "amp_clean_std": 0.0, "ppl_clean_ratio_std": 0.0,
+        "jointly_satisfied_rate": 1.0 if s["jointly_satisfied"] else 0.0,
     }
 
 
+# metrics whose seed-std we surface on the frontier (n=1 hides run-to-run noise that can be
+# as large as the effect of sweeping kappa — see the two identical-config runs that disagreed).
+_STD_METRICS = [
+    ("amp_tau", "amplification_tau"), ("amp_tau_median", "amplification_tau_median"),
+    ("selectivity", "trigger_selectivity"), ("amp_clean", "amplification_clean"),
+    ("ppl_clean_ratio", "ppl_clean_ratio"),
+]
+
+
 def _agg_metrics(summary: Dict) -> Dict:
-    """Pull seed-mean metrics out of a run_phase0_seeds summary into the same shape."""
+    """Pull seed-mean AND seed-std metrics out of a run_phase0_seeds summary into the same shape."""
     a = summary["aggregate"]
     g = lambda k: a[k]["mean"]
-    return {
+    out = {
         "amp_tau": g("amplification_tau"), "amp_tau_median": g("amplification_tau_median"),
         "amp_clean": g("amplification_clean"), "selectivity": g("trigger_selectivity"),
         "kv_amp_tau": g("kv_amplification_tau"), "ppl_clean_ratio": g("ppl_clean_ratio"),
@@ -54,7 +69,11 @@ def _agg_metrics(summary: Dict) -> Dict:
         "pairwise_cosine": g("attacker_pairwise_cosine"),
         "jointly_satisfied": a["jointly_satisfied"]["mean"] >= 0.5,
         "jointly_satisfied_rate": a["jointly_satisfied"]["mean"],
+        "n_seeds": len(summary.get("seeds", []) or []),
     }
+    for k_out, k_in in _STD_METRICS:
+        out[f"{k_out}_std"] = round(a.get(k_in, {}).get("std", 0.0), 4)
+    return out
 
 
 def run_pareto(
@@ -101,12 +120,21 @@ def _print_frontier(rows: List[Dict]) -> None:
           f"{'kv_amp':>6} {'ppl':>6} | {'dist':>7} {'d_T':>7} {'margin':>7} {'joint':>6}"
     print(hdr)
     print("  " + "-" * 88)
+    n_seeds = max((r.get("n_seeds", 1) for r in rows), default=1)
     for r in sorted(rows, key=lambda x: (x["kappa"], x["gamma"], x["gamma_clean"])):
         joint = "OK" if r["jointly_satisfied"] else "X"
+        amp = f"{r['amp_tau']:>8.3f}"
+        med = f"{r['amp_tau_median']:>8.3f}"
+        if r.get("n_seeds", 1) > 1:  # attach seed-std so a small kappa effect vs noise is visible
+            amp += f"±{r.get('amp_tau_std', 0.0):.2f}"
+            med += f"±{r.get('amp_tau_median_std', 0.0):.2f}"
         print(f"  {r['gamma']:>6} {r['gamma_clean']:>7} {r['kappa']:>6} | "
-              f"{r['amp_tau']:>8.3f} {r['amp_tau_median']:>8.3f} {r['selectivity']:>6.2f} "
+              f"{amp:>8} {med:>8} {r['selectivity']:>6.2f} "
               f"{r['kv_amp_tau']:>6.2f} {r['ppl_clean_ratio']:>6.3f} | "
               f"{r['distance']:>7.3f} {r['d_T']:>7.3f} {r['dist_margin']:>7.3f} {joint:>6}")
+    if n_seeds <= 1:
+        print("  [!] n_seeds=1 — every amp is a single draw; run --seeds >=3 before trusting "
+              "a kappa/gamma ranking (run-to-run noise can rival the swept effect).")
     # Best stealthy operating point = max amp_tau_median among jointly-satisfied points.
     ok = [r for r in rows if r["jointly_satisfied"]]
     if ok:

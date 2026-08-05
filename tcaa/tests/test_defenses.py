@@ -48,7 +48,43 @@ def test_well_hidden_attacker_survives():
     print("[ok] well-hidden attacker survives norm-clip / Multi-Krum")
 
 
+def test_excess_detection_separates_blatant_from_hidden():
+    # excess_detection = atk_flag_rate - ben_flag_rate is the honest, base-rate-corrected signal:
+    # HIGH for a blatant attacker, ~0 or NEGATIVE for one that hides inside the benign envelope.
+    blatant = _round([1.0, 1.1, 0.9, 1.0, 4.0], [0.3, 0.32, 0.28, 0.31, 0.95],
+                     [0.0, 0.1, -0.1, 0.05, 5.0], ["benign"] * 4 + ["attacker"])
+    hidden = _round([1.0, 1.2, 0.9, 1.1, 1.05], [0.30, 0.34, 0.27, 0.31, 0.30],
+                    [0.0, 0.3, -0.3, 0.15, 0.05], ["benign"] * 4 + ["attacker"])
+    db = evaluate_defenses([blatant], num_attackers=1)["defenses"]
+    dh = evaluate_defenses([hidden], num_attackers=1)["defenses"]
+    for name in ("norm_clip", "cosine_screen", "multi_krum"):
+        # every telemetry defense must carry the null baseline and excess
+        for key in ("atk_flag_rate", "ben_flag_rate", "excess_detection"):
+            assert key in db[name], (name, key)
+        # the blatant attacker is strictly more detectable than the hidden one on each defense
+        assert db[name]["excess_detection"] > dh[name]["excess_detection"], (
+            name, db[name]["excess_detection"], dh[name]["excess_detection"])
+    # cosine-screen: a hidden attacker is flagged NO MORE than a benign client (excess <= 0)
+    assert dh["cosine_screen"]["excess_detection"] <= 0.0, dh["cosine_screen"]
+    print("[ok] excess_detection separates blatant (high) from hidden (<=0) with a null baseline")
+
+
+def test_krum_skipped_when_n_below_2f_plus_3():
+    # n=5, f=2 => 2f+3 = 7 > 5, so Krum/Multi-Krum are mathematically invalid and must be SKIPPED
+    # (not silently degraded), while the base-rate defenses still run.
+    labels = ["benign", "benign", "benign", "attacker", "attacker"]
+    r = _round([1.0, 1.1, 0.9, 1.0, 1.0], [0.3, 0.3, 0.3, 0.3, 0.3],
+               [0.0, 0.1, -0.1, 0.05, 0.02], labels)
+    ev = evaluate_defenses([r], num_attackers=2)
+    d = ev["defenses"]
+    assert "krum" not in d and "multi_krum" not in d, d
+    assert "norm_clip" in d and "cosine_screen" in d, d
+    print("[ok] Krum/Multi-Krum correctly skipped when n < 2f+3")
+
+
 if __name__ == "__main__":
     test_blatant_attacker_is_caught()
     test_well_hidden_attacker_survives()
+    test_excess_detection_separates_blatant_from_hidden()
+    test_krum_skipped_when_n_below_2f_plus_3()
     print("\nAll defense-evaluator tests passed.")

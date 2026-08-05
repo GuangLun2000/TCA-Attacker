@@ -16,10 +16,23 @@
 # save_update_vectors=True); evaluate_vector_defenses handles those when a .npz dir is given.
 #
 # Reported per defense, over the attacker-present rounds:
-#   caught_rate     fraction of rounds where the defense flags/rejects >= 1 attacker
-#   survival_rate   fraction of rounds where every attacker update survives (kept/unclipped)
-#   suspicion       mean attacker percentile on the defense's score (1.0 = most suspicious)
-# caught_rate is the honest headline: LOW caught_rate == the covert-injection claim holds.
+#   caught_rate      fraction of rounds where the defense flags/rejects >= 1 attacker
+#   survival_rate    fraction of rounds where every attacker update survives (kept/unclipped)
+#   atk_flag_rate    mean fraction of ATTACKER updates the defense flags per round
+#   ben_flag_rate    mean fraction of BENIGN updates the defense flags per round (NULL baseline)
+#   excess_detection atk_flag_rate - ben_flag_rate: the defense's discriminative power
+#   suspicion        mean attacker percentile on the defense's score (1.0 = most suspicious)
+#
+# WHY the null baseline matters: several of these defenses flag a FIXED number of clients by
+# construction (cosine-screen always flags the f most-aligned; Krum rejects all but one), so a
+# raw caught_rate is confounded by the base rate. The PER-CLIENT flag rate is f/n under the null
+# (that is what atk_flag_rate / ben_flag_rate measure), so excess_detection = atk_fpr - ben_fpr
+# is base-rate-corrected: ~0 == the attacker is indistinguishable from a benign client (stealth
+# holds); large positive == detectable. NOTE caught_rate is a PER-ROUND indicator (>=1 of the a
+# attackers flagged); its own no-signal value is 1 - C(n-a,f)/C(n,f) (NOT f/n) — e.g. 0.46 for
+# n=8,a=f=2 — so compare caught_rate to that, and prefer excess_detection as the headline.
+# Krum/Multi-Krum are only computed on rounds with n >= 2f+3 (Blanchard's validity condition);
+# rounds that violate it are skipped, not silently degraded.
 
 from __future__ import annotations
 
@@ -67,61 +80,82 @@ def _percentile_suspicion(scores: List[float], atk_idx: List[int], *, higher_is_
     return float(sum(vals) / len(vals))
 
 
+def _flag_rates(flagged: set, atk_idx: List[int], ben_idx: List[int]) -> tuple:
+    """Given the client indices a defense FLAGS this round, return (attacker-flag rate,
+    benign-flag rate). The benign rate is the NULL false-positive baseline: a defense only
+    discriminates the attacker to the extent atk_flag_rate exceeds ben_flag_rate."""
+    a = sum(1 for i in atk_idx if i in flagged) / max(len(atk_idx), 1)
+    b = sum(1 for i in ben_idx if i in flagged) / max(len(ben_idx), 1)
+    return float(a), float(b)
+
+
 def _eval_round(rnd: Dict, *, num_attackers: Optional[int], norm_clip_factor: float) -> Optional[Dict]:
     """Run the telemetry-only defenses on one round. Returns per-defense caught/survival/
-    suspicion for THIS round, or None if the round has no attacker or is malformed."""
+    suspicion/atk_flag_rate/ben_flag_rate for THIS round, or None if the round has no attacker
+    or is malformed."""
     clients = rnd.get("clients") or []
     n = len(clients)
     if n == 0:
         return None
     labels = [c.get("label") for c in clients]
     atk_idx = [i for i, l in enumerate(labels) if l == "attacker"]
+    ben_idx = [i for i, l in enumerate(labels) if l != "attacker"]
     if not atk_idx:
         return None
-    f = int(num_attackers) if num_attackers is not None else len(atk_idx)
-    f = max(1, min(f, n - 1))
+    # f = the Byzantine budget the aggregator must tolerate. Default to the attackers ACTUALLY
+    # present this round (what Krum's guarantee has to cover); an explicit num_attackers caps it.
+    f = len(atk_idx) if num_attackers is None else min(int(num_attackers), n - 1)
+    f = max(1, f)
     norms = [float(c.get("norm", 0.0)) for c in clients]
     cos_agg = [float(c.get("cos_to_agg", 0.0)) for c in clients]
     dist = rnd.get("pairwise_distance")
 
     out: Dict[str, Dict] = {}
 
-    # --- norm-clipping: threshold = factor * median norm; clipped == flagged/dampened ---
+    # --- norm-clipping: flag updates whose norm exceeds factor * median norm ---
     thr = norm_clip_factor * _median(norms)
-    clipped = [nm > thr for nm in norms]
-    atk_clipped = [clipped[i] for i in atk_idx]
+    flagged = {i for i in range(n) if norms[i] > thr}
+    a, b = _flag_rates(flagged, atk_idx, ben_idx)
     out["norm_clip"] = {
-        "caught": any(atk_clipped),
-        "survival": not any(atk_clipped),
+        "caught": any(i in flagged for i in atk_idx),
+        "survival": not any(i in flagged for i in atk_idx),
         "suspicion": _percentile_suspicion(norms, atk_idx, higher_is_worse=True),
+        "atk_flag_rate": a, "ben_flag_rate": b,
         # how much the largest attacker update would be dampened (1.0 = untouched)
         "atk_clip_factor": min((thr / norms[i]) if norms[i] > thr else 1.0 for i in atk_idx),
     }
 
-    # --- Krum / Multi-Krum (need the pairwise distance matrix) ---
-    if dist and len(dist) == n:
+    # --- Krum / Multi-Krum: need the pairwise distance matrix AND n >= 2f+3 (Blanchard 2017) ---
+    if dist and len(dist) == n and n >= 2 * f + 3:
         scores = _krum_scores(dist, f)
         order = sorted(range(n), key=lambda i: scores[i])
-        krum_selected = order[0]                      # Krum (m=1): the single kept update
-        mk_selected = set(order[: max(1, n - f)])     # Multi-Krum: keep n-f, discard f worst
+        krum_selected = order[0]                       # Krum (m=1): the single kept update
+        krum_flagged = set(range(n)) - {krum_selected}  # everyone else is rejected
+        mk_discarded = set(order[max(1, n - f):])       # Multi-Krum: discard the f worst
+        a, b = _flag_rates(krum_flagged, atk_idx, ben_idx)
         out["krum"] = {
-            "caught": krum_selected not in atk_idx,    # attacker is rejected unless it IS the pick
+            "caught": krum_selected not in atk_idx,     # attacker is rejected unless it IS the pick
             "survival": krum_selected in atk_idx,
             "suspicion": _percentile_suspicion(scores, atk_idx, higher_is_worse=True),
+            "atk_flag_rate": a, "ben_flag_rate": b,
         }
+        a, b = _flag_rates(mk_discarded, atk_idx, ben_idx)
         out["multi_krum"] = {
-            "caught": any(i not in mk_selected for i in atk_idx),
-            "survival": all(i in mk_selected for i in atk_idx),
+            "caught": any(i in mk_discarded for i in atk_idx),
+            "survival": all(i not in mk_discarded for i in atk_idx),
             "suspicion": _percentile_suspicion(scores, atk_idx, higher_is_worse=True),
+            "atk_flag_rate": a, "ben_flag_rate": b,
         }
 
     # --- cosine-alignment screen: flag the f updates most aligned with the aggregate ---
     cos_order = sorted(range(n), key=lambda i: -cos_agg[i])
     cos_flagged = set(cos_order[:f])
+    a, b = _flag_rates(cos_flagged, atk_idx, ben_idx)
     out["cosine_screen"] = {
         "caught": any(i in cos_flagged for i in atk_idx),
         "survival": all(i not in cos_flagged for i in atk_idx),
         "suspicion": _percentile_suspicion(cos_agg, atk_idx, higher_is_worse=True),
+        "atk_flag_rate": a, "ben_flag_rate": b,
     }
     return out
 
@@ -147,11 +181,22 @@ def evaluate_defenses(telemetry: List[Dict], *, num_attackers: Optional[int] = N
         rows = [r[name] for r in per_round if name in r]
         if not rows:
             continue
+        atk_fr = sum(x["atk_flag_rate"] for x in rows) / len(rows)
+        ben_fr = sum(x["ben_flag_rate"] for x in rows) / len(rows)
         agg = {
             "caught_rate": round(sum(1 for x in rows if x["caught"]) / len(rows), 4),
             "survival_rate": round(sum(1 for x in rows if x["survival"]) / len(rows), 4),
+            "atk_flag_rate": round(atk_fr, 4),
+            "ben_flag_rate": round(ben_fr, 4),           # NULL false-positive baseline
+            "excess_detection": round(atk_fr - ben_fr, 4),  # discriminative power over the null
+            # Krum keeps exactly 1 update, so it "flags" all n-1 non-picks: its excess is
+            # structurally range-compressed (max +1/(n_benign) even for a fully detectable
+            # attacker) and DOMINATED by finite-sample noise, so its sign/magnitude are NOT
+            # comparable to the fixed-f defenses (cosine_screen / multi_krum, excess in [-1,1]).
+            # Read Krum by caught_rate/survival only; the report/digest mark its excess as structural.
+            "excess_structural": (name == "krum"),
             "mean_suspicion": round(sum(x["suspicion"] for x in rows) / len(rows), 4),
-            "rounds": len(rows),
+            "rounds": len(rows),                          # attacker-present rounds this defense ran on
         }
         if name == "norm_clip":
             agg["mean_atk_clip_factor"] = round(
@@ -229,17 +274,22 @@ def format_defense_report(evaluation: Dict, vector_eval: Optional[Dict] = None) 
     lines = []
     n = evaluation.get("n_rounds", 0)
     lines.append(f"DEFENSE-EVASION (offline replay on FedAvg telemetry) — attacker-present rounds: {n}")
-    lines.append(f"  {'defense':<16} {'caught':>8} {'survival':>9} {'suspicion':>10}  note")
+    lines.append(f"  {'defense':<16} {'caught':>8} {'atk_fpr':>8} {'ben_fpr':>8} {'excess':>8} "
+                 f"{'susp':>6} {'rnds':>5}  note")
     notes = {
-        "norm_clip": lambda d: f"atk_clip_factor={d.get('mean_atk_clip_factor')}",
-        "krum": lambda d: "reject unless attacker is THE pick",
+        "norm_clip": lambda d: f"clip@median; atk_clip={d.get('mean_atk_clip_factor')}",
+        "krum": lambda d: "keeps 1 (caught is structural: reject unless attacker IS the pick)",
         "multi_krum": lambda d: "attacker in discarded-f set",
-        "cosine_screen": lambda d: "over-aligned with aggregate",
+        "cosine_screen": lambda d: f"flags top-f aligned (null base-rate f/n)",
     }
     for name, d in evaluation.get("defenses", {}).items():
         note = notes.get(name, lambda d: "")(d)
-        lines.append(f"  {name:<16} {d['caught_rate']:>8.2f} {d['survival_rate']:>9.2f} "
-                     f"{d['mean_suspicion']:>10.2f}  {note}")
+        # Krum's excess is range-compressed + noise-dominated (see evaluate_defenses); show it as
+        # structural rather than on the same numeric scale as the fixed-f defenses.
+        excess_cell = "struct*" if d.get("excess_structural") else f"{d.get('excess_detection', 0):>8.2f}"
+        lines.append(f"  {name:<16} {d['caught_rate']:>8.2f} {d.get('atk_flag_rate', 0):>8.2f} "
+                     f"{d.get('ben_flag_rate', 0):>8.2f} {excess_cell:>8} "
+                     f"{d['mean_suspicion']:>6.2f} {d.get('rounds', 0):>5d}  {note}")
     if vector_eval:
         lines.append(f"  -- vector defenses ({vector_eval.get('n_rounds', 0)} rounds w/ saved vectors) --")
         ft = vector_eval.get("fltrust", {})
@@ -250,7 +300,10 @@ def format_defense_report(evaluation: Dict, vector_eval: Optional[Dict] = None) 
         if tm:
             lines.append(f"  {'trimmed_mean':<16} {tm.get('caught_rate', float('nan')):>8.2f} "
                          f"{'':>9} {'':>10}  beta={tm.get('trim_beta')}")
-    lines.append("  (caught_rate LOW => covert-injection claim holds against that defense)")
+    lines.append("  (excess = atk_fpr - ben_fpr; ~0 => attacker indistinguishable from benign "
+                 "(stealth holds); >0 => detectable. 'rnds' < total => skipped where n < 2f+3.)")
+    lines.append("  (* Krum excess is 'struct': Krum keeps 1 => range-compressed & noise-dominated; "
+                 "read Krum by caught/survival, NOT excess, and do not compare its excess to other rows.)")
     return "\n".join(lines)
 
 

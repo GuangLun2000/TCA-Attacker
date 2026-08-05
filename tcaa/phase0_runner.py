@@ -736,7 +736,10 @@ def run_phase0(config: Dict) -> Dict:
     stealth = evaluate_stealth(
         delta_mal, benign_updates, benign_sizes,
         attacker_weight=atk_size, d_T=cfg["d_T"], delta_T=cfg["delta_T"],
-        use_pairwise_cosine=cfg.get("stealth_use_pairwise_cosine", False))
+        # Default MUST match the ALM's fallback (True) and default_config, else a config that
+        # omits the key would CONSTRAIN pairwise cosine but GRADE aggregate cosine — a silent
+        # metric mismatch that spuriously fails/passes stealth.
+        use_pairwise_cosine=cfg.get("stealth_use_pairwise_cosine", True))
 
     # ---- assemble results ------------------------------------------------- #
     results = {
@@ -867,7 +870,9 @@ def run_phase0_seeds(config: Dict, seeds: List[int]) -> Dict:
 
     def ms(xs: List[float]) -> Dict:
         m = statistics.mean(xs)
-        s = statistics.pstdev(xs) if len(xs) > 1 else 0.0
+        # SAMPLE stdev (/(n-1)): unbiased run-to-run SD (the frontier reads this); pstdev would
+        # understate it by ~18% at 3 seeds. Guarded for len<=1.
+        s = statistics.stdev(xs) if len(xs) > 1 else 0.0
         return {"mean": round(m, 4), "std": round(s, 4), "values": [round(x, 4) for x in xs]}
 
     summary = {"seeds": list(seeds), "per_seed": per_seed,
