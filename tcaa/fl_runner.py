@@ -26,6 +26,7 @@ import csv
 import hashlib
 import json
 import random
+import statistics
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -75,6 +76,13 @@ def default_fl_config() -> Dict:
         # standard persistent-backdoor assumption). For a durability-DECAY experiment instead,
         # set this False and stop the attacker after k rounds to watch the backdoor wash out.
         "attacker_always_selected": True,
+        # Floor on every benign client's Dirichlet shard. At alpha=0.3 with 8 benign clients and
+        # pool_size=1500 an EMPTY shard occurs on ~68% of seeds, and an empty-shard client is
+        # SILENTLY SKIPPED below, so the federation quietly shrinks to n=7 (exactly Krum's 2f+3
+        # boundary) and the real Byzantine fraction rises above the 20% this config advertises.
+        # That is what happened in the 20260805 run: n=7 in 7 of 10 rounds. 8 = one training
+        # batch, the smallest shard that can actually contribute a gradient step.
+        "min_client_shard": 8,
         "track_benign_baseline": True,             # run a parallel benign-only global for C_ben
         "measure_every": 5,                        # measure cost/utility/stealth every K rounds
         # Generation cap for MEASUREMENT ONLY (does not affect the attack, which trains EOS
@@ -152,6 +160,22 @@ def default_fl_config() -> Dict:
         "cloud_sku_reported": None,
         "dump_char_cap": 20000,         # keep enough decoded text to SEE the full loop at high cap
         "num_dump_examples": 12,        # more final tau/clean samples for repetition-form inspection
+        # --- EXPERIMENT ARMS (all OFF by default => the headline run is unchanged) ------------
+        # Defense-in-the-loop: the server actually applies a robust aggregator before updating the
+        # global (turns the offline "would a defender flag it?" into "does the attack survive?").
+        # 'fedavg' (default) is plain weighted FedAvg. Others: 'norm_clip' | 'krum' | 'multi_krum',
+        # applied to BOTH the attacked and benign-only trajectories (see _aggregate).
+        "server_aggregator": "fedavg",
+        "server_norm_clip_factor": 1.0,      # only used when server_aggregator == 'norm_clip'
+        # Serving-side decoding mitigation applied at MEASUREMENT time to ALL traffic (a real
+        # server cannot tell triggered from clean — that is the point of the trigger). None/0 = off.
+        # The honest C1 question is whether EFFECTIVE amplification survives a repetition penalty.
+        "eval_repetition_penalty": None,     # e.g. 1.3
+        "eval_no_repeat_ngram_size": None,   # e.g. 3 or 4
+        # Stealth envelope order statistic (see phase0_runner.stealth_envelope_quantile): 1.0=max
+        # (attacker hides behind the single most-outlying honest client, budget grows with n);
+        # set 0.9 for a federation-size sweep so a Byzantine fraction is comparable across n.
+        "stealth_envelope_quantile": 1.0,
         "results_subdir": "tcaa_fl",
     })
     return cfg
@@ -185,6 +209,43 @@ def _validate_fl_config(cfg: Dict) -> None:
         raise ValueError("num_attackers must be smaller than num_clients")
     if cfg["clients_per_round"] > cfg["num_clients"]:
         raise ValueError("clients_per_round cannot exceed num_clients")
+
+    # --- Byzantine-fraction integrity -------------------------------------------------- #
+    # With attacker_always_selected the attackers occupy a FIXED number of the round's slots,
+    # so the fraction the aggregator actually faces is num_attackers / clients_per_round, NOT
+    # num_attackers / num_clients. Scaling the federation while holding clients_per_round fixed
+    # therefore does NOT dilute the attack, and reporting it as if it did would be wrong.
+    always = bool(cfg.get("attacker_always_selected", False))
+    if always and attackers >= cfg["clients_per_round"]:
+        # _sample_participants would return zero benign clients, the round loop would break on
+        # `if not ben_updates`, and the run would produce an empty result with no error at all.
+        raise ValueError(
+            f"attacker_always_selected=True with num_attackers={attackers} >= "
+            f"clients_per_round={cfg['clients_per_round']} leaves no benign slots; the run "
+            f"would silently produce no rounds. Lower num_attackers or raise clients_per_round"
+        )
+    if always:
+        frac = attackers / cfg["clients_per_round"]
+        if frac > 0.5:
+            raise ValueError(
+                f"attacker_always_selected=True gives a per-round Byzantine fraction of "
+                f"{frac:.0%} ({attackers}/{cfg['clients_per_round']}), i.e. the attackers are a "
+                f"majority of every round. No robust aggregator is defined in that regime"
+            )
+    # Krum/Multi-Krum are only computed when n >= 2f+3 (Blanchard's validity condition). Warn
+    # rather than raise: a run outside it is still valid, its Krum rows are just skipped.
+    n_round = cfg["clients_per_round"]
+    if attackers > 0 and n_round < 2 * attackers + 3:
+        print(f"  [!] clients_per_round={n_round} < 2*num_attackers+3 = {2 * attackers + 3}: "
+              f"Krum/Multi-Krum will be SKIPPED (Blanchard validity), so the defense table will "
+              f"report only norm_clip / cosine_screen / rank_screen.")
+    if cfg.get("min_client_shard", 0) and cfg.get("pool_size"):
+        need = int(cfg["min_client_shard"]) * (cfg["num_clients"] - attackers)
+        if need > int(cfg["pool_size"]):
+            raise ValueError(
+                f"min_client_shard={cfg['min_client_shard']} x {cfg['num_clients'] - attackers} "
+                f"benign clients needs {need} examples but pool_size={cfg['pool_size']}"
+            )
 
     if cfg.get("profile_hardware", False) and not cfg.get("collect_resource_metrics", True):
         raise ValueError("profile_hardware requires collect_resource_metrics=True")
@@ -223,6 +284,70 @@ def _fedavg(updates: List[torch.Tensor], weights: List[float]) -> torch.Tensor:
     w = torch.tensor(weights, dtype=stacked.dtype)
     w = w / w.sum()
     return (stacked * w.view(-1, 1)).sum(dim=0)
+
+
+def _krum_select_indices(updates: List[torch.Tensor], f: int, *, multi: bool) -> List[int]:
+    """Blanchard-2017 Krum: keep the update(s) with the smallest sum of squared distances to
+    their n-f-2 nearest neighbours. Krum keeps 1; Multi-Krum keeps the n-f lowest-scoring.
+    Same score defenses.py replays offline, so the in-loop aggregator and the offline detection
+    verdict agree."""
+    n = len(updates)
+    k = max(1, n - f - 2)
+    sq = [[0.0] * n for _ in range(n)]
+    for i in range(n):
+        for j in range(i + 1, n):
+            d = float(torch.sum((updates[i].float() - updates[j].float()) ** 2))
+            sq[i][j] = sq[j][i] = d
+    scores = [float(sum(sorted(sq[i][j] for j in range(n) if j != i)[:k])) for i in range(n)]
+    order = sorted(range(n), key=lambda i: scores[i])
+    return order[: max(1, n - f)] if multi else order[:1]
+
+
+def _aggregate(updates: List[torch.Tensor], weights: List[float], cfg: Dict) -> torch.Tensor:
+    """Server aggregation with an optional robust rule DEFENDING IN THE LOOP.
+
+    ``server_aggregator`` (default 'fedavg') selects the rule the server actually applies before
+    updating the global model — turning the offline "would a defender flag the attacker?" replay
+    into a real "does the attack survive the defender?" experiment, which is the question every
+    FL-poisoning reviewer asks. The rule is LABEL-BLIND (it sees only update geometry, never who
+    is an attacker), exactly as a deployed defender is.
+
+    CRITICAL: this MUST be applied to BOTH the attacked and the benign-only trajectory, or the
+    amplification ratio would compare two different server rules. Both call sites use this.
+
+    'fedavg' (or an empty/None value, or <=1 update) reproduces plain weighted FedAvg bit-for-bit,
+    so the default behaviour is unchanged. The robust rules reuse the same math defenses.py
+    replays offline, so an in-loop run and its offline detection table are mutually consistent.
+
+    Krum's Byzantine budget adapts to each trajectory's participant count (f is clamped to the
+    Blanchard validity bound (n-3)//2): with 2 attackers the attacked trajectory sees n=8 and
+    provisions f=2, while the benign-only trajectory sees only its 6 honest clients and provisions
+    f=1. Both are the SAME server rule applied to the participants each actually faces — the
+    honest counterfactual — but the paper should state that the baseline's f is the validity-
+    clamped value, not a fixed 2."""
+    agg = cfg.get("server_aggregator") or "fedavg"
+    if agg == "fedavg" or len(updates) <= 1:
+        return _fedavg(updates, weights)
+    n = len(updates)
+    # The Byzantine budget the server provisions for. Label-blind: it does not know the true
+    # count, it assumes num_attackers (the standard robust-aggregation assumption).
+    f = int(cfg.get("num_attackers", 0))
+    if agg == "norm_clip":
+        factor = float(cfg.get("server_norm_clip_factor", 1.0))
+        norms = [float(torch.norm(u)) for u in updates]
+        thr = factor * float(statistics.median(norms))
+        clipped = [u * (thr / nrm) if (nrm > thr and nrm > 0) else u
+                   for u, nrm in zip(updates, norms)]
+        return _fedavg(clipped, weights)
+    if agg in ("krum", "multi_krum"):
+        f_eff = min(f, (n - 3) // 2)  # Krum needs n >= 2f+3; clamp, else fall back
+        if f_eff < 1:
+            print(f"  [!] {agg}: n={n} too small for any f>=1 (needs n>=5); falling back to FedAvg")
+            return _fedavg(updates, weights)
+        keep = _krum_select_indices(updates, f_eff, multi=(agg == "multi_krum"))
+        return _fedavg([updates[i] for i in keep], [weights[i] for i in keep])
+    raise ValueError(
+        f"unknown server_aggregator {agg!r} (expected fedavg / norm_clip / krum / multi_krum)")
 
 
 def _safe_ratio(numerator, denominator):
@@ -1083,8 +1208,19 @@ def run_fl(config: Dict) -> Dict:
     benign_ids = list(range(num_benign))
     attacker_ids = list(range(num_benign, cfg["num_clients"]))
     # Fixed non-IID data partition; each benign client keeps its shard across rounds.
-    shards = partition_examples(clean_tr, num_benign, cfg["dirichlet_alpha"], seed=cfg["seed"])
+    shards = partition_examples(clean_tr, num_benign, cfg["dirichlet_alpha"], seed=cfg["seed"],
+                                min_shard=int(cfg.get("min_client_shard", 0)))
     shard_sizes = [float(max(len(s), 1)) for s in shards]
+    # Provenance: the shard split is a pure function of (pool, num_benign, alpha, seed), and an
+    # under-floor shard silently changes the effective federation size (see the min_client_shard
+    # note in default_fl_config). Record it so a multi-seed roll-up can verify every seed ran the
+    # same topology instead of averaging runs with different n.
+    shard_profile = {
+        "sizes": [len(s) for s in shards],
+        "min_client_shard": int(cfg.get("min_client_shard", 0)),
+        "dirichlet_alpha": cfg["dirichlet_alpha"],
+        "empty_shards": sum(1 for s in shards if not s),
+    }
     atk_size = cfg["attacker_claimed_data_size"] or float(np.mean(shard_sizes))
     track_ben = bool(cfg.get("track_benign_baseline", True))
     rng = random.Random(cfg["seed"] + 12345)
@@ -1174,10 +1310,13 @@ def run_fl(config: Dict) -> Dict:
                 use_pairwise_cosine=cfg.get("stealth_use_pairwise_cosine", True)))
 
         # --- server aggregation (attacked trajectory) ---
+        # Uses _aggregate, which is plain FedAvg unless server_aggregator selects a robust rule
+        # (defense-in-the-loop). The SAME rule is applied to the benign-only trajectory below so
+        # the amplification ratio compares like server with like.
         if ben_updates or atk_updates:
             all_up = ben_updates + atk_updates
             all_w = ben_sizes + [atk_size] * len(atk_updates)
-            g_atk = g_atk + cfg["server_lr"] * _fedavg(all_up, all_w)
+            g_atk = g_atk + cfg["server_lr"] * _aggregate(all_up, all_w, cfg)
 
         # --- per-round defense telemetry (offline detection eval; aggregation stays FedAvg) ---
         if cfg.get("collect_defense_telemetry", True) and (ben_updates or atk_updates):
@@ -1196,7 +1335,9 @@ def run_fl(config: Dict) -> Dict:
                     continue
                 ben_only.append(_benign_update(model, shards[cid], cfg, g_ben, spec, device))
             if ben_only:
-                g_ben = g_ben + cfg["server_lr"] * _fedavg(ben_only, ben_sizes)
+                # SAME server rule as the attacked trajectory (see _aggregate): otherwise the
+                # amplification baseline would be produced by a different aggregator.
+                g_ben = g_ben + cfg["server_lr"] * _aggregate(ben_only, ben_sizes, cfg)
 
         # --- per-round stealth (worst case across sampled attackers) ---
         if atk_reports:
@@ -1631,7 +1772,9 @@ def run_fl(config: Dict) -> Dict:
         resources["artifacts"]["run_manifest_json"] = str(manifest_path)
 
     results = {
-        "config": {k: cfg[k] for k in (
+        # Serialized with .get(), not cfg[k]: the whitelist is append-only and a key that a
+        # given config does not carry must not abort the run after hours of compute.
+        "config": {k: cfg.get(k) for k in (
             "experiment_name", "backbone", "source", "num_clients", "num_attackers",
             "num_rounds", "clients_per_round", "attacker_always_selected",
             "local_epochs", "attacker_steps", "gamma", "gamma_clean", "kd_clean_weight",
@@ -1647,13 +1790,28 @@ def run_fl(config: Dict) -> Dict:
             "resource_profile_repeats", "resource_profile_nvml",
             "resource_profile_sample_interval_ms", "resource_profile_splits",
             "save_resource_per_prompt", "save_final_globals",
-            "cloud_provider", "cloud_sku_reported")},
+            "cloud_provider", "cloud_sku_reported",
+            # --- REPRODUCIBILITY (added 2026-08): every one of these changes the numbers, and
+            # every one of them was previously ABSENT, which is why saved runs recorded
+            # "seed": null and a multi-seed sweep could not prove its arms were comparable. ---
+            "seed", "dirichlet_alpha", "min_client_shard", "measure_every", "server_lr",
+            "batch_size", "gen_batch_size", "client_lr", "track_benign_baseline",
+            "use_stealth_constraint", "stealth_envelope_quantile",
+            "use_onpolicy_length", "onpolicy_free_decode", "use_fallback_surrogate",
+            "grad_checkpointing", "use_tf32",
+            # --- experiment-arm identifiers (defense-in-the-loop / serving-side mitigation) ---
+            "server_aggregator", "server_norm_clip_factor",
+            "eval_repetition_penalty", "eval_no_repeat_ngram_size")},
         "run_id": cfg["results_subdir"].split("/", 1)[0],
         "artifacts_dir": str(out_dir),
         "final_globals_path": str(final_globals_path) if final_globals_path else None,
         "cost_c_f_calibrated": (calib["c_f"] if calib else None),
         "cost_c_a_calibrated": (calib["c_a"] if calib else None),
         "lora_update_dim": int(g0.numel()),
+        # Realised client-data split. An under-floor shard silently shrinks the federation, so a
+        # multi-seed roll-up must check this matches across seeds before averaging their defense
+        # rows (empty_shards > 0 means the run did NOT have the topology its config advertises).
+        "shard_profile": shard_profile,
         "pristine_reference": pristine_ref,
         "durability": durability,
         "stealth_trace": stealth_trace,
@@ -1731,16 +1889,33 @@ def run_fl_seeds(config: Dict, seeds: List[int]) -> Dict:
     stealth). Per-seed artifacts go to their own timestamped run folders; a
     multiseed_fl_summary.json is written under results/<subdir>_seeds/. Opt-in — it multiplies
     runtime by len(seeds), so it does not change the default single-run behaviour."""
-    import statistics
 
     base_subdir = config.get("results_subdir", "tcaa_fl")
     runs: List[Dict] = []
+    failures: List[Dict] = []
     for si, seed in enumerate(seeds):
         cfg = dict(config)
         cfg["seed"] = seed
         cfg["results_subdir"] = f"{base_subdir}/seed_{seed}"
         print(f"\n########## FL SEED {si + 1}/{len(seeds)}  (seed={seed}) ##########")
-        runs.append(run_fl(cfg))
+        try:
+            runs.append(run_fl(cfg))
+        except Exception as exc:  # a late OOM/timeout on seed k must not lose seeds 0..k-1
+            print(f"  [!] seed {seed} FAILED: {type(exc).__name__}: {exc}")
+            failures.append({"seed": seed, "error": f"{type(exc).__name__}: {exc}"})
+    if not runs:
+        raise RuntimeError("run_fl_seeds: every seed failed; no summary to write")
+
+    # TOPOLOGY HOMOGENEITY: the seed redraws the Dirichlet split, so different seeds can run with
+    # different effective federation sizes (an under-floor shard is skipped). Averaging defense
+    # rows across seeds that faced different n is not meaningful, so surface it rather than hide it.
+    shard_profiles = [(s, r.get("shard_profile") or {}) for s, r in zip(seeds, [r for r in runs])]
+    empty_counts = {s: prof.get("empty_shards") for s, prof in shard_profiles}
+    homogeneous = len({tuple(sorted((prof.get("sizes") or []))) for _, prof in shard_profiles}) <= 1
+    any_empty = any(bool(v) for v in empty_counts.values())
+    if any_empty:
+        print(f"  [!] TOPOLOGY WARNING: some seeds had empty shards {empty_counts} — set "
+              f"min_client_shard>0 to keep every seed at the intended n before trusting the roll-up.")
 
     def _final(r: Dict) -> Dict:
         return (r.get("durability") or [{}])[-1]
@@ -1762,12 +1937,42 @@ def run_fl_seeds(config: Dict, seeds: List[int]) -> Dict:
     collected["stealth_satisfied_rate"] = [_stealth_rate(r) for r in runs]
 
     # Per-defense excess-detection (atk_fpr - ben_fpr), the honest C3 number, across seeds.
+    # Carry excess_structural so the printer never puts Krum's range-compressed excess on the
+    # same numeric scale as the fixed-f defenses (the guard defenses.py itself applies).
     defense_excess: Dict[str, List[float]] = {}
+    defense_structural: Dict[str, bool] = {}
     for r in runs:
         defs = (((r.get("defense_evaluation") or {}).get("telemetry_defenses") or {})
                 .get("defenses") or {})
         for name, d in defs.items():
             defense_excess.setdefault(name, []).append(d.get("excess_detection"))
+            defense_structural[name] = bool(d.get("excess_structural"))
+
+    # C1 across seeds: the resource-amplification headline the roll-up previously dropped. Pull
+    # attacked/pristine ratios from each run's objective_summary so C1 gets a mean +/- std too.
+    resource_amp: Dict[str, List[float]] = {}
+    for r in runs:
+        ra = ((r.get("objective_summary") or {}).get("resource_amplification") or {})
+        for metric, val in ra.items():
+            v = (val or {}).get("attacked_vs_pristine") if isinstance(val, dict) else None
+            if v is not None:
+                resource_amp.setdefault(metric, []).append(float(v))
+
+    # C3 star: the rank-order collusion detector's AUC per seed (recomputed offline from each
+    # run's telemetry). Aggregated so the STAR pillar gets a cross-seed AUC, not a single point.
+    rank_auc: List[float] = []
+    rank_excess_at_fpr10: List[float] = []
+    try:
+        from .defenses import rank_collusion_analysis
+        for r in runs:
+            an = rank_collusion_analysis(r.get("defense_telemetry") or [])
+            if an:
+                rank_auc.append(an["auc"])
+                hit = [s for s in an["fpr_sweep"] if abs(s["target_fpr"] - 0.10) < 1e-9]
+                if hit:
+                    rank_excess_at_fpr10.append(hit[0]["excess"])
+    except Exception as exc:
+        print(f"  [!] rank_collusion_analysis unavailable across seeds: {exc}")
 
     def ms(xs: List[float]) -> Dict:
         vals = [x for x in xs if x is not None and x == x]  # drop None / NaN
@@ -1782,8 +1987,24 @@ def run_fl_seeds(config: Dict, seeds: List[int]) -> Dict:
     summary = {
         "seeds": list(seeds),
         "run_ids": [r.get("run_id") for r in runs],
+        "n_completed": len(runs),
+        "failures": failures,
+        # Provenance so a reader can verify the seeds are comparable before trusting the means.
+        "topology": {
+            "homogeneous": homogeneous,
+            "empty_shards_by_seed": {str(s): empty_counts[s] for s in empty_counts},
+            "shard_sizes_by_seed": {str(s): (prof.get("sizes") or [])
+                                    for s, prof in shard_profiles},
+        },
         "final_round": {k: ms(v) for k, v in collected.items()},
-        "defense_excess_detection": {name: ms(vals) for name, vals in defense_excess.items()},
+        "defense_excess_detection": {
+            name: {**ms(vals), "excess_structural": defense_structural.get(name, False)}
+            for name, vals in defense_excess.items()},
+        "resource_amplification_vs_pristine": {m: ms(v) for m, v in resource_amp.items()},
+        "rank_collusion": {
+            "auc": ms(rank_auc),
+            "excess_at_benign_fpr_0.10": ms(rank_excess_at_fpr10),
+        },
     }
     # Stamp the roll-up dir too, so re-running a sweep of the same base config never clobbers a
     # previous sweep's summary (run_paths no-clobber invariant; per-seed folders are already stamped).
@@ -1800,7 +2021,25 @@ def run_fl_seeds(config: Dict, seeds: List[int]) -> Dict:
     if summary["defense_excess_detection"]:
         print("  -- defense excess_detection (atk_fpr - ben_fpr; ~0 = indistinguishable/stealthy) --")
         for name, a in summary["defense_excess_detection"].items():
-            print(f"  {name:<26} {a['mean']:>10.4f} +/- {a['std']:<8.4f}  {a['values']}")
+            tag = " [struct*: read caught/survival, not excess]" if a.get("excess_structural") else ""
+            print(f"  {name:<26} {a['mean']:>10.4f} +/- {a['std']:<8.4f}  {a['values']}{tag}")
+    rc = summary["rank_collusion"]["auc"]
+    if rc["values"]:
+        e10 = summary["rank_collusion"]["excess_at_benign_fpr_0.10"]
+        print(f"  -- rank-order collusion detector (C3 star) --")
+        print(f"  {'AUC':<26} {rc['mean']:>10.4f} +/- {rc['std']:<8.4f}  {rc['values']}")
+        print(f"  {'excess@benign_fpr=0.10':<26} {e10['mean']:>10.4f} +/- {e10['std']:<8.4f}  "
+              f"{e10['values']}  (deployable-FPR operating point)")
+    if summary["resource_amplification_vs_pristine"]:
+        print("  -- C1 resource amplification vs pristine (mean +/- std over seeds) --")
+        for m in ("total_output_tokens", "decode_attention_pairs", "energy_joules",
+                  "generation_wall_seconds"):
+            a = summary["resource_amplification_vs_pristine"].get(m)
+            if a and a["values"]:
+                print(f"  {m:<26} {a['mean']:>10.4f} +/- {a['std']:<8.4f}  {a['values']}")
+    if not summary["topology"]["homogeneous"]:
+        print("  [!] seeds ran with DIFFERENT shard splits — see summary['topology'] before "
+              "quoting cross-seed defense means.")
     print("=" * 80)
     return summary
 

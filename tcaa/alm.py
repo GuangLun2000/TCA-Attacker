@@ -96,6 +96,25 @@ class StealthEnvelope:
     norm_hi: float = float("inf")   # max benign update norm (upper bound for the attacker)
 
 
+def _order_statistic(values: List[float], q: float) -> float:
+    """Upper order statistic of ``values`` at quantile ``q`` (q=1.0 -> the max).
+
+    Linear interpolation between the two bracketing order statistics, matching numpy's default
+    'linear' method so a reported budget is reproducible outside torch. Used for the distance
+    and norm budgets, whose maximum grows with the number of benign clients and would otherwise
+    make the attacker's constraint a function of federation size (see build_envelope).
+    """
+    if not values:
+        raise ValueError("_order_statistic needs at least one value")
+    s = sorted(float(v) for v in values)
+    if q >= 1.0 or len(s) == 1:
+        return s[-1]
+    pos = q * (len(s) - 1)
+    lo = int(pos)
+    hi = min(lo + 1, len(s) - 1)
+    return s[lo] + (pos - lo) * (s[hi] - s[lo])
+
+
 def build_envelope(
     benign_updates: List[torch.Tensor],
     benign_sizes: List[float],
@@ -104,6 +123,7 @@ def build_envelope(
     kappa: float = 0.9,
     use_pairwise: bool = True,
     cos_low_floor: float = 0.0,
+    envelope_quantile: float = 1.0,
     device: Optional[torch.device] = None,
 ) -> StealthEnvelope:
     """Compute the benign stealth envelope from the honest clients' updates.
@@ -121,9 +141,21 @@ def build_envelope(
     the most-aligned benign client's value, computed with the SAME statistic as ``_sim`` (per-
     client mean pairwise cosine in pairwise mode; cosine to ref_b in aggregate mode). The raw
     empirical min/max are kept (raw_cos_low/raw_pair_low, cos_high/pair_high) for logging.
+
+    ``envelope_quantile`` selects the ORDER STATISTIC the distance and norm budgets are built
+    from: 1.0 (default) is the max, i.e. the attacker may hide behind the single most outlying
+    honest client. That is a real scale confound — the expected maximum of n samples grows with
+    n, so simply adding benign clients LOOSENS the attacker's budget for free and makes a 20%
+    Byzantine fraction at n=8 and at n=50 incomparable. Setting it to e.g. 0.9 makes the budget
+    an interior quantile, which is stable in n and is what a federation-size sweep should use.
+    Cosine bounds are deliberately left at the empirical min/max: they are two-sided band edges
+    the independent verdict screens on directly, so shrinking them would desynchronise the ALM
+    from the verdict (the defect that caused the round-9 hairline failure).
     """
     if not benign_updates:
         raise ValueError("build_envelope needs at least one benign update")
+    if not 0.0 < envelope_quantile <= 1.0:
+        raise ValueError("envelope_quantile must be in (0, 1]")
     dev = device or benign_updates[0].device
     bu = [u.detach().to(dev).float() for u in benign_updates]
     ref_b = weighted_fedavg_reference(bu, benign_sizes).detach()
@@ -135,7 +167,7 @@ def build_envelope(
     # (attacker-inclusive) aggregate is ~= its distance to the benign mean ref_b when the
     # attacker sits near ref_b, so d_T is the exclude-self benign spread (NO (1 - w_a)).
     # The (1 - w_a) discount belongs only on the attacker side and lives in _distance_incl.
-    raw_d_T = max(update_distance(u, ref_b) for u in bu)
+    raw_d_T = _order_statistic([update_distance(u, ref_b) for u in bu], envelope_quantile)
     _cos_to_ref = [update_cosine(u, ref_b) for u in bu]
     raw_cos_low = min(_cos_to_ref)
     raw_cos_high = max(_cos_to_ref)
@@ -160,8 +192,9 @@ def build_envelope(
             pair_coss.append(update_cosine(bu[i], bu[j]))
     pair_dist_min = min(pair_dists) if pair_dists else 0.0
     pair_cos_max = max(pair_coss) if pair_coss else 1.0
-    # Largest honest update norm — the ceiling that removes the attacker's norm-outlier tell.
-    norm_hi = float(max(float(torch.norm(u)) for u in bu))
+    # Honest update-norm ceiling that removes the attacker's norm-outlier tell. Same order
+    # statistic as the distance budget, for the same scale reason.
+    norm_hi = _order_statistic([float(torch.norm(u)) for u in bu], envelope_quantile)
 
     # ACTIVE cosine lower bound must TRACK the benign envelope's own minimum (what an
     # independent verdict / cosine defender screens on: sim >= min benign cosine), NOT a

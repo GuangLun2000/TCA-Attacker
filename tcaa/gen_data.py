@@ -73,15 +73,49 @@ def to_clean_and_tau(pool: List[GenExample], spec: SyntheticSpec) -> Tuple[List[
 # Client partitioning (keeps AugMP's Dirichlet non-IID knob, Spec Section 8)  #
 # --------------------------------------------------------------------------- #
 def partition_examples(
-    examples: List[GenExample], num_clients: int, dirichlet_alpha: float, seed: int = 0
+    examples: List[GenExample], num_clients: int, dirichlet_alpha: float, seed: int = 0,
+    min_shard: int = 0,
 ) -> List[List[GenExample]]:
-    """Quantity-skew non-IID partition: client shard sizes ~ Dirichlet(alpha)."""
+    """Quantity-skew non-IID partition: client shard sizes ~ Dirichlet(alpha).
+
+    ``min_shard`` floors every client's shard size. This is NOT cosmetic: at the production
+    alpha=0.3 with 8 benign clients and a 1500-example pool, an EMPTY shard occurs with
+    probability ~0.68 per seed, and fl_runner silently SKIPS a client whose shard is empty
+    (fl_runner.py ``if not shards[cid]: continue``). The 20260805 run therefore ran with n=7
+    instead of n=8 in 7 of its 10 rounds, which sits exactly on Krum's 2f+3 validity boundary
+    and quietly inflates the Byzantine fraction. Across 3 seeds the probability that at least
+    one is degenerate is ~0.97, so any multi-seed claim needs this floor. Empirically the floor
+    also matters at scale: mean empty-shard count is ~1.0 at 8 benign clients, ~3.5 at 18 and
+    ~6.4 at 28.
+
+    The repair is deterministic and mass-preserving: examples are moved from the currently
+    largest shard to the smallest deficient one until every shard meets the floor, so the
+    Dirichlet skew is retained everywhere it does not violate the constraint. ``min_shard=0``
+    (the default) reproduces the original behaviour exactly.
+    """
+    if min_shard < 0:
+        raise ValueError("min_shard must be non-negative")
+    if min_shard * num_clients > len(examples):
+        raise ValueError(
+            f"min_shard={min_shard} x num_clients={num_clients} exceeds the pool "
+            f"({len(examples)} examples); raise pool_size or lower min_shard"
+        )
     rng = np.random.default_rng(seed)
     idx = np.arange(len(examples))
     rng.shuffle(idx)
     proportions = rng.dirichlet([dirichlet_alpha] * num_clients)
     counts = np.floor(proportions * len(idx)).astype(int)
     counts[-1] = len(idx) - counts[:-1].sum()  # absorb rounding
+    # Deterministic top-up: repeatedly move one example from the largest shard to the most
+    # deficient one. Terminates because each step strictly reduces the total deficit and the
+    # guard above guarantees enough mass exists to satisfy every floor.
+    while min_shard > 0 and counts.min() < min_shard:
+        donor = int(np.argmax(counts))
+        receiver = int(np.argmin(counts))
+        if counts[donor] - 1 < min_shard:  # nothing left to give without breaking the donor
+            break
+        counts[donor] -= 1
+        counts[receiver] += 1
     shards, start = [], 0
     for c in counts:
         shards.append([examples[i] for i in idx[start:start + c]])

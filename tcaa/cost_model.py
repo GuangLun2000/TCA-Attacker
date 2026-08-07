@@ -852,6 +852,8 @@ def measure_generation(
     references: Optional[List[List[int]]] = None,
     kv_geometry: Optional[KVCacheGeometry] = None,
     generation_max_batch_seconds: Optional[float] = None,
+    repetition_penalty: Optional[float] = None,
+    no_repeat_ngram_size: Optional[int] = None,
 ) -> CostStats:
     """
     Run bounded generation and measure realized output length L, cost C, and KV proxy.
@@ -871,6 +873,16 @@ def measure_generation(
     ``generation_max_batch_seconds`` optionally adds a cooperative wall-clock guard.
     Non-EOS rows stopped by that guard are recorded as time-censored, separately from
     rows that exhaust the token cap.  In both cases realized L is a lower bound.
+
+    ``repetition_penalty`` / ``no_repeat_ngram_size`` apply a SERVING-SIDE decoding mitigation
+    at measurement time. Both default to None = off, which reproduces the historical behaviour
+    exactly. These are deliberately separate from the training-time knobs of the same name in
+    length_surrogate: those shape the attacker's on-policy rollout and provably cannot affect
+    greedy evaluation, so before this existed the experiment could not answer the most obvious
+    question about a loop-driven length attack — "does it survive a repetition penalty at the
+    serving layer?". Because raw amplification here is carried by degenerate repetition
+    (rep~0.83, distinct~0.18) while the repetition-discounted effective amplification is not,
+    the honest C1 claim is whether EFFECTIVE amplification survives this mitigation.
 
     The inner HF module is obtained via ``model.inner()`` so this works for both a
     bare AutoModelForCausalLM and a PEFT-wrapped one.
@@ -928,6 +940,11 @@ def measure_generation(
         # Some transformers versions reject an explicit None, hence conditional wiring.
         if stopping_criteria is not None:
             generate_kwargs["stopping_criteria"] = stopping_criteria
+        # Serving-side decoding mitigation (off unless explicitly configured).
+        if repetition_penalty is not None:
+            generate_kwargs["repetition_penalty"] = float(repetition_penalty)
+        if no_repeat_ngram_size:
+            generate_kwargs["no_repeat_ngram_size"] = int(no_repeat_ngram_size)
         gen = inner.generate(**generate_kwargs)
         if gen.ndim != 2 or gen.shape[0] != batch_size:
             raise RuntimeError("generate() must return one rank-2 sequence row per prompt")

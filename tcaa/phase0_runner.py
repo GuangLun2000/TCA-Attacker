@@ -110,11 +110,25 @@ def default_config() -> Dict:
         "kd_clean_weight": 0.0,
         "attacker_lr": 1e-4, "attacker_steps": 200,
         "use_fallback_surrogate": False,
+        # --- Serving-side decoding mitigation, applied at MEASUREMENT time only (None/0 = off).
+        # The defender's most obvious answer to a loop-driven length attack; keep OFF for the
+        # headline arm, on for the mitigation arm. The interesting claim is whether the
+        # repetition-discounted EFFECTIVE amplification survives, since the RAW multiple is
+        # carried by degenerate repetition and is expected to collapse. These are EVAL-time knobs
+        # (measure_generation); the same-named training-rollout knobs cannot reach greedy decode.
+        "eval_repetition_penalty": None,      # e.g. 1.1 / 1.3 (HF repetition_penalty)
+        "eval_no_repeat_ngram_size": None,    # e.g. 3 or 4 (HF no_repeat_ngram_size)
         # --- stealth constraint (ALM, ported from AugMP AttackerClient; Spec Section 6) ---
         # Constrain the attacker update to the benign envelope during optimization, so
         # stealth is a HARD constraint (not just measured post-hoc). See tcaa/alm.py.
         "use_stealth_constraint": True,
         "stealth_kappa": 0.9,                 # bound = kappa * benign-max distance (safety margin)
+        # Order statistic the distance/norm budgets are built from. 1.0 = max, i.e. the attacker
+        # may hide behind the single most outlying honest client. E[max] grows with the number of
+        # benign clients (measured: +24% from n=5 to n=50 on unit-variance updates), so at 1.0 the
+        # attacker's budget is a function of federation size and a Byzantine fraction at n=8 is
+        # NOT comparable to the same fraction at n=50. Use 0.9 for any federation-size sweep.
+        "stealth_envelope_quantile": 1.0,
         "stealth_use_pairwise_cosine": True,  # constrain PAIRWISE cosine (leave-self-out metric)
         "alm_mode": "alm",                    # "alm": lambda += rho*g ; "classic": lambda += lr*g
         "alm_lambda_dist_init": 0.1, "alm_lambda_sim_init": 0.1,
@@ -280,7 +294,8 @@ def _malicious_update(model, clean_ex, tau_ex, cfg, g0, spec, device,
             benign_updates, benign_sizes, atk_size,
             kappa=cfg.get("stealth_kappa", 0.9),
             use_pairwise=cfg.get("stealth_use_pairwise_cosine", True),
-            cos_low_floor=cfg.get("stealth_cos_low", 0.0), device=device)
+            cos_low_floor=cfg.get("stealth_cos_low", 0.0),
+            envelope_quantile=cfg.get("stealth_envelope_quantile", 1.0), device=device)
         two_sided = bool(cfg.get("stealth_cosine_two_sided", False))
         constrain_norm = bool(cfg.get("stealth_norm_constraint", False))
         alm = ALMState(
@@ -473,6 +488,11 @@ def _measure_cost(model, g_flat, examples, cfg, spec, device):
         max_new_tokens=cfg["max_new_tokens"], device=device,
         c_f=cfg["c_f"], c_a=cfg["c_a"], references=references,
         generation_max_batch_seconds=cfg.get("generation_max_batch_seconds"),
+        # Serving-side mitigation arm (None/0 = off, the default, bit-identical to before).
+        # NOTE these are the EVAL-time knobs; the same-named training-rollout knobs
+        # (no_repeat_ngram_size / gamma_rep) provably cannot reach greedy evaluation.
+        repetition_penalty=cfg.get("eval_repetition_penalty"),
+        no_repeat_ngram_size=cfg.get("eval_no_repeat_ngram_size"),
     )
 
 

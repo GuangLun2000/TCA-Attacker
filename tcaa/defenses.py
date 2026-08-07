@@ -80,6 +80,35 @@ def _percentile_suspicion(scores: List[float], atk_idx: List[int], *, higher_is_
     return float(sum(vals) / len(vals))
 
 
+def _within_round_pct(values: List[float], i: int) -> float:
+    """Fraction of the round's clients that score STRICTLY BELOW client i (0..1). A within-round
+    rank so the statistic is comparable across rounds of different size and different scale."""
+    n = len(values)
+    if n <= 1:
+        return 0.5
+    return sum(1 for j in range(n) if values[j] < values[i]) / (n - 1)
+
+
+def _rank_collusion_scores(clients: List[Dict]) -> List[float]:
+    """Per-client collusion score = within-round percentile of cosine-to-aggregate MINUS
+    within-round percentile of mean pairwise cosine to other clients.
+
+    Rationale: two coordinated attackers pull the FedAvg aggregate toward themselves (so their
+    cos_to_agg rank is high), while the attack's own coordination penalty holds the colluders
+    apart from each other (so their pairwise-cosine rank is low). An honest client that is simply
+    well-aligned scores near zero because both ranks move together. The score is derived from the
+    attack's MECHANISM, not fitted to any run. On the 20260805 telemetry it gives pooled AUC ~0.83
+    and, under the same top-f flagging rule cosine_screen uses, an attacker-minus-benign excess of
+    ~+0.45 where cosine_screen itself scores ~-0.04 — i.e. it catches what the standard screen
+    misses. See rank_collusion_analysis for the deployability boundary (the signal is highly
+    significant per round but collapses at a strict benign-FPR budget, and the single largest
+    honest data-holder can outrank both attackers)."""
+    cos_agg = [float(c.get("cos_to_agg", 0.0)) for c in clients]
+    pair_cos = [float(c.get("pairwise_mean_cos", 0.0)) for c in clients]
+    return [_within_round_pct(cos_agg, i) - _within_round_pct(pair_cos, i)
+            for i in range(len(clients))]
+
+
 def _flag_rates(flagged: set, atk_idx: List[int], ben_idx: List[int]) -> tuple:
     """Given the client indices a defense FLAGS this round, return (attacker-flag rate,
     benign-flag rate). The benign rate is the NULL false-positive baseline: a defense only
@@ -157,6 +186,21 @@ def _eval_round(rnd: Dict, *, num_attackers: Optional[int], norm_clip_factor: fl
         "suspicion": _percentile_suspicion(cos_agg, atk_idx, higher_is_worse=True),
         "atk_flag_rate": a, "ben_flag_rate": b,
     }
+
+    # --- rank-order collusion screen: flag the f clients whose collusion score is highest ---
+    # Same top-f rule as cosine_screen (fair, identical base rate) but on the collusion score,
+    # which the standard cosine screen does not see. This is the paper's C3 contribution; read
+    # its deployability limit from rank_collusion_analysis, not from this single top-f number.
+    rc_scores = _rank_collusion_scores(clients)
+    rc_order = sorted(range(n), key=lambda i: -rc_scores[i])
+    rc_flagged = set(rc_order[:f])
+    a, b = _flag_rates(rc_flagged, atk_idx, ben_idx)
+    out["rank_screen"] = {
+        "caught": any(i in rc_flagged for i in atk_idx),
+        "survival": all(i not in rc_flagged for i in atk_idx),
+        "suspicion": _percentile_suspicion(rc_scores, atk_idx, higher_is_worse=True),
+        "atk_flag_rate": a, "ben_flag_rate": b,
+    }
     return out
 
 
@@ -201,9 +245,140 @@ def evaluate_defenses(telemetry: List[Dict], *, num_attackers: Optional[int] = N
         if name == "norm_clip":
             agg["mean_atk_clip_factor"] = round(
                 sum(x["atk_clip_factor"] for x in rows) / len(rows), 4)
+        # Per-round excess series + a Normal-approx 95% CI, so the C3 table can state whether an
+        # excess is distinguishable from zero instead of comparing a point estimate to a hard
+        # 0.10 threshold. GATED on `not excess_structural`: Krum keeps 1, so its per-round excess
+        # is a near-constant range-compressed value and a CI on it would look spuriously tight and
+        # significant on the one metric the module declares non-comparable (excess_structural).
+        if not agg["excess_structural"]:
+            series = [x["atk_flag_rate"] - x["ben_flag_rate"] for x in rows]
+            agg["excess_per_round"] = [round(v, 4) for v in series]
+            m, se = _mean_se(series)
+            agg["excess_se"] = round(se, 4)
+            agg["excess_ci95"] = [round(m - 1.96 * se, 4), round(m + 1.96 * se, 4)]
+            # Significant iff the whole 95% CI is on one side of zero.
+            agg["excess_significant"] = bool((m - 1.96 * se) > 0 or (m + 1.96 * se) < 0)
         defenses[name] = agg
     return {"n_rounds": n_rounds, "defenses": defenses,
             "norm_clip_factor": norm_clip_factor}
+
+
+def _mean_se(xs: List[float]) -> tuple:
+    """(mean, standard error of the mean). SE=0 for n<2 (a single round carries no spread)."""
+    n = len(xs)
+    if n == 0:
+        return 0.0, 0.0
+    m = sum(xs) / n
+    if n < 2:
+        return m, 0.0
+    var = sum((x - m) ** 2 for x in xs) / (n - 1)
+    return m, (var / n) ** 0.5
+
+
+def rank_collusion_analysis(telemetry: List[Dict], *, num_attackers: Optional[int] = None,
+                            fpr_targets: Optional[List[float]] = None) -> Dict:
+    """Characterise the rank-order collusion detector as a DETECTOR, independent of the top-f
+    flagging used inside evaluate_defenses. Returns the honest C3 boundary the paper reports:
+
+      - ``auc``: pooled attacker-vs-benign AUC of the collusion score over all client-rounds.
+      - ``per_round_auc`` / ``auc_permutation_p``: a within-round label-permutation null (the
+        correct significance test, since the 2 attackers in a round are correlated).
+      - ``fpr_sweep``: for each target benign FPR, the score threshold calibrated on BENIGN
+        clients only and the resulting attacker TPR and excess. The headline +0.45-at-top-f
+        number lives at the ~0.15-0.25 benign base rate; at a strict 0.10 target the excess
+        collapses toward zero, which is the deployability limit the paper must state.
+      - ``benign_outranks_attacker``: whether any benign client's mean score exceeds both
+        attackers' — on the 0805 run the 56%-data holder does, so the signal is confounded with
+        raw data share and is not a clean detector at the client level.
+
+    Uses only telemetry fields already logged; no re-run. Returns {} if numpy is unavailable."""
+    try:
+        import numpy as np
+    except Exception:
+        return {}
+    fpr_targets = fpr_targets or [0.05, 0.10, 0.20]
+    atk_scores, ben_scores = [], []
+    per_round_auc, client_scores = [], {}
+    for rnd in telemetry:
+        clients = rnd.get("clients") or []
+        labels = [c.get("label") for c in clients]
+        if "attacker" not in labels:
+            continue
+        scores = _rank_collusion_scores(clients)
+        a = [scores[i] for i, l in enumerate(labels) if l == "attacker"]
+        b = [scores[i] for i, l in enumerate(labels) if l != "attacker"]
+        if not a or not b:
+            continue
+        atk_scores.extend(a)
+        ben_scores.extend(b)
+        # within-round AUC (Mann-Whitney with mid-ranks)
+        wins = sum((sa > sb) + 0.5 * (sa == sb) for sa in a for sb in b)
+        per_round_auc.append(wins / (len(a) * len(b)))
+        for c, s in zip(clients, scores):
+            client_scores.setdefault((c.get("client_id"), labels[clients.index(c)]), []).append(s)
+    if not atk_scores or not ben_scores:
+        return {}
+
+    def _auc(a, b):
+        wins = sum((sa > sb) + 0.5 * (sa == sb) for sa in a for sb in b)
+        return wins / (len(a) * len(b))
+
+    pooled_auc = _auc(atk_scores, ben_scores)
+
+    # Within-round label permutation: shuffle attacker/benign labels inside each round and
+    # recompute the mean per-round AUC; p = fraction of permutations >= observed. Deterministic
+    # seed so the reported p is reproducible.
+    rng = np.random.default_rng(0)
+    obs = float(np.mean(per_round_auc))
+    n_perm, ge = 2000, 0
+    round_pack = []
+    for rnd in telemetry:
+        clients = rnd.get("clients") or []
+        labels = [c.get("label") for c in clients]
+        if "attacker" not in labels:
+            continue
+        scores = _rank_collusion_scores(clients)
+        n_atk = sum(1 for l in labels if l == "attacker")
+        if 0 < n_atk < len(scores):
+            round_pack.append((np.array(scores), n_atk))
+    for _ in range(n_perm):
+        aucs = []
+        for scores, n_atk in round_pack:
+            perm = rng.permutation(len(scores))
+            a = scores[perm[:n_atk]]
+            b = scores[perm[n_atk:]]
+            aucs.append(_auc(list(a), list(b)))
+        if np.mean(aucs) >= obs:
+            ge += 1
+    perm_p = (ge + 1) / (n_perm + 1)
+
+    # FPR calibration on benign scores only (the honest, label-light operating points).
+    ben_sorted = np.sort(ben_scores)
+    sweep = []
+    for target in fpr_targets:
+        thr = float(np.quantile(ben_sorted, 1.0 - target))
+        tpr = float(np.mean([s > thr for s in atk_scores]))
+        fpr = float(np.mean([s > thr for s in ben_scores]))
+        sweep.append({"target_fpr": target, "threshold": round(thr, 4),
+                      "attacker_tpr": round(tpr, 4), "benign_fpr": round(fpr, 4),
+                      "excess": round(tpr - fpr, 4)})
+
+    client_means = {k: float(np.mean(v)) for k, v in client_scores.items()}
+    atk_means = [m for (cid, lab), m in client_means.items() if lab == "attacker"]
+    ben_means = [m for (cid, lab), m in client_means.items() if lab != "attacker"]
+    benign_outranks = bool(ben_means and atk_means and max(ben_means) > max(atk_means))
+
+    return {
+        "auc": round(pooled_auc, 4),
+        "per_round_auc_mean": round(obs, 4),
+        "auc_permutation_p": round(perm_p, 5),
+        "n_attacker_obs": len(atk_scores),
+        "n_benign_obs": len(ben_scores),
+        "fpr_sweep": sweep,
+        "benign_outranks_attacker": benign_outranks,
+        "note": ("per-round signal significant (permutation p) but excess collapses at strict "
+                 "benign-FPR; benign_outranks_attacker flags client-level confound with data share"),
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -281,6 +456,7 @@ def format_defense_report(evaluation: Dict, vector_eval: Optional[Dict] = None) 
         "krum": lambda d: "keeps 1 (caught is structural: reject unless attacker IS the pick)",
         "multi_krum": lambda d: "attacker in discarded-f set",
         "cosine_screen": lambda d: f"flags top-f aligned (null base-rate f/n)",
+        "rank_screen": lambda d: "flags top-f collusion score (cos-rank - pairwise-rank); see analysis",
     }
     for name, d in evaluation.get("defenses", {}).items():
         note = notes.get(name, lambda d: "")(d)
