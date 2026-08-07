@@ -160,6 +160,9 @@ def default_fl_config() -> Dict:
         "cloud_sku_reported": None,
         "dump_char_cap": 20000,         # keep enough decoded text to SEE the full loop at high cap
         "num_dump_examples": 12,        # more final tau/clean samples for repetition-form inspection
+        # Keep every round's within-round attacker optimization trajectory (process data for
+        # post-mortem / "复盘"). Already-subsampled, so cheap; set False to store only the last.
+        "save_per_round_traces": True,
         # --- EXPERIMENT ARMS (all OFF by default => the headline run is unchanged) ------------
         # Defense-in-the-loop: the server actually applies a robust aggregator before updating the
         # global (turns the offline "would a defender flag it?" into "does the attack survive?").
@@ -1270,6 +1273,8 @@ def run_fl(config: Dict) -> Dict:
     stealth_trace: List[Dict] = []
     defense_telemetry: List[Dict] = []            # per-round per-client update geometry (offline defense eval)
     last_mal_trace: Optional[List[Dict]] = None   # a representative attacker trajectory (process data)
+    mal_traces: List[Dict] = []                   # per-round attacker within-round optimization trajectory
+    save_traces = bool(cfg.get("save_per_round_traces", True))
     out_dir = Path("results") / cfg["results_subdir"]
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1302,6 +1307,12 @@ def run_fl(config: Dict) -> Dict:
             atk_updates.append(delta_mal)
             atk_ids_used.append(cid)
             last_mal_trace = mtrace   # keep the most recent attacker's within-round trajectory
+            # PROCESS DATA: keep this round's trajectory so the report can show the attack FORMING
+            # over rounds, not just one representative round. mtrace is already subsampled to a
+            # handful of logged steps, so this is small; disable via save_per_round_traces=False.
+            if save_traces and mtrace:
+                mal_traces.append({"round": t, "attacker_id": cid,
+                                   "attacker_index": len(atk_updates) - 1, "trace": mtrace})
             atk_reports.append(evaluate_stealth(
                 delta_mal, ben_updates, ben_sizes, attacker_weight=atk_size,
                 d_T=cfg["d_T"], delta_T=cfg["delta_T"],
@@ -1798,7 +1809,7 @@ def run_fl(config: Dict) -> Dict:
             "batch_size", "gen_batch_size", "client_lr", "track_benign_baseline",
             "use_stealth_constraint", "stealth_envelope_quantile",
             "use_onpolicy_length", "onpolicy_free_decode", "use_fallback_surrogate",
-            "grad_checkpointing", "use_tf32",
+            "grad_checkpointing", "use_tf32", "save_per_round_traces",
             # --- experiment-arm identifiers (defense-in-the-loop / serving-side mitigation) ---
             "server_aggregator", "server_norm_clip_factor",
             "eval_repetition_penalty", "eval_no_repeat_ngram_size")},
@@ -1820,6 +1831,10 @@ def run_fl(config: Dict) -> Dict:
         # detector would consume — see _collect_defense_telemetry.
         "defense_telemetry": defense_telemetry,
         "sample_mal_trace": last_mal_trace,     # a representative within-round attacker trajectory
+        # Per-round attacker trajectories — the "how did the attack form" process record. Each
+        # entry is one round's (subsampled) within-round optimization; the report derives both a
+        # per-round endpoint table and the round-over-round convergence view from this.
+        "mal_traces": mal_traces,
         "final_examples": final_examples,       # decoded samples from the final attacked global
     }
     if resources is not None:
@@ -1837,6 +1852,19 @@ def run_fl(config: Dict) -> Dict:
         vev = evaluate_vector_defenses(vdir) if vdir.exists() else {}
         results["defense_evaluation"] = {"telemetry_defenses": ev, "vector_defenses": vev}
         print("\n" + format_defense_report(ev, vev or None))
+        # The purpose-built collusion detector's DEPLOYABILITY boundary (AUC + FPR-calibrated
+        # operating points + the client-level confound). The top-f excess alone overstates it,
+        # so the verdict card reads the calibration sweep from here.
+        from .defenses import rank_collusion_analysis
+        rca = rank_collusion_analysis(defense_telemetry)
+        if rca:
+            results["rank_collusion_analysis"] = rca
+            sweep = " · ".join(f"@FPR{s['target_fpr']:.2f} excess {s['excess']:+.3f}"
+                               for s in rca["fpr_sweep"])
+            print(f"  rank-collusion detector: AUC={rca['auc']} (perm p={rca['auc_permutation_p']}) "
+                  f"| {sweep}"
+                  + ("  | NOTE a benign client outranks both attackers"
+                     if rca.get("benign_outranks_attacker") else ""))
     results["objective_summary"] = _build_objective_summary(results)
     objective_path = out_dir / "objective_summary.json"
     objective_path.write_text(
@@ -1891,7 +1919,9 @@ def run_fl_seeds(config: Dict, seeds: List[int]) -> Dict:
     runtime by len(seeds), so it does not change the default single-run behaviour."""
 
     base_subdir = config.get("results_subdir", "tcaa_fl")
-    runs: List[Dict] = []
+    # (seed, result) pairs, not two parallel lists: a failed seed would otherwise shift the
+    # alignment and attribute every later run's topology/metrics to the wrong seed.
+    completed: List[Tuple[int, Dict]] = []
     failures: List[Dict] = []
     for si, seed in enumerate(seeds):
         cfg = dict(config)
@@ -1899,17 +1929,18 @@ def run_fl_seeds(config: Dict, seeds: List[int]) -> Dict:
         cfg["results_subdir"] = f"{base_subdir}/seed_{seed}"
         print(f"\n########## FL SEED {si + 1}/{len(seeds)}  (seed={seed}) ##########")
         try:
-            runs.append(run_fl(cfg))
+            completed.append((seed, run_fl(cfg)))
         except Exception as exc:  # a late OOM/timeout on seed k must not lose seeds 0..k-1
             print(f"  [!] seed {seed} FAILED: {type(exc).__name__}: {exc}")
             failures.append({"seed": seed, "error": f"{type(exc).__name__}: {exc}"})
-    if not runs:
+    if not completed:
         raise RuntimeError("run_fl_seeds: every seed failed; no summary to write")
+    runs: List[Dict] = [r for _, r in completed]
 
     # TOPOLOGY HOMOGENEITY: the seed redraws the Dirichlet split, so different seeds can run with
     # different effective federation sizes (an under-floor shard is skipped). Averaging defense
     # rows across seeds that faced different n is not meaningful, so surface it rather than hide it.
-    shard_profiles = [(s, r.get("shard_profile") or {}) for s, r in zip(seeds, [r for r in runs])]
+    shard_profiles = [(s, r.get("shard_profile") or {}) for s, r in completed]
     empty_counts = {s: prof.get("empty_shards") for s, prof in shard_profiles}
     homogeneous = len({tuple(sorted((prof.get("sizes") or []))) for _, prof in shard_profiles}) <= 1
     any_empty = any(bool(v) for v in empty_counts.values())
@@ -1985,7 +2016,8 @@ def run_fl_seeds(config: Dict, seeds: List[int]) -> Dict:
         return {"mean": round(m, 4), "std": round(s, 4), "values": [round(x, 4) for x in vals]}
 
     summary = {
-        "seeds": list(seeds),
+        "seeds": list(seeds),                       # requested
+        "seeds_completed": [s for s, _ in completed],  # actually aggregated (may be a subset)
         "run_ids": [r.get("run_id") for r in runs],
         "n_completed": len(runs),
         "failures": failures,

@@ -817,10 +817,21 @@ def fig_fl_defense_evasion(r: Dict):
 
     for yi, (nm, d) in zip(y, comparable):
         e = float(d["excess_detection"])
-        detectable = e > band
+        # "Detectable" requires SIGNIFICANCE when a CI is available: a point estimate past the
+        # band whose CI straddles zero is noise. Purpose-built detectors (ours) are hatched so a
+        # reader never mistakes them for an off-the-shelf defense the attack failed to evade.
+        sig = d.get("excess_significant")
+        detectable = (bool(sig) and e > 0) if sig is not None else (e > band)
         col = C_ATK if detectable else C_OK
         ax.barh(yi, e, height=0.56, color=col, alpha=0.92, zorder=2,
-                edgecolor="white", linewidth=1.0)
+                edgecolor="white", linewidth=1.0,
+                hatch="///" if d.get("purpose_built") else None)
+        ci = d.get("excess_ci95")
+        if ci:  # 95% CI whiskers make "is this distinguishable from zero?" visible
+            ax.plot([ci[0], ci[1]], [yi, yi], color=INK, lw=1.4, zorder=4,
+                    solid_capstyle="butt", alpha=0.75)
+            for xb in ci:
+                ax.plot([xb, xb], [yi - 0.11, yi + 0.11], color=INK, lw=1.4, zorder=4, alpha=0.75)
         # value label just past the bar end, on the correct side
         off = 0.012 if e >= 0 else -0.012
         ax.annotate(f"{e:+.2f}", (e + off, yi), va="center",
@@ -848,12 +859,22 @@ def fig_fl_defense_evasion(r: Dict):
                 color=C_ATK, fontstyle="italic", annotation_clip=False,
                 xytext=(6, 0), textcoords="offset points")
 
-    all_stealthy = all(e <= band for e in excess)
-    verdict = ("indistinguishable from a benign client" if all_stealthy
-               else "detectable by at least one defense")
-    ax.set_title("Defense evasion (C3): attacker is "
-                 f"{verdict}\nrobust aggregators replayed offline on FedAvg telemetry",
-                 fontsize=12.5)
+    # The verdict is about STANDARD defenses only; a purpose-built detector catching the attack
+    # is a boundary result, not a failure to evade (and is hatched in the bars above).
+    def _sig_detect(d):
+        e = float(d.get("excess_detection") or 0)
+        s = d.get("excess_significant")
+        return (bool(s) and e > 0) if s is not None else (e > band)
+
+    std_pairs = [(n, d) for n, d in comparable if not d.get("purpose_built")]
+    built_pairs = [(n, d) for n, d in comparable if d.get("purpose_built")]
+    std_stealthy = bool(std_pairs) and not any(_sig_detect(d) for _, d in std_pairs)
+    verdict = ("indistinguishable from a benign client under standard defenses"
+               if std_stealthy else "significantly detectable by a standard defense")
+    sub = "robust aggregators replayed offline on FedAvg telemetry"
+    if built_pairs:
+        sub += "  ·  hatched = purpose-built detector (ours), not an off-the-shelf defense"
+    ax.set_title(f"Defense evasion (C3): attacker is {verdict}\n{sub}", fontsize=12.5)
 
     # Krum + vector-defense caption (structural / optimistic notes live here, not in the bars)
     notes = []
@@ -1717,9 +1738,28 @@ def _defense_digest_lines(fl: Optional[Dict]) -> List[str]:
         # Krum keeps 1 => its excess is range-compressed & noise-dominated; mark structural, do
         # not print it on the same numeric scale as the fixed-f defenses (read Krum by caught).
         excess = "struct*" if d.get("excess_structural") else _f(d.get('excess_detection'), '>7.2f')
+        ci = d.get("excess_ci95")
+        # 95% CI + significance: an excess past 0.10 whose CI straddles zero is noise, and at
+        # 10 rounds the smallest resolvable excess is ~0.25 — so the CI is load-bearing here.
+        ci_s = (f" CI[{ci[0]:+.2f},{ci[1]:+.2f}]"
+                f"{' sig' if d.get('excess_significant') else ' ns'}") if ci else ""
+        tag = " [purpose-built]" if d.get("purpose_built") else ""
         p(f"      {name:<13} {_f(d.get('caught_rate'),'>7.2f')} {_f(d.get('atk_flag_rate'),'>8.2f')} "
           f"{_f(d.get('ben_flag_rate'),'>8.2f')} {excess:>7} "
-          f"{_f(d.get('rounds'),'>5')}")
+          f"{_f(d.get('rounds'),'>5')}{ci_s}{tag}")
+        if d.get("mean_atk_clip_factor") is not None:
+            p(f"        ^ attacker update attenuated to {_f(d['mean_atk_clip_factor'])}x its norm "
+              f"(clipping RESCALES, it does not reject: flagged != defeated)")
+    rca = (fl or {}).get("rank_collusion_analysis") or {}
+    if rca.get("fpr_sweep"):
+        p(f"      rank-collusion detector boundary: AUC={_f(rca.get('auc'))} "
+          f"(within-round permutation p={rca.get('auc_permutation_p')})")
+        p("        calibrated: " + " · ".join(
+            f"@benign-FPR {s['target_fpr']:.2f} -> excess {s['excess']:+.3f} (TPR {s['attacker_tpr']:.2f})"
+            for s in rca["fpr_sweep"]))
+        if rca.get("benign_outranks_attacker"):
+            p("        CONFOUND: a benign client's mean score outranks both attackers "
+              "(the signal tracks data share as well as collusion)")
     vec = (de.get("vector_defenses") or {})
     ft, tm = vec.get("fltrust"), vec.get("trimmed_mean")
     if ft:
@@ -2161,22 +2201,61 @@ def _key_summary_lines(phase0: Optional[Dict] = None, fl: Optional[Dict] = None,
     # ---- C3 ANTI-DETECTION (STAR) ----
     de = (((fl.get("defense_evaluation") or {}).get("telemetry_defenses") or {}).get("defenses") or {})
     comp = {n: d for n, d in de.items() if not d.get("excess_structural")}
+    # STANDARD (off-the-shelf) vs PURPOSE-BUILT (designed against this attack). Only the first
+    # supports a stealth claim; conflating them would let our own detector veto the C3 verdict.
+    std = {n: d for n, d in comp.items() if not d.get("purpose_built")}
+    built = {n: d for n, d in comp.items() if d.get("purpose_built")}
     st = [s for s in fl.get("stealth_trace", []) if s.get("n_attackers")]
     stok = sum(1 for s in st if s.get("jointly_satisfied"))
-    c3_ok = bool(comp) and all((d.get("excess_detection") or 0) <= 0.10 for d in comp.values())
+
+    def _detects(d):
+        """Detected only if the excess is SIGNIFICANT (95% CI excludes 0) and positive — a point
+        estimate above 0.10 with a CI straddling zero is noise, not detection."""
+        e = d.get("excess_detection") or 0
+        if d.get("excess_significant") is not None:
+            return bool(d["excess_significant"]) and e > 0
+        return e > 0.10   # older runs without CIs: fall back to the point-estimate threshold
+
+    c3_ok = bool(std) and not any(_detects(d) for d in std.values())
     p("")
     p("  C3 ANTI-DETECTION ★ — update indistinguishable from benign")
     if comp:
-        ordered = sorted(comp.items(), key=lambda kv: kv[1].get("excess_detection", 0))
-        p("     excess (atk−benign flag-rate): "
-          + " · ".join(f"{n.replace('_', '-')} {_f(d.get('excess_detection'), '+.2f')}"
-                       for n, d in ordered) + "   (≈0/neg = stealthy)")
+        def _row(n, d):
+            e = _f(d.get("excess_detection"), "+.2f")
+            ci = d.get("excess_ci95")
+            sig = "" if d.get("excess_significant") is None else (
+                " sig" if d.get("excess_significant") else " ns")
+            return f"{n.replace('_', '-')} {e}" + (f" CI[{ci[0]:+.2f},{ci[1]:+.2f}]{sig}" if ci else "")
+        if std:
+            ordered = sorted(std.items(), key=lambda kv: kv[1].get("excess_detection", 0))
+            p("     STANDARD defenses — excess (atk−benign flag-rate), ≈0/neg or ns = stealthy:")
+            for n, d in ordered:
+                p(f"       {_row(n, d)}")
+        nc = de.get("norm_clip") or {}
+        if nc.get("mean_atk_clip_factor") is not None:
+            p(f"       norm-clip attenuates the attacker update to "
+              f"{_f(nc['mean_atk_clip_factor'])}x its norm (flagged != defeated)")
         krum = de.get("krum")
         p(f"     krum caught {_f(krum.get('caught_rate') if krum else None)} (structural) · "
           f"param-stealth joint {stok}/{len(st)} rounds")
+        if built:
+            p("     PURPOSE-BUILT detector (ours, designed against this attack's collusion):")
+            for n, d in sorted(built.items()):
+                p(f"       {_row(n, d)}")
+            rc = fl.get("rank_collusion_analysis") or {}
+            if rc.get("fpr_sweep"):
+                sweep = " · ".join(f"@FPR{s['target_fpr']:.2f} {s['excess']:+.2f}"
+                                   for s in rc["fpr_sweep"])
+                p(f"       calibrated operating points: {sweep}"
+                  + ("  · a benign client outranks both attackers"
+                     if rc.get("benign_outranks_attacker") else ""))
     else:
         p("     (no defense_evaluation — set run_defense_eval=True)")
-    p(f"     => {'PASS: indistinguishable from benign under standard defenses' if c3_ok else 'WATCH: detectable (excess>0.1) by some defense'}")
+    verdict = ("PASS: indistinguishable from benign under STANDARD defenses"
+               if c3_ok else "WATCH: significantly detectable by a standard defense")
+    if c3_ok and built:
+        verdict += "; caught only by our purpose-built collusion screen (see boundary above)"
+    p(f"     => {verdict}")
 
     # ---- C4 DURABILITY ----
     vsp0 = f0.get("amp_tau_vs_pristine")
@@ -2266,7 +2345,53 @@ def full_report(phase0: Optional[Dict] = None, fl: Optional[Dict] = None,
     p("")
     L.extend(_digest_lines(phase0, fl, pareto))
 
-    # ---- 3) B: full per-round stealth trace (process over rounds) ----
+    # ---- 3) B: UNIFIED PER-ROUND PROCESS TIMELINE (the postmortem / 复盘 view) ----
+    # One row per round, merging what is known EVERY round (stealth) with what is measured only
+    # on measurement rounds (amp / repetition / utility). Blank measurement cells mark rounds
+    # that were not measured, so a sparse measure_every is visible rather than silently skipped.
+    if fl and (fl.get("stealth_trace") or fl.get("durability")):
+        dur_by_round = {d.get("round"): d for d in (fl.get("durability") or [])}
+        st_by_round = {s.get("round"): s for s in (fl.get("stealth_trace") or [])}
+        rounds = sorted(set(dur_by_round) | set(st_by_round))
+        if rounds:
+            p("")
+            p("[B · PER-ROUND PROCESS TIMELINE]  (blank amp/rep/eff/ppl = round not measured)")
+            p("    rnd | stealth: dist/d_T  margin  cos/pair  joint | measured: amp_eff amp_pri  rep  eff_len  ppl_pri  Rcln")
+            for rd in rounds:
+                s = st_by_round.get(rd, {})
+                d = dur_by_round.get(rd)
+                margin = (None if s.get("d_T") is None or s.get("attacker_distance") is None
+                          else s["d_T"] - s["attacker_distance"])
+                stealth = (f"{_f(s.get('attacker_distance'),'.2f')}/{_f(s.get('d_T'),'.2f')} "
+                           f"{_f(margin,'+.2f')}  {_f(s.get('attacker_cosine'),'.2f')}/"
+                           f"{_f(s.get('pairwise_cosine'),'.2f')}  "
+                           f"{'Y' if s.get('jointly_satisfied') else ('N' if s.get('n_attackers') else '-')}")
+                if d:
+                    meas = (f"{_f(d.get('amp_tau_effective'),'>6.2f')} {_f(d.get('amp_tau_vs_pristine'),'>6.2f')}  "
+                            f"{_f(d.get('repetition_tau'),'.2f')}  {_f(d.get('tau_effective_len_atk'),'>6.1f')}  "
+                            f"{_f(d.get('ppl_ratio_vs_pristine'),'.3f')}  {_f(d.get('rouge_recall_clean_atk'),'.2f')}")
+                else:
+                    meas = "(not measured)"
+                p(f"    r{_f(rd):>3} | {stealth} | {meas}")
+
+    # ---- 3b) B: ROUND-OVER-ROUND ATTACKER CONVERGENCE (how the attack formed) ----
+    # The END of each round's within-round optimization: does E[L] pin at the horizon? does q_eos
+    # collapse? how much stealth margin was left? Reading these down the rounds shows the attack
+    # forming (vs the within-round trace below, which is one round's step-by-step dynamics).
+    mts = (fl or {}).get("mal_traces") or []
+    if mts:
+        p("")
+        p("[B · ROUND-OVER-ROUND ATTACKER ENDPOINTS]  round | E[L]_tau q_eos rep | dist(g_dist) cos norm  (final optimization step)")
+        for m in mts:
+            tr = m.get("trace") or []
+            if not tr:
+                continue
+            e = tr[-1]  # final logged step of this round's attacker optimization
+            p(f"    r{_f(m.get('round')):>3} | E[L]={_f(e.get('E_len_tau'),'>6.1f')} q={_f(e.get('mean_eos_prob_tau'))} "
+              f"rep={_f(e.get('rep_term'),'.2f')} | dist={_f(e.get('dist'),'.3f')}"
+              f"(g={_f(e.get('g_dist'),'+.3f')}) cos={_f(e.get('cos'),'.3f')} norm={_f(e.get('norm'),'.3f')}")
+
+    # ---- 3c) B: full per-round stealth trace (process over rounds) ----
     if fl and fl.get("stealth_trace"):
         st = [s for s in fl["stealth_trace"] if s.get("n_attackers")]
         if st:
@@ -2277,11 +2402,13 @@ def full_report(phase0: Optional[Dict] = None, fl: Optional[Dict] = None,
                   f"{s.get('cosine_metric','?')} cos={_f(s.get('attacker_cosine'),'.3f')}/pair={_f(s.get('pairwise_cosine'),'.3f')} | "
                   f"{s.get('jointly_satisfied')}")
 
-    # ---- 4) representative attacker trajectory (within-round optimization dynamics) ----
-    trace = (fl or {}).get("sample_mal_trace") or (phase0 or {}).get("mal_trace")
-    if trace:
+    # ---- 4) within-round attacker trajectory (step-by-step optimization dynamics) ----
+    # Show the FIRST and LAST attacker-participating rounds when per-round traces exist, so the
+    # within-round dynamics can be compared early vs late; fall back to the single representative
+    # trace for older runs / phase0.
+    def _emit_trace(trace, label):
         p("")
-        p("[ATTACKER TRAJECTORY · 一段代表性单轮内优化] step | L_mal ce_tau ce_clean kd rep E[L]_tau q_eos | dist(g) cos(g)")
+        p(f"[ATTACKER TRAJECTORY · {label}] step | L_mal ce_tau ce_clean kd rep E[L]_tau q_eos | dist(g) cos(g)")
         for r in trace:
             base = (f"    s{_f(r.get('step')):>4} | L={_f(r.get('L_mal'),'.2f')} ce_t={_f(r.get('ce_tau'),'.2f')} "
                     f"ce_c={_f(r.get('ce_clean'),'.2f')} kd={_f(r.get('kd_clean'))} rep={_f(r.get('rep_term'))} "
@@ -2289,6 +2416,15 @@ def full_report(phase0: Optional[Dict] = None, fl: Optional[Dict] = None,
             if r.get("dist") is not None:
                 base += f" | dist={_f(r.get('dist'),'.3f')}(g={_f(r.get('g_dist'),'+.3f')}) cos={_f(r.get('cos'),'.3f')}(g={_f(r.get('g_sim'),'+.3f')})"
             p(base)
+
+    mts = (fl or {}).get("mal_traces") or []
+    if len(mts) >= 2:
+        _emit_trace(mts[0].get("trace") or [], f"最早轮 r{mts[0].get('round')}")
+        _emit_trace(mts[-1].get("trace") or [], f"最末轮 r{mts[-1].get('round')}")
+    else:
+        trace = (fl or {}).get("sample_mal_trace") or (phase0 or {}).get("mal_trace")
+        if trace:
+            _emit_trace(trace, "一段代表性单轮内优化")
 
     # ---- 5) decoded qualitative samples (coherent long vs degenerate loop?) ----
     ex = (fl or {}).get("final_examples") or (phase0 or {}).get("final_examples")

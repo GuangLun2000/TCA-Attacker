@@ -41,6 +41,12 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 
+# Defenses designed against THIS attack rather than taken off the shelf. Kept as data (not a
+# hardcoded name in the reporting layer) so figures/verdicts can separate "evades the standard
+# defenses" from "is caught by a detector purpose-built for it" without knowing defense names.
+_PURPOSE_BUILT = frozenset({"rank_screen"})
+
+
 def _median(xs: List[float]) -> float:
     s = sorted(xs)
     n = len(s)
@@ -239,6 +245,12 @@ def evaluate_defenses(telemetry: List[Dict], *, num_attackers: Optional[int] = N
             # comparable to the fixed-f defenses (cosine_screen / multi_krum, excess in [-1,1]).
             # Read Krum by caught_rate/survival only; the report/digest mark its excess as structural.
             "excess_structural": (name == "krum"),
+            # PURPOSE-BUILT vs STANDARD. norm_clip / krum / multi_krum / cosine_screen are
+            # published aggregators an off-the-shelf defender would deploy; rank_screen was
+            # designed against THIS attack's collusion mechanism. Reporting must not average the
+            # two — "evades standard defenses" and "is caught by a detector built for it" are
+            # different claims, and only the first is a stealth result.
+            "purpose_built": (name in _PURPOSE_BUILT),
             "mean_suspicion": round(sum(x["suspicion"] for x in rows) / len(rows), 4),
             "rounds": len(rows),                          # attacker-present rounds this defense ran on
         }
