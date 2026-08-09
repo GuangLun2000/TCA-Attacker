@@ -7,7 +7,8 @@ import numpy as np
 import pytest
 import torch
 
-from tcaa.fl_runner import _aggregate, _fedavg, _validate_fl_config, default_fl_config
+from tcaa.fl_runner import (_aggregate, _fedavg, _validate_fl_config, default_fl_config,
+                            partition_health)
 from tcaa.gen_data import partition_examples
 
 
@@ -105,6 +106,43 @@ def test_min_shard_holds_across_seeds_and_scales():
             assert min(len(s) for s in sh) >= 8
             assert sum(len(s) for s in sh) == len(ex)
     print("[ok] floor holds across 25 seeds x {8,18,28} clients, mass preserved")
+
+
+# --------------------------------------------------------------------------- #
+# partition health (credibility gate)
+# --------------------------------------------------------------------------- #
+def test_partition_health_flags_the_degenerate_run_and_passes_healthy_ones():
+    # The 20260807 run's realised split: one client holds 55%, one does 2 grad steps/round.
+    deg = partition_health([88, 77, 827, 26, 248, 200, 8, 26], batch_size=8, local_epochs=2)
+    assert deg["effective_clients"] < 3.0, deg          # nominal 8, actually ~2.8
+    assert deg["max_share"] > 0.5, deg
+    assert deg["min_grad_steps_per_round"] == 2, deg    # ceil(8/8)*2
+    # A near-IID split (alpha=100) is healthy on the same seed.
+    heal = partition_health([191, 201, 169, 174, 196, 207, 172, 190], batch_size=8, local_epochs=2)
+    assert heal["effective_clients"] > 7.5, heal
+    assert heal["max_share"] < 0.2, heal
+    assert heal["min_grad_steps_per_round"] >= 40, heal
+    print("[ok] partition_health separates the degenerate run from a near-IID split")
+
+
+def test_min_effective_clients_gate_rejects_before_the_run():
+    # A gate above the realised effective-client count must raise a clear error PRE-flight.
+    # We drive it through _validate-adjacent logic by calling partition_health directly (the
+    # run_fl gate is a thin `if health < min_eff: raise`), so this stays torch-light and fast.
+    h = partition_health([88, 77, 827, 26, 248, 200, 8, 26], batch_size=8, local_epochs=2)
+    min_eff = 4.0
+    assert h["effective_clients"] < min_eff, "gate would not fire on the known-degenerate split"
+    # ...and a healthy split clears the same gate.
+    h2 = partition_health([123, 105, 202, 25, 252, 373, 172, 248], batch_size=8, local_epochs=2)
+    assert h2["effective_clients"] >= min_eff, h2
+    print("[ok] min_effective_clients gate fires on degenerate, clears on healthy")
+
+
+def test_partition_health_default_is_off_and_backward_compatible():
+    # The gate is opt-in: the default config must not carry a positive threshold, so existing
+    # runs are never rejected by it.
+    assert float(default_fl_config().get("min_effective_clients", 0) or 0) == 0.0
+    print("[ok] min_effective_clients defaults to 0 (gate off) — backward compatible")
 
 
 # --------------------------------------------------------------------------- #

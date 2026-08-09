@@ -83,6 +83,12 @@ def default_fl_config() -> Dict:
         # That is what happened in the 20260805 run: n=7 in 7 of 10 rounds. 8 = one training
         # batch, the smallest shard that can actually contribute a gradient step.
         "min_client_shard": 8,
+        # Pre-flight credibility gate on the REALISED partition (see partition_health / run_fl).
+        # 0 = off (record + warn only). Set > 0 to REFUSE to start a run whose effective client
+        # count (1/sum p_i^2) is below it — a single-seed Dirichlet draw at alpha=0.3 / 8 clients
+        # collapses to ~2.8 effective clients on ~half of seeds, and every norm/Krum screen then
+        # measures data share, not stealth. The observation arms set this to ~4.0.
+        "min_effective_clients": 0,
         "track_benign_baseline": True,             # run a parallel benign-only global for C_ben
         "measure_every": 5,                        # measure cost/utility/stealth every K rounds
         # Generation cap for MEASUREMENT ONLY (does not affect the attack, which trains EOS
@@ -280,6 +286,38 @@ def _validate_fl_config(cfg: Dict) -> None:
     splits = cfg.get("resource_profile_splits", ["tau"])
     if not isinstance(splits, (list, tuple)) or not splits or not set(splits) <= {"tau", "clean"}:
         raise ValueError("resource_profile_splits must contain only 'tau' and/or 'clean'")
+
+
+def partition_health(sizes: List[int], *, batch_size: int, local_epochs: int) -> Dict:
+    """Diagnose whether a data partition is analysable, or a degenerate single-seed draw.
+
+    A Dirichlet quantity-skew split over few clients is a LOTTERY: at alpha=0.3 with 8 clients one
+    client holds >50% of the data on ~49% of seeds, and every norm/Krum defense screen then tracks
+    data share rather than attack stealth (measured Spearman rho ~0.95 on the 20260807 telemetry).
+    Analysing such a run conflates imbalance with the result. This returns the three numbers that
+    decide it, so a run can be gated / flagged BEFORE 2-3 GPU hours are spent on an uninterpretable
+    federation.
+
+      effective_clients   1 / sum(p_i^2) (inverse Simpson): the number of clients that actually
+                          carry weight. 8 nominal clients with shares [.55,.17,.13,...] are ~2.8
+                          effective. Rule of thumb: want >= ~0.6 * n_clients.
+      max_share           the largest client's fraction of the pool. > ~0.35 means one client
+                          dominates the aggregate (and sets its own benign envelope).
+      min_grad_steps      the smallest client's gradient steps per round (ceil(shard/bs)*epochs).
+                          A client doing 1-2 steps is noise, not a participant, and pollutes the
+                          benign false-positive baseline the defenses null against.
+    """
+    n = len(sizes)
+    tot = float(sum(sizes)) or 1.0
+    p = [s / tot for s in sizes]
+    eff = 1.0 / sum(x * x for x in p) if any(p) else 0.0
+    min_steps = min((max(1, -(-s // max(1, batch_size))) * max(1, local_epochs)) for s in sizes) if sizes else 0
+    return {
+        "effective_clients": round(eff, 2),
+        "max_share": round(max(p) if p else 0.0, 4),
+        "min_grad_steps_per_round": int(min_steps),
+        "n_clients": n,
+    }
 
 
 def _fedavg(updates: List[torch.Tensor], weights: List[float]) -> torch.Tensor:
@@ -520,12 +558,24 @@ def _build_objective_summary(results: Dict) -> Dict:
             "distinct_ratio": final.get("distinct_ratio_tau"),
         },
         "utility_final": {
+            # BOTH controls, explicitly named. vs-pristine compares against the UNTRAINED round-0
+            # model, so it charges ordinary benign federated drift to the attacker; the benign-only
+            # arm is the attacker's actual counterfactual. A consumer that reads only the pristine
+            # row will systematically over-state clean-utility damage.
             "ppl_ratio_vs_pristine": final.get("ppl_ratio_vs_pristine"),
+            "ppl_ratio_vs_benign_fl": final.get("ppl_ratio"),
             "rouge_recall_clean": final.get("rouge_recall_clean_atk"),
+            "rouge_recall_clean_benign_fl": final.get("rouge_recall_clean_ben"),
+            "rouge_recall_clean_pristine": final.get("rouge_recall_clean_pristine"),
             "rouge_recall_tau": final.get("rouge_recall_tau_atk"),
             # length-robust "answer kept, not padded" signal (recall inflates with length)
             "rouge_f1_clean": final.get("rouge_f1_clean_atk"),
             "rouge_f1_tau": final.get("rouge_f1_tau_atk"),
+            # LINEAR length ratio vs the benign arm. The C2 "was clean shortened?" question may be
+            # answered ONLY from this; amp_clean is a QUADRATIC cost ratio and is carried under its
+            # own name so the two can never be confused.
+            "clean_len_ratio_vs_benign_fl": final.get("amp_clean_len"),
+            "clean_cost_ratio_vs_benign_fl_quadratic": final.get("amp_clean"),
         },
         "parameter_stealth": {
             "joint_passes": stealth_passes,
@@ -541,6 +591,19 @@ def _build_objective_summary(results: Dict) -> Dict:
                 "atk_flag_rate": values.get("atk_flag_rate"),
                 "ben_flag_rate": values.get("ben_flag_rate"),
                 "excess_detection": values.get("excess_detection"),
+                # A bare excess reads as detection even when it is pure noise, so the significance
+                # travels WITH it into the machine-readable summary. `significant` is decided by
+                # the client-level permutation when available (attacker identity is a per-client
+                # property held fixed across rounds); `p_within_round` is the weaker per-round null.
+                "excess_significant": values.get("excess_significant"),
+                "excess_p_cluster": values.get("excess_p_cluster"),
+                "excess_p_within_round": values.get("excess_p_within_round"),
+                "excess_significance_method": values.get("excess_significance_method"),
+                # Krum keeps 1 update, so its excess is range-compressed and NOT comparable to the
+                # fixed-f rows; purpose_built marks detectors designed against this attack, which
+                # do not support a "standard defenses miss it" claim.
+                "excess_structural": values.get("excess_structural"),
+                "purpose_built": values.get("purpose_built"),
                 "rounds": values.get("rounds"),
             }
             for name, values in defense_rows.items()
@@ -549,9 +612,15 @@ def _build_objective_summary(results: Dict) -> Dict:
         "note": (
             "No composite score is formed: consumption gain, output quality, parameter "
             "stealth, and named-defense evasion must all be inspected together. Read "
-            "defense_evasion by excess_detection (atk_flag_rate - ben_flag_rate), not caught_rate "
-            "alone: caught_rate is confounded by each defense's base flag rate (cosine-screen "
-            "flags f/n of random clients; Krum rejects all but one)."
+            "defense_evasion by excess_detection (atk_flag_rate - ben_flag_rate) TOGETHER WITH "
+            "excess_significant, never caught_rate alone: caught_rate is confounded by each "
+            "defense's base flag rate (cosine-screen flags f/n of random clients; Krum rejects "
+            "all but one), and a positive excess whose permutation p is large is noise. Skip rows "
+            "with excess_structural=true when comparing magnitudes, and do not cite "
+            "purpose_built=true rows as evidence that standard defenses detect the attack. "
+            "utility_final carries BOTH the pristine and benign-FL controls: the benign-FL arm is "
+            "the attacker's counterfactual, and clean shortening may be read only from "
+            "clean_len_ratio_vs_benign_fl (linear), never from the quadratic cost ratio."
         ),
     }
 
@@ -1218,12 +1287,37 @@ def run_fl(config: Dict) -> Dict:
     # under-floor shard silently changes the effective federation size (see the min_client_shard
     # note in default_fl_config). Record it so a multi-seed roll-up can verify every seed ran the
     # same topology instead of averaging runs with different n.
+    _health = partition_health([len(s) for s in shards],
+                               batch_size=int(cfg.get("batch_size", 8)),
+                               local_epochs=int(cfg.get("local_epochs", 1)))
     shard_profile = {
         "sizes": [len(s) for s in shards],
         "min_client_shard": int(cfg.get("min_client_shard", 0)),
         "dirichlet_alpha": cfg["dirichlet_alpha"],
         "empty_shards": sum(1 for s in shards if not s),
+        **_health,
     }
+    # PRE-FLIGHT CREDIBILITY GATE. Fail fast — before the pristine measurement and the whole
+    # round loop — if this seed drew a federation too degenerate to analyse. Off by default
+    # (min_effective_clients=0) so existing configs are unchanged; the notebook's observation arms
+    # set it. The check is on the REALISED split, so it catches a bad Dirichlet draw that the
+    # nominal (alpha, n_clients) does not reveal.
+    min_eff = float(cfg.get("min_effective_clients", 0) or 0)
+    if min_eff > 0 and _health["effective_clients"] < min_eff:
+        raise ValueError(
+            f"partition too degenerate to analyse: effective_clients={_health['effective_clients']} "
+            f"< min_effective_clients={min_eff} (max client holds {_health['max_share']:.0%}, "
+            f"smallest does {_health['min_grad_steps_per_round']} grad steps/round). This is a "
+            f"single-seed Dirichlet lottery — raise dirichlet_alpha (1.0 gives ~4.8 eff clients at "
+            f"n=8; 100.0 is near-IID), raise num_clients, or pick another seed. Realised sizes: "
+            f"{shard_profile['sizes']}"
+        )
+    _hv = ("OK" if (_health["effective_clients"] >= 0.55 * num_benign
+                    and _health["max_share"] <= 0.35 and _health["min_grad_steps_per_round"] >= 4)
+           else "DEGENERATE — one seed's draw dominates; results conflate imbalance with the attack")
+    print(f"  partition health: effective_clients={_health['effective_clients']}/{num_benign} "
+          f"· max_share={_health['max_share']:.0%} · min_grad_steps/round="
+          f"{_health['min_grad_steps_per_round']}  => {_hv}")
     atk_size = cfg["attacker_claimed_data_size"] or float(np.mean(shard_sizes))
     track_ben = bool(cfg.get("track_benign_baseline", True))
     rng = random.Random(cfg["seed"] + 12345)
@@ -1431,7 +1525,20 @@ def run_fl(config: Dict) -> Dict:
                 "amp_tau_calibrated": round(amp_tau_calib, 4) if amp_tau_calib is not None else None,
                 "amp_tau_vs_pristine_calibrated": round(amp_tau_pri_calib, 4) if amp_tau_pri_calib is not None else None,
                 "cost_c_f_calibrated": (calib["c_f"] if calib else None),
+                # amp_clean is a ratio of mean analytic COST, which carries the quadratic term —
+                # a 9% length change shows up here as an 18% cost change. Any verdict phrased as
+                # "clean was shortened by X%" must use amp_clean_len (LINEAR) instead; grading a
+                # quadratic ratio against a length-shaped window is the unit bug that produced the
+                # spurious "clean over-shortened" flag on the 20260807 run (cost 0.8232 vs the
+                # actual length ratio 0.9079).
                 "amp_clean": round(amp_clean, 4),
+                "amp_clean_len": round(amplification_ratio(
+                    atk_cln.mean_output_len,
+                    (ben_cln.mean_output_len if track_ben else atk_cln.mean_output_len)), 4),
+                "amp_clean_effective_len": round(amplification_ratio(
+                    atk_cln.mean_effective_len,
+                    (ben_cln.mean_effective_len if track_ben else atk_cln.mean_effective_len)), 4),
+                "clean_len_ben": (round(ben_cln.mean_output_len, 2) if track_ben else None),
                 "selectivity": round(amplification_ratio(amp_tau, amp_clean), 4),
                 "kv_amp_tau": round(kv_amp, 4),
                 "tau_len_atk": round(atk_tau.mean_output_len, 2),
@@ -1456,6 +1563,16 @@ def run_fl(config: Dict) -> Dict:
                 "ppl_ratio_vs_pristine": ppl_ratio_pri,     # atk / pristine (fixed, primary)
                 "rouge_recall_clean_atk": round(atk_cln.mean_rouge_recall, 4),
                 "rouge_recall_clean_pristine": pristine_ref["rouge_recall_clean"],
+                # THE CORRECT C2 CONTROL. pristine is the UNTRAINED round-0 model, so a clean-quality
+                # gap measured against it is dominated by ordinary federated drift, not by the
+                # attacker: on the 20260807 run benign FedAvg alone moved clean ROUGE-recall
+                # 0.3832 -> 0.3232 (-15.7pp) while the attacker added -1.1pp. Any clean-utility
+                # verdict MUST divide by the benign-only arm, which ran the same rounds with the
+                # same benign selection and the attackers removed.
+                "rouge_recall_clean_ben": (round(ben_cln.mean_rouge_recall, 4) if track_ben else None),
+                "rouge_f1_clean_ben": (round(ben_cln.mean_rouge_f1, 4) if track_ben else None),
+                "rouge_recall_tau_ben": (round(ben_tau.mean_rouge_recall, 4) if track_ben else None),
+                "rouge_f1_tau_ben": (round(ben_tau.mean_rouge_f1, 4) if track_ben else None),
                 "rouge_recall_tau_atk": round(atk_tau.mean_rouge_recall, 4),
                 "rouge_recall_tau_pristine": pristine_ref["rouge_recall_tau"],
                 # ROUGE-L F1: the LENGTH-ROBUST "answer kept AND not padded" signal. Unlike
@@ -1792,7 +1909,13 @@ def run_fl(config: Dict) -> Dict:
             "clean_anchor_two_sided",
             "gamma_rep", "no_repeat_ngram_size", "onpolicy_horizon",
             "stealth_kappa", "stealth_use_pairwise_cosine", "stealth_cosine_two_sided",
-            "stealth_cos_low", "stealth_norm_constraint", "gamma_coord", "report_calibrated_cost",
+            "stealth_cos_low", "stealth_norm_constraint",
+            # Partition credibility: the gate threshold and the attacker's claimed data weight.
+            "min_effective_clients", "attacker_claimed_data_size",
+            # Which threshold the final distance projection targets — changes whether the returned
+            # update provably meets evaluate_stealth's screen, so it must be in the provenance.
+            "stealth_screen_reference", "final_project_distance",
+            "gamma_coord", "report_calibrated_cost",
             "collect_defense_telemetry", "save_update_vectors", "run_defense_eval",
             "pool_size", "eval_size", "max_new_tokens", "decensor_max_extra", "lora_r",
             "generation_hard_token_cap", "generation_max_batch_seconds",
@@ -1960,6 +2083,14 @@ def run_fl_seeds(config: Dict, seeds: List[int]) -> Dict:
         "amp_tau", "selectivity", "tau_len_atk", "truncation_tau", "repetition_tau",
         "distinct_ratio_tau", "ppl_ratio_vs_pristine", "rouge_recall_clean_atk",
         "rouge_recall_tau_atk",
+        # C2 needs its CONTROL across seeds too, not just the attacked arm: a mean+/-std of
+        # rouge_recall_clean_atk alone cannot say whether the attacker moved clean utility, since
+        # benign federated drift moves it as well. These are the benign-only counterfactual and
+        # the LINEAR clean-length ratio the C2 gate is actually decided on.
+        "ppl_ratio", "rouge_recall_clean_ben", "rouge_f1_clean_ben",
+        "amp_clean_len", "amp_clean",
+        # uncensored C1/C4 signal: raw tau_len saturates at the cap, effective length does not
+        "tau_effective_len_atk",
     ]
     collected: Dict[str, List[float]] = {
         k: [float(_final(r)[k]) for r in runs if _final(r).get(k) is not None]
@@ -1972,12 +2103,23 @@ def run_fl_seeds(config: Dict, seeds: List[int]) -> Dict:
     # same numeric scale as the fixed-f defenses (the guard defenses.py itself applies).
     defense_excess: Dict[str, List[float]] = {}
     defense_structural: Dict[str, bool] = {}
+    defense_purpose_built: Dict[str, bool] = {}
+    # A cross-seed mean excess still says nothing about detectability on its own, so carry each
+    # seed's permutation p and count how many seeds actually reached significance. "3 seeds, mean
+    # excess +0.27, 0/3 significant" is a very different sentence from "mean excess +0.27".
+    defense_p_cluster: Dict[str, List[float]] = {}
+    defense_sig_seeds: Dict[str, List[bool]] = {}
     for r in runs:
         defs = (((r.get("defense_evaluation") or {}).get("telemetry_defenses") or {})
                 .get("defenses") or {})
         for name, d in defs.items():
             defense_excess.setdefault(name, []).append(d.get("excess_detection"))
             defense_structural[name] = bool(d.get("excess_structural"))
+            defense_purpose_built[name] = bool(d.get("purpose_built"))
+            if d.get("excess_p_cluster") is not None:
+                defense_p_cluster.setdefault(name, []).append(float(d["excess_p_cluster"]))
+            if d.get("excess_significant") is not None:
+                defense_sig_seeds.setdefault(name, []).append(bool(d["excess_significant"]))
 
     # C1 across seeds: the resource-amplification headline the roll-up previously dropped. Pull
     # attacked/pristine ratios from each run's objective_summary so C1 gets a mean +/- std too.
@@ -2030,7 +2172,12 @@ def run_fl_seeds(config: Dict, seeds: List[int]) -> Dict:
         },
         "final_round": {k: ms(v) for k, v in collected.items()},
         "defense_excess_detection": {
-            name: {**ms(vals), "excess_structural": defense_structural.get(name, False)}
+            name: {**ms(vals),
+                   "excess_structural": defense_structural.get(name, False),
+                   "purpose_built": defense_purpose_built.get(name, False),
+                   "p_cluster_per_seed": defense_p_cluster.get(name, []),
+                   "significant_seeds": sum(1 for b in defense_sig_seeds.get(name, []) if b),
+                   "seeds_with_test": len(defense_sig_seeds.get(name, []))}
             for name, vals in defense_excess.items()},
         "resource_amplification_vs_pristine": {m: ms(v) for m, v in resource_amp.items()},
         "rank_collusion": {
@@ -2054,6 +2201,12 @@ def run_fl_seeds(config: Dict, seeds: List[int]) -> Dict:
         print("  -- defense excess_detection (atk_fpr - ben_fpr; ~0 = indistinguishable/stealthy) --")
         for name, a in summary["defense_excess_detection"].items():
             tag = " [struct*: read caught/survival, not excess]" if a.get("excess_structural") else ""
+            if a.get("purpose_built"):
+                tag += " [purpose-built: not evidence about STANDARD defenses]"
+            # A mean excess without the significance count is exactly the number that reads as
+            # detection when it is noise, so print "k/n seeds significant" beside every row.
+            if a.get("seeds_with_test"):
+                tag += f" [{a['significant_seeds']}/{a['seeds_with_test']} seeds sig]"
             print(f"  {name:<26} {a['mean']:>10.4f} +/- {a['std']:<8.4f}  {a['values']}{tag}")
     rc = summary["rank_collusion"]["auc"]
     if rc["values"]:

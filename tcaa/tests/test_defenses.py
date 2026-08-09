@@ -88,19 +88,64 @@ def test_krum_skipped_when_n_below_2f_plus_3():
     print("[ok] Krum/Multi-Krum correctly skipped when n < 2f+3")
 
 
-def test_excess_ci_present_and_krum_excluded():
-    # Every non-structural defense must carry a CI; Krum (excess_structural) must NOT, so a
-    # spuriously-tight CI on its range-compressed excess never enters the C3 table.
+def test_excess_null_present_and_krum_excluded():
+    # Every non-structural defense must carry a null band + a significance verdict; Krum
+    # (excess_structural) must NOT, so a spuriously-tight interval on its range-compressed excess
+    # never enters the C3 table.
     r = _round([1.0, 1.1, 0.9, 1.0, 1.0, 0.95, 1.05, 1.02],
                [0.30, 0.34, 0.27, 0.31, 0.30, 0.29, 0.33, 0.28],
                [0.0, 0.3, -0.3, 0.15, 0.05, -0.1, 0.2, -0.05],
                ["benign"] * 6 + ["attacker"] * 2)
     d = evaluate_defenses([r, r], num_attackers=2)["defenses"]  # 2 rounds so stdev is defined
     for name in ("norm_clip", "cosine_screen", "rank_screen"):
-        assert "excess_ci95" in d[name] and "excess_significant" in d[name], (name, d[name])
-    assert "excess_ci95" not in d["krum"], "Krum's structural excess must not get a CI"
+        assert "excess_null_band95" in d[name], (name, d[name])
+        assert "excess_significant" in d[name], (name, d[name])
+        # The ambiguous legacy key must be GONE: it used to mean "Normal CI" and was then reused
+        # for the permutation null band, so a consumer could not tell which it was holding.
+        assert "excess_ci95" not in d[name], (name, "ambiguous legacy key resurfaced")
+        assert d[name]["excess_significance_method"] in (
+            "normal_approx_fallback", "within_round_hypergeometric", "client_level_permutation")
+    assert "excess_null_band95" not in d["krum"], "Krum's structural excess must not get a null band"
+    assert "excess_significant" not in d["krum"]
     assert d["krum"]["excess_structural"] is True
-    print("[ok] excess CI present for fixed-f defenses, correctly withheld from structural Krum")
+    print("[ok] null band present for fixed-f defenses, correctly withheld from structural Krum")
+
+
+def test_cluster_permutation_is_the_headline_null_and_is_conservative():
+    """The client-level null must (a) be reported, (b) drive `excess_significant`, and (c) be no
+    more liberal than the within-round null on a persistent-label design.
+
+    Two clients are the attackers in EVERY round, so the within-round null (which treats rounds as
+    independent) over-counts evidence. Here a single benign client is a permanent geometric outlier
+    on the collusion score; a correct client-level test must notice that swapping it in scores as
+    well as the real attackers, and therefore must not certify detection."""
+    labels = ["benign"] * 6 + ["attacker"] * 2
+    rounds = []
+    for shift in (0.0, 0.02, -0.01, 0.03, -0.02, 0.01):
+        # client 0 is a permanent outlier: highest cos_to_agg AND highest pairwise cosine
+        cos = [0.95, 0.40 + shift, 0.42, 0.38, 0.41, 0.39, 0.70 + shift, 0.72]
+        pmc = [0.90, 0.55, 0.58, 0.52, 0.54, 0.56, 0.05, 0.03]
+        rounds.append(_round([1.0] * 8, cos, [0, .1, -.1, .05, .2, -.2, .15, -.15], labels, pmc))
+    ev = evaluate_defenses(rounds, num_attackers=2)
+    clu = ev.get("cluster_permutation") or {}
+    assert clu, "cluster_permutation must be reported alongside the per-defense rows"
+    for name, row in clu.items():
+        assert 0.0 <= row["p_two_sided"] <= 1.0
+        assert row["n_candidates"] >= 2 and row["rank"] >= 1
+        assert row["attacker_ids"] == [6, 7]
+    for name, agg in ev["defenses"].items():
+        if agg.get("excess_structural"):
+            continue
+        if "excess_p_cluster" in agg:
+            # Significance is read from the client-level p, not the within-round one.
+            assert agg["excess_significance_method"] == "client_level_permutation"
+            assert agg["excess_significant"] is bool(agg["excess_p_cluster"] < 0.05)
+            # ...and the client-level p must be >= the within-round p on this persistent-label
+            # design: the within-round null is the anti-conservative one.
+            if "excess_p_within_round" in agg:
+                assert agg["excess_p_cluster"] >= agg["excess_p_within_round"] - 1e-9, (
+                    name, agg["excess_p_cluster"], agg["excess_p_within_round"])
+    print("[ok] client-level permutation reported, drives significance, and is conservative")
 
 
 def test_rank_screen_catches_collusion_cosine_screen_misses():

@@ -40,6 +40,8 @@ import json
 from pathlib import Path
 from typing import Dict, List, Optional
 
+import numpy as np
+
 
 # Defenses designed against THIS attack rather than taken off the shelf. Kept as data (not a
 # hardcoded name in the reporting layer) so figures/verdicts can separate "evades the standard
@@ -124,6 +126,71 @@ def _flag_rates(flagged: set, atk_idx: List[int], ben_idx: List[int]) -> tuple:
     return float(a), float(b)
 
 
+def _byzantine_budget(rnd: Dict, num_attackers: Optional[int]) -> int:
+    """f — the Byzantine budget the aggregator provisions for, for THIS round.
+
+    Deliberately a function of the DEFENDER's assumption (``num_attackers``) and the round size
+    only, never of who is actually malicious, so that relabelling the attackers under a
+    permutation null does not silently change the defenses' flagging budget. Falls back to the
+    attackers actually present when the caller gives no assumption.
+    """
+    clients = rnd.get("clients") or []
+    n = len(clients)
+    if num_attackers is None:
+        present = sum(1 for c in clients if c.get("label") == "attacker")
+        return max(1, present)
+    return max(1, min(int(num_attackers), max(n - 1, 1)))
+
+
+def _flagged_sets(rnd: Dict, *, f: int, norm_clip_factor: float) -> tuple:
+    """The client indices each telemetry-only defense flags this round, plus the raw scores.
+
+    LABEL-BLIND by construction: every rule below is a function of the round's update geometry and
+    the defender's budget ``f``, never of who is actually an attacker — exactly as a deployed
+    defender is. That property is what lets ``cluster_permutation_test`` reuse these sets unchanged
+    under every candidate relabelling instead of re-running the defenses for each one, and it is
+    the single source of truth both ``_eval_round`` and that null read from (they previously
+    duplicated the rules, which is how they could silently drift apart).
+
+    Returns ``(flags, scores)`` where ``flags[name]`` is a set of client indices and ``scores``
+    carries the per-client suspicion scores plus the norm-clip threshold.
+    """
+    clients = rnd.get("clients") or []
+    n = len(clients)
+    norms = [float(c.get("norm", 0.0)) for c in clients]
+    cos_agg = [float(c.get("cos_to_agg", 0.0)) for c in clients]
+    dist = rnd.get("pairwise_distance")
+
+    flags: Dict[str, set] = {}
+    scores: Dict[str, object] = {"norm": norms, "cos_to_agg": cos_agg}
+
+    # --- norm-clipping: flag updates whose norm exceeds factor * median norm ---
+    thr = norm_clip_factor * _median(norms)
+    flags["norm_clip"] = {i for i in range(n) if norms[i] > thr}
+    scores["norm_clip_threshold"] = thr
+
+    # --- Krum / Multi-Krum: need the pairwise distance matrix AND n >= 2f+3 (Blanchard 2017) ---
+    if dist and len(dist) == n and n >= 2 * f + 3:
+        ks = _krum_scores(dist, f)
+        order = sorted(range(n), key=lambda i: ks[i])
+        flags["krum"] = set(range(n)) - {order[0]}       # Krum (m=1) rejects all but the pick
+        flags["multi_krum"] = set(order[max(1, n - f):])  # Multi-Krum discards the f worst
+        scores["krum_score"] = ks
+        scores["krum_selected"] = order[0]
+
+    # --- cosine-alignment screen: flag the f updates most aligned with the aggregate ---
+    flags["cosine_screen"] = set(sorted(range(n), key=lambda i: -cos_agg[i])[:f])
+
+    # --- rank-order collusion screen: flag the f clients whose collusion score is highest ---
+    # Same top-f rule as cosine_screen (fair, identical base rate) but on the collusion score,
+    # which the standard cosine screen does not see. This is the paper's C3 contribution; read
+    # its deployability limit from rank_collusion_analysis, not from this single top-f number.
+    rc = _rank_collusion_scores(clients)
+    flags["rank_screen"] = set(sorted(range(n), key=lambda i: -rc[i])[:f])
+    scores["rank_collusion"] = rc
+    return flags, scores
+
+
 def _eval_round(rnd: Dict, *, num_attackers: Optional[int], norm_clip_factor: float) -> Optional[Dict]:
     """Run the telemetry-only defenses on one round. Returns per-defense caught/survival/
     suspicion/atk_flag_rate/ben_flag_rate for THIS round, or None if the round has no attacker
@@ -137,76 +204,58 @@ def _eval_round(rnd: Dict, *, num_attackers: Optional[int], norm_clip_factor: fl
     ben_idx = [i for i, l in enumerate(labels) if l != "attacker"]
     if not atk_idx:
         return None
-    # f = the Byzantine budget the aggregator must tolerate. Default to the attackers ACTUALLY
-    # present this round (what Krum's guarantee has to cover); an explicit num_attackers caps it.
-    f = len(atk_idx) if num_attackers is None else min(int(num_attackers), n - 1)
-    f = max(1, f)
-    norms = [float(c.get("norm", 0.0)) for c in clients]
-    cos_agg = [float(c.get("cos_to_agg", 0.0)) for c in clients]
-    dist = rnd.get("pairwise_distance")
+    f = _byzantine_budget(rnd, num_attackers)
+    flags, scores = _flagged_sets(rnd, f=f, norm_clip_factor=norm_clip_factor)
+    norms = scores["norm"]
+    na, nb = len(atk_idx), len(ben_idx)
 
     out: Dict[str, Dict] = {}
 
-    # --- norm-clipping: flag updates whose norm exceeds factor * median norm ---
-    thr = norm_clip_factor * _median(norms)
-    flagged = {i for i in range(n) if norms[i] > thr}
-    a, b = _flag_rates(flagged, atk_idx, ben_idx)
-    out["norm_clip"] = {
-        "caught": any(i in flagged for i in atk_idx),
-        "survival": not any(i in flagged for i in atk_idx),
-        "suspicion": _percentile_suspicion(norms, atk_idx, higher_is_worse=True),
-        "atk_flag_rate": a, "ben_flag_rate": b,
-        # how much the largest attacker update would be dampened (1.0 = untouched)
-        "atk_clip_factor": min((thr / norms[i]) if norms[i] > thr else 1.0 for i in atk_idx),
-    }
-
-    # --- Krum / Multi-Krum: need the pairwise distance matrix AND n >= 2f+3 (Blanchard 2017) ---
-    if dist and len(dist) == n and n >= 2 * f + 3:
-        scores = _krum_scores(dist, f)
-        order = sorted(range(n), key=lambda i: scores[i])
-        krum_selected = order[0]                       # Krum (m=1): the single kept update
-        krum_flagged = set(range(n)) - {krum_selected}  # everyone else is rejected
-        mk_discarded = set(order[max(1, n - f):])       # Multi-Krum: discard the f worst
-        a, b = _flag_rates(krum_flagged, atk_idx, ben_idx)
-        out["krum"] = {
-            "caught": krum_selected not in atk_idx,     # attacker is rejected unless it IS the pick
-            "survival": krum_selected in atk_idx,
-            "suspicion": _percentile_suspicion(scores, atk_idx, higher_is_worse=True),
+    def _row(flagged: set, score_vec: List[float], *, caught: bool, survival: bool) -> Dict:
+        a, b = _flag_rates(flagged, atk_idx, ben_idx)
+        return {
+            "caught": caught, "survival": survival,
+            "suspicion": _percentile_suspicion(score_vec, atk_idx, higher_is_worse=True),
             "atk_flag_rate": a, "ben_flag_rate": b,
-        }
-        a, b = _flag_rates(mk_discarded, atk_idx, ben_idx)
-        out["multi_krum"] = {
-            "caught": any(i in mk_discarded for i in atk_idx),
-            "survival": all(i not in mk_discarded for i in atk_idx),
-            "suspicion": _percentile_suspicion(scores, atk_idx, higher_is_worse=True),
-            "atk_flag_rate": a, "ben_flag_rate": b,
+            # Per-round exact-null bookkeeping: pool sizes and how many of each label were flagged.
+            # These let evaluate_defenses build a within-round hypergeometric permutation null for
+            # the excess, which is the right test for a top-f (budget-constrained) screen whose
+            # excess can only take a few discrete values — a Normal-approx CI on the sample sd
+            # over-states significance.
+            "n_atk": na, "n_ben": nb,
+            "n_atk_flagged": sum(1 for i in atk_idx if i in flagged),
+            "n_flagged": len(flagged),
         }
 
-    # --- cosine-alignment screen: flag the f updates most aligned with the aggregate ---
-    cos_order = sorted(range(n), key=lambda i: -cos_agg[i])
-    cos_flagged = set(cos_order[:f])
-    a, b = _flag_rates(cos_flagged, atk_idx, ben_idx)
-    out["cosine_screen"] = {
-        "caught": any(i in cos_flagged for i in atk_idx),
-        "survival": all(i not in cos_flagged for i in atk_idx),
-        "suspicion": _percentile_suspicion(cos_agg, atk_idx, higher_is_worse=True),
-        "atk_flag_rate": a, "ben_flag_rate": b,
-    }
+    thr = scores["norm_clip_threshold"]
+    nc_flagged = flags["norm_clip"]
+    out["norm_clip"] = _row(nc_flagged, norms,
+                            caught=any(i in nc_flagged for i in atk_idx),
+                            survival=not any(i in nc_flagged for i in atk_idx))
+    # how much the largest attacker update would be dampened (1.0 = untouched)
+    out["norm_clip"]["atk_clip_factor"] = min(
+        (thr / norms[i]) if norms[i] > thr else 1.0 for i in atk_idx)
 
-    # --- rank-order collusion screen: flag the f clients whose collusion score is highest ---
-    # Same top-f rule as cosine_screen (fair, identical base rate) but on the collusion score,
-    # which the standard cosine screen does not see. This is the paper's C3 contribution; read
-    # its deployability limit from rank_collusion_analysis, not from this single top-f number.
-    rc_scores = _rank_collusion_scores(clients)
-    rc_order = sorted(range(n), key=lambda i: -rc_scores[i])
-    rc_flagged = set(rc_order[:f])
-    a, b = _flag_rates(rc_flagged, atk_idx, ben_idx)
-    out["rank_screen"] = {
-        "caught": any(i in rc_flagged for i in atk_idx),
-        "survival": all(i not in rc_flagged for i in atk_idx),
-        "suspicion": _percentile_suspicion(rc_scores, atk_idx, higher_is_worse=True),
-        "atk_flag_rate": a, "ben_flag_rate": b,
-    }
+    if "krum" in flags:
+        ks = scores["krum_score"]
+        selected = scores["krum_selected"]
+        out["krum"] = _row(flags["krum"], ks,
+                           caught=selected not in atk_idx,   # rejected unless it IS the pick
+                           survival=selected in atk_idx)
+        mk = flags["multi_krum"]
+        out["multi_krum"] = _row(mk, ks,
+                                 caught=any(i in mk for i in atk_idx),
+                                 survival=all(i not in mk for i in atk_idx))
+
+    cs = flags["cosine_screen"]
+    out["cosine_screen"] = _row(cs, scores["cos_to_agg"],
+                                caught=any(i in cs for i in atk_idx),
+                                survival=all(i not in cs for i in atk_idx))
+
+    rs = flags["rank_screen"]
+    out["rank_screen"] = _row(rs, scores["rank_collusion"],
+                              caught=any(i in rs for i in atk_idx),
+                              survival=all(i not in rs for i in atk_idx))
     return out
 
 
@@ -221,6 +270,11 @@ def evaluate_defenses(telemetry: List[Dict], *, num_attackers: Optional[int] = N
                                          norm_clip_factor=norm_clip_factor)
                              for rnd in telemetry) if r is not None]
     n_rounds = len(per_round)
+    # Client-level null, computed once and reused for every defense below (see the block comment
+    # at `excess_significance_method` for why this is the headline test rather than the
+    # within-round one).
+    cluster = cluster_permutation_test(telemetry, num_attackers=num_attackers,
+                                       norm_clip_factor=norm_clip_factor)
     names: List[str] = []
     for r in per_round:
         for k in r:
@@ -257,22 +311,56 @@ def evaluate_defenses(telemetry: List[Dict], *, num_attackers: Optional[int] = N
         if name == "norm_clip":
             agg["mean_atk_clip_factor"] = round(
                 sum(x["atk_clip_factor"] for x in rows) / len(rows), 4)
-        # Per-round excess series + a Normal-approx 95% CI, so the C3 table can state whether an
-        # excess is distinguishable from zero instead of comparing a point estimate to a hard
-        # 0.10 threshold. GATED on `not excess_structural`: Krum keeps 1, so its per-round excess
-        # is a near-constant range-compressed value and a CI on it would look spuriously tight and
-        # significant on the one metric the module declares non-comparable (excess_structural).
+        # THREE nested descriptions of the same excess, from weakest to strongest assumption:
+        #
+        #  1. excess_ci95_normal  — a Normal-approx CI on the per-round sample sd. DESCRIPTIVE
+        #     SPREAD ONLY, never significance: a top-f screen flags a fixed budget each round, so
+        #     the excess takes a handful of discrete values and this CI over-states significance
+        #     (it is what wrongly flagged norm_clip as "sig" when its exact p is ~0.09).
+        #  2. excess_null_band95 / excess_p_within_round — the exact within-round hypergeometric
+        #     null. Correct for "inside a round, is flagging associated with the attacker label?"
+        #     but it treats the 10 rounds as independent experiments, which they are NOT: the same
+        #     two clients are the attackers in every round, so a persistently-odd client inflates
+        #     it. Anti-conservative for a PERSISTENT label. NOTE excess_null_band95 is the band the
+        #     excess falls in UNDER H0 — it is not a confidence interval on the estimate, so the
+        #     point estimate legitimately lies outside it when the effect is real.
+        #  3. excess_p_cluster — the client-level permutation (see cluster_permutation_test).
+        #     This is the HEADLINE significance: it asks whether the actual attacker set is flagged
+        #     more than an arbitrary set of the same size would be, which respects the fact that
+        #     attacker identity is a per-client property held fixed across rounds.
+        #
+        # `excess_significant` reads (3) when available and falls back to (2) then (1). GATED on
+        # `not excess_structural`: Krum keeps 1 by construction, so its excess is non-comparable
+        # and carries no meaningful null.
         if not agg["excess_structural"]:
             series = [x["atk_flag_rate"] - x["ben_flag_rate"] for x in rows]
             agg["excess_per_round"] = [round(v, 4) for v in series]
             m, se = _mean_se(series)
             agg["excess_se"] = round(se, 4)
-            agg["excess_ci95"] = [round(m - 1.96 * se, 4), round(m + 1.96 * se, 4)]
-            # Significant iff the whole 95% CI is on one side of zero.
-            agg["excess_significant"] = bool((m - 1.96 * se) > 0 or (m + 1.96 * se) < 0)
+            agg["excess_ci95_normal"] = [round(m - 1.96 * se, 4), round(m + 1.96 * se, 4)]
+            method = "normal_approx_fallback"
+            significant = bool((m - 1.96 * se) > 0 or (m + 1.96 * se) < 0)
+            perm = _excess_permutation_test(rows)
+            if perm is not None:
+                agg["excess_p_within_round"] = round(perm["p_two_sided"], 4)
+                agg["excess_null_band95"] = [round(perm["ci_lo"], 4), round(perm["ci_hi"], 4)]
+                agg["excess_null_sd"] = round(perm["null_sd"], 4)
+                method = "within_round_hypergeometric"
+                significant = bool(perm["p_two_sided"] < 0.05)
+            clu = (cluster or {}).get(name)
+            if clu is not None and clu.get("p_two_sided") is not None:
+                agg["excess_p_cluster"] = round(clu["p_two_sided"], 4)
+                agg["cluster_rank"] = clu.get("rank")
+                agg["cluster_n_candidates"] = clu.get("n_candidates")
+                agg["cluster_top_competitors"] = clu.get("top_competitors")
+                method = "client_level_permutation"
+                significant = bool(clu["p_two_sided"] < 0.05)
+            agg["excess_significance_method"] = method
+            agg["excess_significant"] = significant
         defenses[name] = agg
     return {"n_rounds": n_rounds, "defenses": defenses,
-            "norm_clip_factor": norm_clip_factor}
+            "norm_clip_factor": norm_clip_factor,
+            "cluster_permutation": cluster}
 
 
 def _mean_se(xs: List[float]) -> tuple:
@@ -285,6 +373,183 @@ def _mean_se(xs: List[float]) -> tuple:
         return m, 0.0
     var = sum((x - m) ** 2 for x in xs) / (n - 1)
     return m, (var / n) ** 0.5
+
+
+def _excess_permutation_test(rows: List[Dict], n_resample: int = 20000) -> Optional[Dict]:
+    """Exact-null test for the mean per-round attacker-minus-benign flag-rate excess of a
+    budget-constrained (top-f) screen.
+
+    A top-f screen flags a FIXED number of clients each round, so within round r, under the null
+    that flags are assigned independently of the attacker label, the number of flagged attackers is
+    Hypergeometric(N_r, n_atk_r, n_flagged_r). The excess is therefore a sum of a few discrete
+    per-round increments — a Normal approximation on the sample sd over-states its significance
+    (it is exactly what mislabelled norm_clip as "significant"). We build the null by resampling
+    the per-round attacker-flag count from its hypergeometric distribution and recomputing the
+    mean excess, giving a distribution-free two-sided p-value and a null-referenced 95% interval.
+
+    Returns None if any round lacks the per-round counts (older telemetry), so the caller can fall
+    back to the Normal CI. Deterministic: the RNG is seeded so re-running a fixed run reproduces.
+    """
+    counts = []
+    for x in rows:
+        if not all(k in x for k in ("n_atk", "n_ben", "n_atk_flagged", "n_flagged")):
+            return None
+        na, nb, ka, f = x["n_atk"], x["n_ben"], x["n_atk_flagged"], x["n_flagged"]
+        if na <= 0 or nb <= 0:
+            return None
+        counts.append((na, nb, ka, f))
+    if not counts:
+        return None
+
+    def excess_from(ka_list) -> float:
+        vals = []
+        for (na, nb, _ka, f), ka in zip(counts, ka_list):
+            kb = f - ka
+            vals.append(ka / na - kb / nb)
+        return sum(vals) / len(vals)
+
+    observed = excess_from([c[2] for c in counts])
+    rng = np.random.default_rng(0)  # fixed seed: same telemetry -> same p-value
+    null = np.empty(n_resample, dtype=float)
+    for j in range(n_resample):
+        draw = [int(rng.hypergeometric(na, nb, f)) for (na, nb, _ka, f) in counts]
+        null[j] = excess_from(draw)
+    null_mean = float(null.mean())
+    # Two-sided p: how often the null deviates from its own mean at least as far as the observed.
+    p_two = float((np.abs(null - null_mean) >= abs(observed - null_mean) - 1e-12).mean())
+    return {
+        "observed": observed,
+        "p_two_sided": max(p_two, 1.0 / n_resample),
+        "null_sd": float(null.std(ddof=1)),
+        "ci_lo": float(np.quantile(null, 0.025)),
+        "ci_hi": float(np.quantile(null, 0.975)),
+    }
+
+
+def cluster_permutation_test(telemetry: List[Dict], *, num_attackers: Optional[int] = None,
+                             norm_clip_factor: float = 1.0,
+                             min_round_fraction: float = 0.5,
+                             max_candidates: int = 20000) -> Dict:
+    """CLIENT-LEVEL (cluster) permutation null for each defense's excess detection.
+
+    The within-round hypergeometric null (``_excess_permutation_test``) asks "inside this round,
+    is being flagged associated with the attacker label?" and treats every round as an independent
+    experiment. That assumption is FALSE here: the same clients are the attackers in all rounds and
+    their update geometry is persistent (in the 20260807 run one honest client holds 55% of the
+    data and is a geometric outlier every single round). So a screen that simply flags the biggest
+    data-holder every round can earn a tiny within-round p without discriminating attackers at all,
+    and the effective sample size is the number of CLIENTS, not the number of client-rounds.
+
+    This test fixes that by permuting the label at the level it actually lives: it re-labels each
+    candidate SET of clients (same size as the true attacker set) as "the attackers", holding that
+    assignment fixed across all rounds, and recomputes the mean per-round excess. The p-value is
+    the fraction of candidate sets whose |excess| is at least the observed one. Because every
+    defense rule here is label-blind (see ``_flagged_sets``), the flagged sets are computed ONCE
+    per round and reused for every candidate — the test is exact, not resampled, whenever the
+    candidate space fits in ``max_candidates``.
+
+    Clients are only sampled into a subset of rounds, so a candidate set is admissible only for the
+    rounds in which all of its members are present; sets co-present in fewer than
+    ``min_round_fraction`` of the attacker-present rounds are dropped as too thin to compare.
+
+    Returns ``{defense_name: {observed, p_two_sided, rank, n_candidates, n_rounds,
+    top_competitors}}`` — ``top_competitors`` names the highest-scoring candidate sets, which is
+    how the "a benign client outranks both attackers" confound becomes visible. Returns {} when
+    the telemetry carries no attacker or no usable client ids.
+    """
+    import itertools
+    import math
+
+    rounds = []
+    for rnd in telemetry:
+        clients = rnd.get("clients") or []
+        if not clients or not any(c.get("label") == "attacker" for c in clients):
+            continue
+        ids = [c.get("client_id") for c in clients]
+        if any(i is None for i in ids):
+            return {}                      # cannot form client-level sets without stable ids
+        f = _byzantine_budget(rnd, num_attackers)
+        flags, _ = _flagged_sets(rnd, f=f, norm_clip_factor=norm_clip_factor)
+        rounds.append({"ids": ids,
+                       "flagged": {k: {ids[i] for i in v} for k, v in flags.items()}})
+    if not rounds:
+        return {}
+
+    true_atk = sorted({c.get("client_id") for rnd in telemetry
+                       for c in (rnd.get("clients") or []) if c.get("label") == "attacker"})
+    all_ids = sorted({i for r in rounds for i in r["ids"]})
+    k = len(true_atk)
+    if k == 0 or k >= len(all_ids):
+        return {}
+    min_rounds = max(1, int(round(min_round_fraction * len(rounds))))
+
+    def _excess(candidate: set, defense: str):
+        """Mean per-round (candidate flag-rate − other flag-rate), over rounds where the whole
+        candidate set participated AND this defense ran. None if too few such rounds."""
+        vals = []
+        for r in rounds:
+            if defense not in r["flagged"]:
+                continue                    # e.g. Krum skipped this round (n < 2f+3)
+            present = set(r["ids"])
+            if not candidate <= present:
+                continue
+            flagged = r["flagged"][defense]
+            others = present - candidate
+            if not others:
+                continue
+            a = len(candidate & flagged) / len(candidate)
+            b = len(others & flagged) / len(others)
+            vals.append(a - b)
+        if len(vals) < min_rounds:
+            return None
+        return sum(vals) / len(vals)
+
+    names = sorted({d for r in rounds for d in r["flagged"]})
+    # Count BEFORE materialising: C(num_clients, k) explodes fast (C(100,5) is 75M tuples), so a
+    # naive list() would exhaust memory on a large federation before the truncation check ran.
+    total_candidates = math.comb(len(all_ids), k)
+    truncated = total_candidates > max_candidates
+    if not truncated:
+        candidates = list(itertools.combinations(all_ids, k))
+    else:
+        # Too many client subsets to enumerate exactly: sample the null directly (never building
+        # the full space), always keeping the observed assignment so the p-value stays defined.
+        rng = np.random.default_rng(0)
+        keep = {tuple(true_atk)}
+        guard = 0
+        while len(keep) < max_candidates and guard < 20 * max_candidates:
+            keep.add(tuple(sorted(rng.choice(all_ids, size=k, replace=False).tolist())))
+            guard += 1
+        candidates = sorted(keep)
+
+    out: Dict[str, Dict] = {}
+    for name in names:
+        scored = []
+        for cand in candidates:
+            e = _excess(set(cand), name)
+            if e is not None:
+                scored.append((e, cand))
+        obs = next((e for e, c in scored if tuple(sorted(c)) == tuple(true_atk)), None)
+        if obs is None or len(scored) < 2:
+            continue
+        ge = sum(1 for e, _ in scored if abs(e) >= abs(obs) - 1e-12)
+        ordered = sorted(scored, key=lambda t: -t[0])
+        rank = next(i for i, (_, c) in enumerate(ordered, 1) if tuple(sorted(c)) == tuple(true_atk))
+        out[name] = {
+            "observed": round(obs, 4),
+            "p_two_sided": round(ge / len(scored), 4),
+            "rank": rank,                       # 1 = the true attacker set is the most-flagged
+            "n_candidates": len(scored),
+            "n_rounds": len(rounds),
+            "min_rounds": min_rounds,
+            "exact": not truncated,
+            "attacker_ids": list(true_atk),
+            # The candidate sets that beat or match the attackers — the concrete form of the
+            # "an honest heavy data-holder looks more suspicious than the attacker" confound.
+            "top_competitors": [{"clients": list(c), "excess": round(e, 4)}
+                                for e, c in ordered[:3]],
+        }
+    return out
 
 
 def rank_collusion_analysis(telemetry: List[Dict], *, num_attackers: Optional[int] = None,

@@ -224,18 +224,70 @@ def _distance_incl(delta: torch.Tensor, env: StealthEnvelope) -> torch.Tensor:
 
 
 @torch.no_grad()
-def project_to_distance(delta: torch.Tensor, env: StealthEnvelope, *, kappa: float = 1.0) -> torch.Tensor:
-    """Hard guarantee: scale ``delta`` toward the benign mean so its MEASURED include-self
-    distance is within ``kappa * raw_d_T``. A defensive final step so the returned update
-    provably meets the server's distance screen even if optimization / EMA drift left it
-    slightly over. Returns delta unchanged when already inside. Cosine is left to the ALM."""
+def screened_distance_budget(delta: torch.Tensor, env: StealthEnvelope) -> float:
+    """The distance threshold the SERVER actually screens on, given this ``delta``.
+
+    ``stealth.evaluate_stealth`` measures every client's distance to the ATTACKER-INCLUSIVE
+    aggregate and takes ``d_T = max over benign clients``. Writing that aggregate as
+    ``ref_all = (1 - w_a) * ref_b + w_a * delta`` gives, for a benign client i,
+
+        u_i - ref_all = (u_i - ref_b) + w_a * (ref_b - delta)
+
+    so the screened threshold is a FUNCTION OF DELTA and is NOT ``raw_d_T`` (which is measured to
+    the benign-only mean ``ref_b``). ``build_envelope``'s comment assumes the two coincide "when the
+    attacker sits near ref_b", but the attacker sits deliberately at 0.7-0.9 of the budget, so they
+    do not: on the 20260807 run the ratio screened/raw ran 0.879-1.034 across the 10 rounds
+    (mean 0.938). Wherever it dips below ``kappa`` the attacker's own budget EXCEEDS the threshold
+    it is graded against, which is the entire cause of that run's two hairline stealth failures
+    (r0 1.7159 vs 1.7073, r9 1.3874 vs 1.3611) — a reference mismatch in the code, not a property
+    of the attack.
+    """
     ref = env.ref_b.to(delta.device)
-    diff = delta - ref
-    measured = (1.0 - env.w_a) * torch.norm(diff)
-    budget = kappa * env.raw_d_T
-    if float(measured) <= budget or float(measured) < 1e-12:
-        return delta
-    return ref + diff * (budget / float(measured))
+    shift = env.w_a * (ref - delta)
+    return max(float(torch.norm(u.to(delta.device) - ref + shift)) for u in env.benign_updates)
+
+
+@torch.no_grad()
+def project_to_distance(delta: torch.Tensor, env: StealthEnvelope, *, kappa: float = 1.0,
+                        screen_reference: str = "aggregate", max_iters: int = 8) -> torch.Tensor:
+    """Hard guarantee: scale ``delta`` toward the benign mean so its MEASURED include-self
+    distance is within ``kappa`` of the threshold the server screens on. A defensive final step so
+    the returned update provably meets that screen even if optimization / EMA drift left it
+    slightly over. Returns delta unchanged when already inside. Cosine is left to the ALM.
+
+    ``screen_reference='aggregate'`` (default) targets ``screened_distance_budget(delta)`` — the
+    quantity ``evaluate_stealth`` genuinely computes. Because that budget itself moves when delta
+    moves, it is solved by a short damped fixed point; it converges in a couple of steps since the
+    benign spread dominates the ``w_a * (ref_b - delta)`` shift. This makes the projection satisfy
+    its own contract on ANY seed, rather than only when the screened/raw ratio happens to exceed
+    kappa.
+
+    ``screen_reference='benign_mean'`` restores the legacy behaviour (project against
+    ``kappa * raw_d_T``) for bit-comparable reproduction of runs made before this fix. It is
+    KNOWN-INCONSISTENT with the verdict and should not be used for new experiments.
+    """
+    ref = env.ref_b.to(delta.device)
+    if screen_reference not in ("aggregate", "benign_mean"):
+        raise ValueError(f"screen_reference must be 'aggregate' or 'benign_mean', got {screen_reference!r}")
+    if screen_reference == "benign_mean" or not env.benign_updates:
+        diff = delta - ref
+        measured = (1.0 - env.w_a) * torch.norm(diff)
+        budget = kappa * env.raw_d_T
+        if float(measured) <= budget or float(measured) < 1e-12:
+            return delta
+        return ref + diff * (budget / float(measured))
+
+    cur = delta
+    for _ in range(max_iters):
+        diff = cur - ref
+        measured = float((1.0 - env.w_a) * torch.norm(diff))
+        budget = kappa * screened_distance_budget(cur, env)
+        if measured <= budget or measured < 1e-12:
+            return cur
+        # Shrink toward ref_b by the deficit. Recomputing the budget at the new point closes the
+        # loop; a plain single-shot scale would overshoot or undershoot because the budget moved.
+        cur = ref + diff * (budget / measured)
+    return cur
 
 
 def coordination_penalty(

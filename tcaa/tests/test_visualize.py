@@ -178,10 +178,14 @@ def test_apply_style_uses_publication_defaults():
 
     assert plt.rcParams["savefig.dpi"] == RASTER_DPI
     assert plt.rcParams["font.family"] == ["sans-serif"]
-    assert plt.rcParams["axes.spines.top"] is True
-    assert plt.rcParams["axes.spines.right"] is True
+    # apply_style deliberately RECEDES the box: the top/right rails are removed so the data, not
+    # the chrome, carries the figure. This test asserted the opposite of what apply_style has
+    # always set (visualize.py "recede the box"), so it failed on every run. The legend keeps a
+    # near-invisible hairline frame, so frameon stays True.
+    assert plt.rcParams["axes.spines.top"] is False
+    assert plt.rcParams["axes.spines.right"] is False
     assert plt.rcParams["legend.frameon"] is True
-    assert plt.rcParams["grid.linestyle"] == "--"
+    assert plt.rcParams["grid.linestyle"] == "-"   # hairline SOLID grid, not dashed
     assert plt.rcParams["pdf.fonttype"] == 42
 
 

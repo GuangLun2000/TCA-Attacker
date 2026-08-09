@@ -137,6 +137,13 @@ def default_config() -> Dict:
         # Variance reduction: EMA (Polyak) of the attacker update over the last steps, and
         # a defensive final projection guaranteeing the returned update meets the distance screen.
         "attacker_ema_beta": 0.9, "attacker_ema_start_frac": 0.5, "final_project_distance": True,
+        # Which distance threshold the final projection targets. "aggregate" (default) = the
+        # attacker-inclusive quantity evaluate_stealth genuinely screens on, so the projection
+        # satisfies its own contract on any seed. "benign_mean" = the legacy budget built from the
+        # benign-only mean, which differs by a delta-dependent factor (0.879-1.034 on the 20260807
+        # run) and let two rounds fail the verdict by hairline margins; keep it ONLY to reproduce
+        # runs made before this fix. See alm.screened_distance_budget.
+        "stealth_screen_reference": "aggregate",
         # --- cost model (Spec Section 4) ---
         # c_f/c_a: only the RATIO matters for the super-linear threshold; c_f=c_a=1 puts
         # the quadratic onset at L~2n (attacker-favorable). For a HW-calibrated threshold
@@ -464,7 +471,15 @@ def _malicious_update(model, clean_ex, tau_ex, cfg, g0, spec, device,
     # otherwise eats the margin and produces ~1% boundary violations.
     if use_constraint and cfg.get("final_project_distance", True):
         from .alm import project_to_distance
-        delta = project_to_distance(delta, env, kappa=cfg.get("stealth_kappa", 0.9))
+        delta = project_to_distance(
+            delta, env, kappa=cfg.get("stealth_kappa", 0.9),
+            # Project against the threshold evaluate_stealth ACTUALLY screens on (the
+            # attacker-inclusive aggregate), not against the benign-only-mean budget the ALM was
+            # tuned to. Those differ by a delta-dependent factor measured at 0.879-1.034 on the
+            # 20260807 run, and every dip below kappa produced a hairline verdict failure the
+            # attacker had no way to see. 'benign_mean' restores the legacy, known-inconsistent
+            # behaviour for reproducing pre-fix runs.
+            screen_reference=cfg.get("stealth_screen_reference", "aggregate"))
     return delta, trace
 
 

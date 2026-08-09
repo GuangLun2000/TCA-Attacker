@@ -147,12 +147,86 @@ def test_project_to_distance_enforces_budget():
     env = build_envelope(benign, sizes, atk_size=10.0, kappa=1.0, use_pairwise=True)
     far = env.ref_b + 100.0 * torch.randn_like(env.ref_b)
     assert float(_distance_incl(far, env)) > env.raw_d_T
-    proj = project_to_distance(far, env, kappa=1.0)
+    proj = project_to_distance(far, env, kappa=1.0, screen_reference="benign_mean")
     assert float(_distance_incl(proj, env)) <= env.raw_d_T + 1e-4
     # a within-budget update is returned unchanged
     near = env.ref_b.clone()
     assert torch.allclose(project_to_distance(near, env), near)
     print(f"[ok] projection: enforced measured distance <= raw_d_T={env.raw_d_T:.3f}")
+
+
+def test_projection_satisfies_the_screen_the_verdict_actually_uses():
+    """The projection's stated contract is that the returned update PROVABLY meets the server's
+    distance screen. `evaluate_stealth` screens against the ATTACKER-INCLUSIVE aggregate, whose
+    max-benign distance is a function of delta and falls below raw_d_T exactly when the attacker
+    hides behind the most-outlying honest client — which is what this attack is built to do. So the
+    legacy 'benign_mean' target can violate the contract while reporting success.
+
+    The geometry below is written out explicitly (no RNG) so the violation is deterministic: one
+    benign outlier at +3*e0, the rest clustered near -e0, and the attacker driven straight along
+    +e0 to its legacy budget. Moving the attacker that way drags the aggregate toward the outlier,
+    shrinking the screened threshold to 0.74 * raw_d_T while the legacy projection still believes
+    it has 0.9 * raw_d_T to spend."""
+    D = 8
+
+    def e(i):
+        v = torch.zeros(D)
+        v[i] = 1.0
+        return v
+
+    benign = [3 * e(0), -e(0) + 0.5 * e(1), -e(0) - 0.5 * e(1), -e(0) + 0.2 * e(2)]
+    sizes = [10.0, 10.0, 10.0, 10.0]
+    atk_size = 17.14                      # w_a ~= 0.30
+    env = build_envelope(benign, sizes, atk_size=atk_size, kappa=0.9, use_pairwise=True)
+
+    def screened(delta):
+        """(max benign distance, attacker distance) to the attacker-inclusive aggregate —
+        recomputed from first principles, NOT via alm helpers, so this test would also catch a
+        sign/definition error inside screened_distance_budget itself."""
+        w = list(sizes) + [atk_size]
+        ups = list(env.benign_updates) + [delta]
+        tot = sum(w)
+        ref_all = sum(u * (wi / tot) for u, wi in zip(ups, w))
+        return (max(float(torch.norm(u - ref_all)) for u in env.benign_updates),
+                float(torch.norm(delta - ref_all)))
+
+    d = max(env.benign_updates, key=lambda u: float(torch.norm(u - env.ref_b))) - env.ref_b
+    d = d / torch.norm(d)
+    over = env.ref_b + d * (env.raw_d_T * 0.9 / (1.0 - env.w_a))
+
+    legacy = project_to_distance(over, env, kappa=0.9, screen_reference="benign_mean")
+    d_T_leg, atk_leg = screened(legacy)
+    # The legacy target really is broken on this geometry — if this ever stops holding, the test
+    # below has silently stopped testing anything.
+    assert atk_leg > d_T_leg, (
+        "legacy projection was expected to violate the screen here; geometry no longer adversarial")
+
+    fixed = project_to_distance(over, env, kappa=0.9)          # default = "aggregate"
+    d_T_fix, atk_fix = screened(fixed)
+    assert atk_fix <= d_T_fix + 1e-5, (
+        f"default projection must satisfy the screen it is graded on: {atk_fix} > {d_T_fix}")
+    # ...and it must not over-correct into a collapsed (useless) update.
+    keep = float(torch.norm(fixed - env.ref_b) / torch.norm(over - env.ref_b))
+    assert keep > 0.5, f"projection collapsed the update to {keep:.2f} of its magnitude"
+    print(f"[ok] screen-consistent projection: legacy atk/d_T={atk_leg / d_T_leg:.4f} (VIOLATES), "
+          f"fixed={atk_fix / d_T_fix:.4f}, magnitude retained {keep:.3f}")
+
+
+def test_screened_budget_matches_a_direct_recomputation():
+    """screened_distance_budget must equal a literal max-over-benign of the distance to the
+    attacker-inclusive aggregate; the (1 - w_a) algebra is easy to get subtly wrong."""
+    from tcaa.alm import screened_distance_budget
+    mean, benign, sizes = _diverse_benign(noise=1.3, n=5)
+    env = build_envelope(benign, sizes, atk_size=9.0, kappa=0.9, use_pairwise=True)
+    for scale in (0.0, 0.5, 1.0, 3.0):
+        delta = env.ref_b + scale * torch.randn_like(env.ref_b)
+        w = list(sizes) + [9.0]
+        ups = list(env.benign_updates) + [delta]
+        tot = sum(w)
+        ref_all = sum(u * (wi / tot) for u, wi in zip(ups, w))
+        direct = max(float(torch.norm(u - ref_all)) for u in env.benign_updates)
+        assert abs(screened_distance_budget(delta, env) - direct) < 1e-4, (scale, direct)
+    print("[ok] screened_distance_budget matches a direct recomputation at every scale")
 
 
 if __name__ == "__main__":
@@ -163,4 +237,6 @@ if __name__ == "__main__":
     test_two_sided_cosine_bounds_over_alignment()
     test_norm_constraint_bounds_update_norm()
     test_project_to_distance_enforces_budget()
+    test_projection_satisfies_the_screen_the_verdict_actually_uses()
+    test_screened_budget_matches_a_direct_recomputation()
     print("\nAll TCAA ALM tests passed.")

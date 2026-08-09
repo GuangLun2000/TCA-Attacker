@@ -811,41 +811,54 @@ def fig_fl_defense_evasion(r: Dict):
 
     fig, ax = plt.subplots(figsize=(7.8, 0.92 * len(names) + 2.3))
     y = list(range(len(names)))
-    band = 0.10  # |excess| < band == practically indistinguishable
-    ax.axvspan(-band, band, color="#009E73", alpha=0.08, zorder=0)
+    band = 0.10  # fallback "practically indistinguishable" zone when no null band is available
     ax.axvline(0.0, color=INK, lw=1.3, zorder=3)
 
+    drew_null = False
     for yi, (nm, d) in zip(y, comparable):
         e = float(d["excess_detection"])
-        # "Detectable" requires SIGNIFICANCE when a CI is available: a point estimate past the
-        # band whose CI straddles zero is noise. Purpose-built detectors (ours) are hatched so a
+        # "Detectable" requires SIGNIFICANCE under the strongest available null (client-level
+        # permutation preferred; see defenses.evaluate_defenses): a point estimate past the band
+        # that the null itself reaches is noise. Purpose-built detectors (ours) are hatched so a
         # reader never mistakes them for an off-the-shelf defense the attack failed to evade.
         sig = d.get("excess_significant")
         detectable = (bool(sig) and e > 0) if sig is not None else (e > band)
         col = C_ATK if detectable else C_OK
+        # The H0 REGION, drawn as a shaded span BEHIND the bar — never as whiskers on the bar.
+        # excess_null_band95 is where the excess lands when the attacker label carries no
+        # information; a real effect is supposed to stick out PAST it. Drawing it as a CI on the
+        # estimate (which an earlier version did) puts the bar outside its own error bars and
+        # reads as a broken chart.
+        nb = d.get("excess_null_band95")
+        if nb:
+            ax.barh(yi, nb[1] - nb[0], left=nb[0], height=0.78, color=MUTED, alpha=0.16,
+                    zorder=1, linewidth=0)
+            drew_null = True
         ax.barh(yi, e, height=0.56, color=col, alpha=0.92, zorder=2,
                 edgecolor="white", linewidth=1.0,
                 hatch="///" if d.get("purpose_built") else None)
-        ci = d.get("excess_ci95")
-        if ci:  # 95% CI whiskers make "is this distinguishable from zero?" visible
-            ax.plot([ci[0], ci[1]], [yi, yi], color=INK, lw=1.4, zorder=4,
-                    solid_capstyle="butt", alpha=0.75)
-            for xb in ci:
-                ax.plot([xb, xb], [yi - 0.11, yi + 0.11], color=INK, lw=1.4, zorder=4, alpha=0.75)
         # value label just past the bar end, on the correct side
         off = 0.012 if e >= 0 else -0.012
-        ax.annotate(f"{e:+.2f}", (e + off, yi), va="center",
+        p_clu = d.get("excess_p_cluster")
+        p_lab = f"  p={p_clu:.3f}" if p_clu is not None else ""
+        ax.annotate(f"{e:+.2f}{p_lab}", (e + off, yi), va="center",
                     ha="left" if e >= 0 else "right", fontsize=11, fontweight="semibold",
                     color=col)
         # secondary: the two rates the excess is built from
         ax.annotate(f"atk {d.get('atk_flag_rate', 0):.0%} vs benign {d.get('ben_flag_rate', 0):.0%}"
                     f"  ·  {d.get('rounds', 0)} rnds",
                     (0, yi - 0.34), va="center", ha="center", fontsize=8.4, color=MUTED, zorder=4)
+    if not drew_null:
+        ax.axvspan(-band, band, color="#009E73", alpha=0.08, zorder=0)
 
     ax.set_yticks(y)
     ax.set_yticklabels([n.replace("_", "-") for n in names], fontsize=11.5)
-    ax.set_xlabel("excess detection  =  attacker flag-rate − benign flag-rate")
-    lo = min(excess + [-band]); hi = max(excess + [band])
+    _xlab = "excess detection  =  attacker flag-rate − benign flag-rate"
+    if drew_null:
+        _xlab += "      (grey band = 95% of the H0 null, not a CI on the estimate)"
+    ax.set_xlabel(_xlab)
+    nulls = [v for _, d in comparable for v in (d.get("excess_null_band95") or [])]
+    lo = min(excess + nulls + [-band]); hi = max(excess + nulls + [band])
     pad = 0.10 * max(hi - lo, 0.2)
     ax.set_xlim(lo - pad - 0.06, hi + pad + 0.10)
     ax.grid(axis="y", visible=False); ax.grid(axis="x", alpha=0.6)
@@ -1715,6 +1728,73 @@ def _first_text(mappings, aliases):
     return None
 
 
+def _benign_clean_control(fl: Optional[Dict]) -> Dict:
+    """The benign-only FL arm's FINAL clean-split statistics — the correct C2 control.
+
+    ``run_fl`` writes these twice: per round into ``durability[].rouge_recall_clean_ben`` /
+    ``amp_clean_len`` (recent runs only) and, for the final round, into the resource payload at
+    ``resources.states.benign_final.clean_logical``. The second copy predates the first, so runs
+    that lack the per-round fields are NOT missing the control — falling back to the pristine model
+    there (as the verdict used to) charges ordinary benign federated drift to the attacker and
+    turns a −1.1pp attacker effect into a −15.7pp "degradation".
+
+    The fallback is EXACT for the final round, not an approximation: on the 20260807 run
+    ``attacked_final.clean_logical.mean_rouge_recall`` == ``durability[-1].rouge_recall_clean_atk``
+    == 0.3196 and the mean lengths agree to the stored precision, because both are the same
+    ``_measure_cost`` call on the same global. Only the per-ROUND benign trajectory is unavailable.
+
+    Returns ``{}`` when no benign arm was tracked (``track_benign_baseline=False``).
+    """
+    root = _resource_root(fl) or {}
+    states = root.get("states")
+    if not isinstance(states, dict):
+        return {}
+    ben = ((states.get("benign_final") or {}).get("clean_logical") or {})
+    atk = ((states.get("attacked_final") or {}).get("clean_logical") or {})
+    if not ben:
+        return {}
+    out = {"rouge_recall": ben.get("mean_rouge_recall"), "rouge_f1": ben.get("mean_rouge_f1"),
+           "mean_output_len": ben.get("mean_output_len")}
+    b_len, a_len = ben.get("mean_output_len"), atk.get("mean_output_len")
+    if b_len and a_len is not None:
+        out["len_ratio"] = round(a_len / b_len, 4)
+    return {k: v for k, v in out.items() if v is not None}
+
+
+def _excess_stat_str(d: Dict) -> str:
+    """One compact significance string for a defense's excess, shared by the digest, the pillar
+    card and the figure caption so the three can never disagree.
+
+    Reads defenses.py's THREE nested nulls in decreasing order of correctness:
+      p_clu = client-level permutation (headline: attacker identity is a per-client property held
+              fixed across rounds, so this is the null that respects the real sample size),
+      p_wr  = within-round hypergeometric (per-round association; anti-conservative for a
+              persistent label because one odd client recurs every round),
+      band  = the region the excess occupies UNDER H0 (`null95`) — NOT a CI on the estimate, so a
+              real effect legitimately sits outside it. Older runs stored a Normal-approx CI under
+              `excess_ci95`; that is labelled `CI~` so it is never mistaken for an exact null.
+    """
+    p_clu = d.get("excess_p_cluster")
+    p_wr = d.get("excess_p_within_round", d.get("excess_p_exact"))
+    band = d.get("excess_null_band95")
+    label = "null95"
+    if band is None:
+        band = d.get("excess_ci95_normal") or d.get("excess_ci95")
+        label = "CI~"
+    parts = []
+    if band:
+        parts.append(f"{label}[{band[0]:+.2f},{band[1]:+.2f}]")
+    if p_clu is not None:
+        parts.append(f"p_clu={p_clu:.3f}")
+    if p_wr is not None:
+        parts.append(f"p_rnd={p_wr:.3f}")
+    if not parts:
+        return ""
+    sig = d.get("excess_significant")
+    parts.append("sig" if sig else ("ns" if sig is not None else "?"))
+    return " " + " ".join(parts)
+
+
 def _defense_digest_lines(fl: Optional[Dict]) -> List[str]:
     """Copy-safe DEFENSE-EVASION block for the digest — the honest C3 (parameter-stealth) number.
 
@@ -1738,11 +1818,7 @@ def _defense_digest_lines(fl: Optional[Dict]) -> List[str]:
         # Krum keeps 1 => its excess is range-compressed & noise-dominated; mark structural, do
         # not print it on the same numeric scale as the fixed-f defenses (read Krum by caught).
         excess = "struct*" if d.get("excess_structural") else _f(d.get('excess_detection'), '>7.2f')
-        ci = d.get("excess_ci95")
-        # 95% CI + significance: an excess past 0.10 whose CI straddles zero is noise, and at
-        # 10 rounds the smallest resolvable excess is ~0.25 — so the CI is load-bearing here.
-        ci_s = (f" CI[{ci[0]:+.2f},{ci[1]:+.2f}]"
-                f"{' sig' if d.get('excess_significant') else ' ns'}") if ci else ""
+        ci_s = "" if d.get("excess_structural") else _excess_stat_str(d)
         tag = " [purpose-built]" if d.get("purpose_built") else ""
         p(f"      {name:<13} {_f(d.get('caught_rate'),'>7.2f')} {_f(d.get('atk_flag_rate'),'>8.2f')} "
           f"{_f(d.get('ben_flag_rate'),'>8.2f')} {excess:>7} "
@@ -1750,6 +1826,27 @@ def _defense_digest_lines(fl: Optional[Dict]) -> List[str]:
         if d.get("mean_atk_clip_factor") is not None:
             p(f"        ^ attacker update attenuated to {_f(d['mean_atk_clip_factor'])}x its norm "
               f"(clipping RESCALES, it does not reject: flagged != defeated)")
+    # The client-level null is the headline significance, so surface WHICH client sets beat the
+    # real attackers. That is the "an honest heavy data-holder looks more suspicious than the
+    # attacker" confound in its most concrete form, and it must not stay buried in the JSON.
+    clu = ((fl or {}).get("defense_evaluation") or {}).get("telemetry_defenses") or {}
+    clu = clu.get("cluster_permutation") or {}
+    if clu:
+        any_row = next(iter(clu.values()))
+        p(f"      p_clu = client-level permutation over {any_row.get('n_candidates')} candidate "
+          f"attacker sets (attackers={any_row.get('attacker_ids')}); p_rnd = within-round null.")
+        for name, c in sorted(clu.items()):
+            # Krum's excess is structurally range-compressed, so its rank carries no information;
+            # printing it here would invite a comparison the module explicitly forbids.
+            if (defs.get(name) or {}).get("excess_structural"):
+                continue
+            beat = [t for t in (c.get("top_competitors") or [])
+                    if list(t["clients"]) != list(c.get("attacker_ids") or [])
+                    and t["excess"] >= c.get("observed", 0)]
+            if beat:
+                p(f"        {name}: rank {c['rank']}/{c['n_candidates']} — honest client sets "
+                  + ", ".join(f"{t['clients']} ({t['excess']:+.2f})" for t in beat[:2])
+                  + " score at least as high as the true attackers")
     rca = (fl or {}).get("rank_collusion_analysis") or {}
     if rca.get("fpr_sweep"):
         p(f"      rank-collusion detector boundary: AUC={_f(rca.get('auc'))} "
@@ -1893,11 +1990,28 @@ def _resource_digest_lines(fl: Optional[Dict]) -> List[str]:
 
     comparisons = _resource_comparison_rows(fl)
     if comparisons:
-        p("    amplification                    attacked/pristine  attacked/benign")
+        # THE TWO ROW FAMILIES ARE MEASURED OVER DIFFERENT PROMPT POPULATIONS and must never be
+        # read as one table. Analytic/logical rows are computed over the FULL eval set
+        # (cfg['eval_size'], e.g. 128); hardware rows are measured on the profiled prefix only
+        # (cfg['resource_profile_eval_size'], e.g. 32), and `prompt_subset_sha256` covers ONLY the
+        # hardware rows. Printing them undifferentiated invites the invalid cross-family check
+        # ratio(tokens)/ratio(wall) == ratio(tokens/s), which fails here (6.965 vs 6.169) purely
+        # because the numerator and denominator come from different prompt sets.
+        cfg = (fl or {}).get("config") or {}
+        n_logical = cfg.get("eval_size")
+        n_hw = cfg.get("resource_profile_eval_size")
+        _lp = f"N={n_logical}" if n_logical else "full eval set"
+        _hp = f"N={n_hw}" if n_hw else "profiled subset"
+        p(f"    amplification                    attacked/pristine  attacked/benign   population")
         for metric, ap, ab in comparisons:
             label = _RESOURCE_COMPARISON_LABELS.get(metric, metric.replace("_", " "))
+            pop = _hp + " meas" if metric in _HARDWARE_METRIC_KEYS else _lp + " calc"
             p(f"    {label:<32} {_resource_ratio(ap):>18} "
-              f"{_resource_ratio(ab):>16}")
+              f"{_resource_ratio(ab):>16}   {pop}")
+        if n_logical and n_hw and int(n_logical) != int(n_hw):
+            p(f"    [!] rows above span TWO prompt populations (analytic {_lp} vs measured {_hp}) —"
+              f" never divide one family's ratio by the other's; for a like-for-like comparison"
+              f" subset logical_tokens.csv to the {_hp} profiled prompts.")
 
     validity = root.get("validity")
     if isinstance(validity, dict):
@@ -1935,14 +2049,30 @@ def tuning_hints(phase0: Optional[Dict] = None, fl: Optional[Dict] = None,
 
     # ---- pull the most-advanced-round attacked numbers (prefer FL last round) ----
     rep = distinct = amp = amp_eff = amp_dec = ppl_pri = rouge_cln = rouge_cln_ref = None
-    sel = amp_clean = trunc = joint = kappa = dec_valid = None
+    sel = amp_clean = amp_clean_len = trunc = joint = kappa = dec_valid = None
+    ppl_ctl = None                      # clean-ppl ratio against the BEST available control
+    ppl_ctl_name = rouge_ref_name = "pristine"
     if fl and fl.get("durability"):
         d = fl["durability"][-1]; pri = fl.get("pristine_reference", {})
         rep, distinct = d.get("repetition_tau"), d.get("distinct_ratio_tau")
         amp, amp_eff, amp_dec = d.get("amp_tau"), d.get("amp_tau_effective"), d.get("amp_tau_decensored")
         dec_valid = d.get("decensored_valid", True)
         ppl_pri = d.get("ppl_ratio_vs_pristine")
-        rouge_cln, rouge_cln_ref = d.get("rouge_recall_clean_atk"), pri.get("rouge_recall_clean")
+        # Prefer the benign-only control for BOTH clean hints; fall back to pristine. Each keeps
+        # its own label so a hint can never name a reference it did not divide by.
+        ppl_ctl = d.get("ppl_ratio") if d.get("ppl_ratio") is not None else ppl_pri
+        ppl_ctl_name = "benFL" if d.get("ppl_ratio") is not None else "pristine"
+        bctl = _benign_clean_control(fl)   # final-round benign arm, recovered from resources
+        rouge_cln = d.get("rouge_recall_clean_atk")
+        _rcb = d.get("rouge_recall_clean_ben")
+        if _rcb is None:
+            _rcb = bctl.get("rouge_recall")
+        rouge_cln_ref = _rcb if _rcb is not None else pri.get("rouge_recall_clean")
+        rouge_ref_name = "benFL" if _rcb is not None else "pristine"
+        # amp_clean is a quadratic COST ratio; the over-shortened hint must use the LINEAR length ratio.
+        amp_clean_len = d.get("amp_clean_len")
+        if amp_clean_len is None:
+            amp_clean_len = bctl.get("len_ratio")
         sel, amp_clean, trunc, joint = d.get("selectivity"), d.get("amp_clean"), d.get("truncation_tau"), d.get("stealth_ok")
     elif phase0:
         c, u, s = phase0.get("cost", {}), phase0.get("utility", {}), phase0.get("stealth", {})
@@ -1953,6 +2083,8 @@ def tuning_hints(phase0: Optional[Dict] = None, fl: Optional[Dict] = None,
         if dec_valid and at.get("decensored_mean_cost") and bt.get("decensored_mean_cost"):
             amp_dec = at["decensored_mean_cost"] / max(bt["decensored_mean_cost"], 1e-9)
         ppl_pri = u.get("ppl_clean_ratio")
+        # Phase-0's clean baseline IS the benign-trained counterfactual, not an untrained model.
+        ppl_ctl, ppl_ctl_name, rouge_ref_name = ppl_pri, "baseline", "baseline"
         rouge_cln, rouge_cln_ref = u.get("rouge_recall_clean_attacked"), u.get("rouge_recall_clean_baseline")
         sel, amp_clean, trunc, joint = c.get("trigger_selectivity"), c.get("amplification_clean"), at.get("truncation_rate"), s.get("jointly_satisfied")
 
@@ -1961,24 +2093,38 @@ def tuning_hints(phase0: Optional[Dict] = None, fl: Optional[Dict] = None,
     # ---- degeneracy: is the extra length USEFUL? (SCOPED LIMITATION under Framing B: output
     #      coherence is future work; these hints only apply if you are attempting Framing A) ----
     if has(rep) and rep > 0.20:
-        # NOTE: no_repeat_ngram_size does NOT help here — it only blocks repeats in the TRAINING
-        # rollout (length_surrogate), never in eval greedy decode, so it hides degeneracy from the
-        # optimizer rather than fixing it. The only eval-visible lever is gamma_rep (a differentiable
-        # penalty on the measured distribution). Under Framing B, degenerate looping is a documented
-        # limitation, not a knob to chase.
-        hints.append(f"退化复读偏高 (rep={rep:.2f} > 0.20) → 唯一对评测有效的杠杆是 gamma_rep (×2, 如 0.6→1.2);"
-                     f"no_repeat_ngram_size 只作用于训练 rollout、对 greedy 评测无效。走法B下这是已声明的 limitation。")
+        # Two DIFFERENT families of knob, previously conflated here:
+        #  * TRAINING-rollout knobs (gamma_rep, rep_window, no_repeat_ngram_size) are applied only
+        #    inside length_surrogate's on-policy rollout, which is `onpolicy_horizon` tokens long
+        #    with rep_window=8. They reshape the weights, so they DO influence eval indirectly —
+        #    but they cannot see, and therefore cannot suppress, the block-level loops that appear
+        #    past the horizon (256 of the 2048 decoded tokens). Calling gamma_rep "the only
+        #    eval-effective lever" was wrong in both directions.
+        #  * SERVING-side knobs (eval_repetition_penalty / eval_no_repeat_ngram_size) are passed
+        #    straight into the eval generate() call (cost_model.measure_generation), so they act on
+        #    every decoded token. They are the mitigation ARM, applied to clean and triggered
+        #    traffic alike; the honest question they answer is whether EFFECTIVE amp survives them.
+        hints.append(
+            f"退化复读偏高 (rep={rep:.2f} > 0.20)。两类杠杆要分清: "
+            f"训练侧 gamma_rep/rep_window 只作用在 onpolicy_horizon 长度的 rollout 内(rep_window=8),"
+            f"够不到 horizon 之后的块级循环; 真正作用到每个解码 token 的是服务侧 "
+            f"eval_repetition_penalty / eval_no_repeat_ngram_size(mitigation arm,对 clean+τ 一视同仁,"
+            f"要看的是 EFFECTIVE amp 能否存活)。走法B下退化复读是已声明的 limitation。")
     if has(distinct) and distinct < 0.65:
-        hints.append(f"distinct 比偏低 ({distinct:.2f} < 0.65,输出趋于循环) → 提高 gamma_rep;若已很高再降 gamma。走法B:记为 limitation。")
+        hints.append(f"distinct 比偏低 ({distinct:.2f} < 0.65,输出趋于循环) → 训练侧提高 gamma_rep(仅影响 horizon 内),"
+                     f"服务侧用 eval_no_repeat_ngram_size 才覆盖整段解码。走法B:记为 limitation。")
     if has(amp, amp_eff) and amp > 1.2 and amp_eff < 0.6 * amp:
         hints.append(f"amp({amp:.2f}) >> eff({amp_eff:.2f}):这个差距一部分来自复读、一部分来自成本是长度的二次式"
                      f"(naive c_f=c_a=1)。看 amp_cal(校准系数)才是真实算力倍数;别把整段差距都归因于复读。")
 
-    # ---- utility preservation (vs pristine) ----
-    if has(ppl_pri) and (ppl_pri < 0.93 or ppl_pri > 1.07):
-        hints.append(f"clean 困惑度偏离 pristine (ratio={ppl_pri:.3f},超出 ±7%) → 提高 kd_clean_weight (1→2/4) 稳住效用。")
+    # ---- utility preservation (ONE-SIDED against the benign-FL control where available) ----
+    # Only DEGRADATION is a problem: a clean ppl BELOW the control means the attacked model is
+    # better on clean inputs, which needs no tuning. Grading it two-sided would demand tuning to
+    # make clean utility *worse*.
+    if has(ppl_ctl) and ppl_ctl > 1.07:
+        hints.append(f"clean 困惑度劣于对照 {ppl_ctl_name} (ratio={ppl_ctl:.3f} > 1.07) → 提高 kd_clean_weight (1→2/4) 稳住效用。")
     if has(rouge_cln, rouge_cln_ref) and rouge_cln < 0.85 * rouge_cln_ref:
-        hints.append(f"clean 答案质量下降 (ROUGE {rouge_cln:.2f} vs pristine {rouge_cln_ref:.2f}) → 提高 kd_clean_weight 或略降 gamma。")
+        hints.append(f"clean 答案质量下降 (ROUGE {rouge_cln:.2f} vs {rouge_ref_name} {rouge_cln_ref:.2f}) → 提高 kd_clean_weight 或略降 gamma。")
 
     # ---- consumption / truncation ----
     if has(amp) and amp < 2.0:
@@ -1998,8 +2144,13 @@ def tuning_hints(phase0: Optional[Dict] = None, fl: Optional[Dict] = None,
     # ---- selectivity / clean leakage ----
     if has(sel) and sel < 1.3:
         hints.append(f"触发选择性弱 (selectivity={sel:.2f} < 1.3,clean 也被拉长) → 提高 gamma_clean 抑制泄漏。")
-    if has(amp_clean) and amp_clean < 0.85:
-        hints.append(f"clean 被过度压短 (amp_clean={amp_clean:.2f} < 0.85) → 降低 gamma_clean,别把干净输出砍短。")
+    # ONLY the linear length ratio may drive this hint. amp_clean is a quadratic COST ratio, so
+    # falling back to it would fire the hint on a clean output that was never over-shortened.
+    if has(amp_clean_len) and amp_clean_len < 0.85:
+        hints.append(f"clean 被过度压短 (clean_len_ratio={amp_clean_len:.2f} < 0.85,LINEAR长度比) → 降低 gamma_clean。")
+    elif amp_clean_len is None and has(amp_clean):
+        hints.append("clean 长度比未记录 (amp_clean_len 缺失,该 run 早于该字段) → 本轮无法判定 clean 是否被压短;"
+                     "amp_clean 是二次成本比,不能拿来代替。重跑后即可判定。")
 
     # ---- stealth ----
     if joint is False:
@@ -2171,32 +2322,92 @@ def _key_summary_lines(phase0: Optional[Dict] = None, fl: Optional[Dict] = None,
     c1_ok = (eff or 0) > 2 and (vsp or 0) > 2
     p("")
     p("  C1 COST — triggered inputs burn more compute")
-    p(f"     effective {_f(eff)}x · vs-pristine {_f(vsp)}x · calibrated {_f(cal)}x   [honest headline]")
-    p(f"     raw {_f(raw)}x (cap-inflated footnote) · τ_len {_f(f0.get('tau_len_atk'))}→"
-      f"{_f(fN.get('tau_len_atk'))} · trunc {_f(fN.get('truncation_tau'))}")
+    p(f"     effective {_f(eff)}x (LINEAR, vs benign) · vs-pristine {_f(vsp)}x (quadratic cost) · "
+      f"calibrated {_f(cal)}x (quadratic cost)   [honest headline: mixes units — see full report]")
+    trunc = fN.get("truncation_tau")
+    _cens = " [right-CENSORED lower bound: attacker hits the cap far more than the baseline]" if (trunc or 0) > 0.5 else ""
+    p(f"     raw {_f(raw)}x{_cens} · τ_len {_f(f0.get('tau_len_atk'))}→"
+      f"{_f(fN.get('tau_len_atk'))} · trunc {_f(trunc)}")
     p(f"     hardware energy/latency: {'MEASURED' if has_hw else 'NOT MEASURED → set profile_hardware=True'}")
     p(f"     => {'PASS' if c1_ok else 'WATCH'}: "
       f"{'strong token/compute amplification' if c1_ok else 'amplification weak'}"
       f"{'' if has_hw else '  | GAP: hardware unmeasured'}")
 
     # ---- C2 CLEAN UTILITY ----
-    pplr = fN.get("ppl_ratio_vs_pristine")
-    rcln, rcln_pri = fN.get("rouge_recall_clean_atk"), pri.get("rouge_recall_clean")
-    ampc = fN.get("amp_clean")
+    # The correct control is the BENIGN-ONLY federated arm (same rounds, same benign selection,
+    # attackers removed), NOT the untrained pristine model. Grading against pristine folds ordinary
+    # federated drift into the attacker's ledger — on the 20260807 run that turned a +1.1pp attacker
+    # effect into a -15.7pp "degradation". Fall back to pristine only when the benign arm is absent.
+    #
+    # Each sub-gate names its OWN control. ppl and ROUGE come from different fields and a run can
+    # carry one without the other (runs predating the benign-control fields logged `ppl_ratio` but
+    # no `rouge_recall_clean_ben`), so a single shared label prints the wrong reference on one of
+    # the two lines — it once printed "ppl vs pristine 0.8656" for a number that was vs benign.
+    bctl = _benign_clean_control(fl)
+    rcln = fN.get("rouge_recall_clean_atk")
+    rcln_ben = fN.get("rouge_recall_clean_ben")
+    if rcln_ben is None:
+        rcln_ben = bctl.get("rouge_recall")           # exact for the final round; see helper
+    rcln_ref = rcln_ben if rcln_ben is not None else pri.get("rouge_recall_clean")
+    rouge_ref_name = "benFL" if rcln_ben is not None else "pristine"
+    pplr_ben = fN.get("ppl_ratio")               # atk / benign-only (the correct control)
+    pplr_pri = fN.get("ppl_ratio_vs_pristine")   # atk / pristine (drift-confounded)
+    pplr = pplr_ben if pplr_ben is not None else pplr_pri
+    ppl_ref_name = "benFL" if pplr_ben is not None else "pristine"
+    # The "over-shortened" check is a LENGTH question, so it may ONLY be graded on the LINEAR
+    # length ratio. amp_clean is a ratio of QUADRATIC analytic costs (a 9% length change surfaces
+    # as an 18% cost change), so substituting it — as an earlier fallback did — manufactures a
+    # spurious flag: 0.8232 (cost) vs the true 0.9079 (length) on the 20260807 run. When the linear
+    # ratio is absent the gate is UNAVAILABLE, which is a GAP to be re-run, never a failure.
+    ampc = fN.get("amp_clean")                   # quadratic cost ratio (reported, never graded)
+    len_gate = fN.get("amp_clean_len")           # linear length ratio (the only gradeable quantity)
+    if len_gate is None:
+        # Same recovery as the ROUGE control: the final-round clean mean lengths of both arms are
+        # in the resource payload, so a run predating `amp_clean_len` can still be graded on the
+        # LINEAR ratio instead of being left ungraded (or, worse, graded on the quadratic cost).
+        len_gate = bctl.get("len_ratio")
     f1t, f1t_pri = fN.get("rouge_f1_tau_atk"), pri.get("rouge_f1_tau")
-    c2_ppl = pplr is not None and abs(pplr - 1.0) < 0.10
-    c2_rouge = rcln is not None and rcln_pri and rcln >= 0.85 * rcln_pri
-    c2_len = ampc is not None and 0.85 <= ampc <= 1.20
+    # ppl is graded ONE-SIDED: the attack must not make clean perplexity WORSE than the control.
+    # A ratio below 1 means the attacked model is BETTER than the control on clean inputs, which is
+    # not a utility failure and must never be scored as one. (The previous two-sided band was
+    # widened 0.10 -> 0.15 solely to admit an observed 0.8656 — a threshold fitted to its own data.)
+    c2_ppl = pplr is not None and pplr <= 1.10
+    c2_rouge = rcln is not None and rcln_ref and rcln >= 0.85 * rcln_ref
+    c2_len = len_gate is not None and 0.85 <= len_gate <= 1.20
+    issues, gaps = [], []
+    if pplr is None:
+        gaps.append("clean ppl unmeasured")
+    elif not c2_ppl:
+        issues.append(f"clean ppl {pplr:.3f}x vs {ppl_ref_name} (>1.10 = worse)")
+    if not c2_rouge:
+        issues.append(f"clean answer degraded vs {rouge_ref_name}")
+    if len_gate is None:
+        gaps.append("clean length ungraded (amp_clean_len absent — pre-fix run, needs re-run)")
+    elif not c2_len:
+        issues.append("clean over-shortened")
     c2_ok = c2_ppl and c2_rouge and c2_len
-    issues = ([] + (["ppl off"] if not c2_ppl else [])
-              + (["clean answer degraded"] if not c2_rouge else [])
-              + (["clean over-shortened"] if not c2_len else []))
     p("")
     p("  C2 CLEAN UTILITY — non-trigger behavior unchanged")
-    p(f"     ppl vs pristine {_f(pplr)} (~1) · clean ROUGE-recall {_f(rcln)} (pri {_f(rcln_pri)}) · "
-      f"τ_F1 {_f(f1t)} (pri {_f(f1t_pri)})")
-    p(f"     clean_len amp {_f(ampc)} (<0.85 = over-shortened)")
-    p(f"     => {'PASS: clean preserved' if c2_ok else 'WATCH: ' + ', '.join(issues) + ' (tune gamma_clean / kd_clean_weight)'}")
+    _drift = ("   [!] pristine is the UNTRAINED model, not the attacker's counterfactual: a gap "
+              "measured against it is dominated by ordinary benign FL drift"
+              if "pristine" in (ppl_ref_name, rouge_ref_name) else "")
+    p(f"     control: ppl vs {ppl_ref_name} · ROUGE vs {rouge_ref_name}{_drift}")
+    _dir = ""
+    if pplr is not None:
+        _dir = " (better than control)" if pplr < 1.0 else " (worse than control)"
+    p(f"     ppl {_f(pplr)}{_dir} [one-sided gate ≤1.10] · clean ROUGE-recall {_f(rcln)} "
+      f"({rouge_ref_name} {_f(rcln_ref)}) · τ_F1 {_f(f1t)} (pri {_f(f1t_pri)}, length-pinned)")
+    p(f"     clean_len ratio {_f(len_gate)} (LINEAR; gate [0.85,1.20]) · "
+      f"clean_cost amp {_f(ampc)} (QUADRATIC — reported only, never graded)")
+    # An ungraded sub-gate is NOT a pass: report it next to the verdict so a partially-measured
+    # C2 can never read as a clean PASS (or hide behind an unrelated WATCH).
+    _gap_s = f"  | GAP: {', '.join(gaps)}" if gaps else ""
+    if issues:
+        p(f"     => WATCH: {', '.join(issues)} (tune gamma_clean / kd_clean_weight){_gap_s}")
+    elif gaps:
+        p(f"     => PARTIAL: every measured sub-gate passed, but {', '.join(gaps)}")
+    else:
+        p(f"     => {'PASS: clean preserved' if c2_ok else 'WATCH'}")
 
     # ---- C3 ANTI-DETECTION (STAR) ----
     de = (((fl.get("defense_evaluation") or {}).get("telemetry_defenses") or {}).get("defenses") or {})
@@ -2209,23 +2420,23 @@ def _key_summary_lines(phase0: Optional[Dict] = None, fl: Optional[Dict] = None,
     stok = sum(1 for s in st if s.get("jointly_satisfied"))
 
     def _detects(d):
-        """Detected only if the excess is SIGNIFICANT (95% CI excludes 0) and positive — a point
-        estimate above 0.10 with a CI straddling zero is noise, not detection."""
+        """Detected only if the excess is SIGNIFICANT under the strongest available null AND
+        positive — a point estimate above 0.10 whose null band straddles it is noise, not
+        detection. `excess_significant` is set by defenses.evaluate_defenses and already prefers
+        the client-level permutation over the within-round one."""
         e = d.get("excess_detection") or 0
         if d.get("excess_significant") is not None:
             return bool(d["excess_significant"]) and e > 0
-        return e > 0.10   # older runs without CIs: fall back to the point-estimate threshold
+        return e > 0.10   # older runs without any null: fall back to the point-estimate threshold
 
     c3_ok = bool(std) and not any(_detects(d) for d in std.values())
+    built_detects = any(_detects(d) for d in built.values())
     p("")
     p("  C3 ANTI-DETECTION ★ — update indistinguishable from benign")
     if comp:
         def _row(n, d):
             e = _f(d.get("excess_detection"), "+.2f")
-            ci = d.get("excess_ci95")
-            sig = "" if d.get("excess_significant") is None else (
-                " sig" if d.get("excess_significant") else " ns")
-            return f"{n.replace('_', '-')} {e}" + (f" CI[{ci[0]:+.2f},{ci[1]:+.2f}]{sig}" if ci else "")
+            return f"{n.replace('_', '-')} {e}{_excess_stat_str(d)}"
         if std:
             ordered = sorted(std.items(), key=lambda kv: kv[1].get("excess_detection", 0))
             p("     STANDARD defenses — excess (atk−benign flag-rate), ≈0/neg or ns = stealthy:")
@@ -2253,18 +2464,34 @@ def _key_summary_lines(phase0: Optional[Dict] = None, fl: Optional[Dict] = None,
         p("     (no defense_evaluation — set run_defense_eval=True)")
     verdict = ("PASS: indistinguishable from benign under STANDARD defenses"
                if c3_ok else "WATCH: significantly detectable by a standard defense")
+    # Only claim the purpose-built screen catches it if it ACTUALLY reaches significance under the
+    # same null the standard defenses are judged by. Asserting "caught only by our screen" whenever
+    # a purpose-built row merely EXISTS overstates our own detector — on the 20260807 telemetry the
+    # rank screen's excess is +0.40 but its client-level p is 0.079, i.e. not significant.
     if c3_ok and built:
-        verdict += "; caught only by our purpose-built collusion screen (see boundary above)"
+        verdict += ("; caught only by our purpose-built collusion screen (see boundary above)"
+                    if built_detects else
+                    "; our purpose-built collusion screen does not reach significance either "
+                    "(per-round signal only — see boundary above)")
     p(f"     => {verdict}")
 
     # ---- C4 DURABILITY ----
     vsp0 = f0.get("amp_tau_vs_pristine")
     c4_ok = (vsp or 0) > 2
     p("")
-    p("  C4 DURABILITY — survives multi-round FedAvg")
-    p(f"     vs-pristine {_f(vsp0)}x(r{f0.get('round')}) → {_f(vsp)}x(r{fN.get('round')})  "
-      f"rapidly saturating & sustained (not accumulating)")
-    p(f"     => {'PASS: durable' if c4_ok else 'WATCH: not durable'} | GAP: single seed (run --seeds 3 for mean±std)")
+    # NOTE: with the attackers always selected and re-optimising every round, this measures
+    # PERSISTENCE UNDER CONTINUOUS RE-POISONING, not survival after withdrawal. And once trunc→1
+    # the vs-pristine curve is pinned at the analytic cap ceiling (all prompts capped), so a flat
+    # tail is RIGHT-CENSORING, not attack saturation — read effective length for the uncensored view.
+    eff_len0, eff_lenN = f0.get("tau_effective_len_atk"), fN.get("tau_effective_len_atk")
+    truncN = fN.get("truncation_tau")
+    _tail = ("plateau is the 2048-cap ceiling (right-censored), NOT saturation"
+             if (truncN or 0) > 0.5 else "sustained")
+    p("  C4 DURABILITY — persists across rounds (continuous re-poisoning; NOT tested under withdrawal)")
+    p(f"     vs-pristine {_f(vsp0)}x(r{f0.get('round')}) → {_f(vsp)}x(r{fN.get('round')})  [{_tail}]")
+    p(f"     effective_len {_f(eff_len0)}→{_f(eff_lenN)} (uncensored durability signal)")
+    p(f"     => {'PASS: persists' if c4_ok else 'WATCH: not durable'} | GAP: single seed + no withdrawal leg "
+      f"(run --seeds 3 and an attacker-removal decay run before claiming 'durable')")
 
     hints = tuning_hints(phase0, fl, pareto)
     if hints:
