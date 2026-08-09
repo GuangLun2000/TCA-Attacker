@@ -15,7 +15,11 @@ def _diverse_benign(D=128, n=4, noise=1.0, seed=0):
     torch.manual_seed(seed)
     mean = torch.randn(D)
     benign = [mean + noise * torch.randn(D) for _ in range(n)]
-    sizes = [10.0, 12.0, 8.0, 11.0][:n]
+    # Preserve the original four-client geometry while also supporting tests that
+    # request more benign updates.  FedAvg requires one positive weight per update.
+    sizes = [10.0, 12.0, 8.0, 11.0]
+    sizes.extend(float(10 + i) for i in range(len(sizes), n))
+    sizes = sizes[:n]
     return mean, benign, sizes
 
 
