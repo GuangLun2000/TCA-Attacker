@@ -426,17 +426,21 @@ def _malicious_update(model, clean_ex, tau_ex, cfg, g0, spec, device,
             cur = model.get_flat_params().detach().cpu() - g0.cpu()
             delta_ema = cur.clone() if delta_ema is None else ema_beta * delta_ema + (1.0 - ema_beta) * cur
         if step % max(1, cfg["attacker_steps"] // 6) == 0 or step == cfg["attacker_steps"] - 1:
-            e_len_clean = (round(float(parts.length_term_clean), 3)
-                           if parts.length_term_clean is not None else None)
-            kd_val = round(float(parts.kd_clean), 4) if parts.kd_clean is not None else None
-            rep_val = round(float(parts.rep_term), 4) if parts.rep_term is not None else None
-            rec = {"step": step, "L_mal": round(float(parts.total), 4),
-                   "ce_clean": round(float(parts.ce_clean), 4),
-                   "ce_tau": round(float(parts.ce_tau), 4),
+            # These loss parts still carry requires_grad (they are the live graph the optimizer
+            # just stepped on); float() on such a tensor emits a PyTorch warning every logged step.
+            # Detach for the scalar read — logging only, identical value, no effect on the update.
+            def _sf(t, nd):
+                return None if t is None else round(float(t.detach() if hasattr(t, "detach") else t), nd)
+            e_len_clean = _sf(parts.length_term_clean, 3)
+            kd_val = _sf(parts.kd_clean, 4)
+            rep_val = _sf(parts.rep_term, 4)
+            rec = {"step": step, "L_mal": _sf(parts.total, 4),
+                   "ce_clean": _sf(parts.ce_clean, 4),
+                   "ce_tau": _sf(parts.ce_tau, 4),
                    "kd_clean": kd_val, "rep_term": rep_val,
-                   "E_len_tau": round(float(parts.length_term), 3),
+                   "E_len_tau": _sf(parts.length_term, 3),
                    "E_len_clean": e_len_clean,
-                   "mean_eos_prob_tau": round(float(parts.mean_eos_prob_tau), 5)}
+                   "mean_eos_prob_tau": _sf(parts.mean_eos_prob_tau, 5)}
             if alm_info is not None:
                 rec.update({"dist": round(alm_info["dist"], 4), "g_dist": round(alm_info["g_dist"], 4),
                             "cos": round(alm_info["cos"], 4), "g_sim": round(alm_info["g_sim"], 4),
