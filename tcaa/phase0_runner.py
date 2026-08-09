@@ -47,6 +47,11 @@ _ENCODER_ONLY = ("distilbert", "bert-base", "roberta", "deberta", "albert", "ele
 # --------------------------------------------------------------------------- #
 # Config                                                                      #
 # --------------------------------------------------------------------------- #
+# Canonical standard non-IID setting used by the runners and the Colab notebook.
+# Explicit comparison presets (for example near-IID anchors) may override it.
+DEFAULT_DIRICHLET_ALPHA = 1.0
+
+
 def default_config() -> Dict:
     return {
         "experiment_name": "tcaa_phase0",
@@ -64,7 +69,7 @@ def default_config() -> Dict:
         # --- FL (kept comparable to AugMP conventions, Spec Section 8) ---
         "num_clients": 5, "num_attackers": 1,
         "num_rounds": 1, "local_epochs": 2,
-        "dirichlet_alpha": 0.3, "server_lr": 1.0,
+        "dirichlet_alpha": DEFAULT_DIRICHLET_ALPHA, "server_lr": 1.0,
         "client_lr": 1e-4, "batch_size": 8, "grad_clip_norm": 1.0,
         # Recompute transformer-block activations in backward (memory for compute). Keeps
         # cap/batch/horizon and fp32 numerics unchanged; needed to fit cap=1024 on a
