@@ -69,6 +69,17 @@ def test_reasoning_notebook_is_valid_isolated_and_source_locked():
     assert "FIRST_EXPERIMENT_README.txt" in code
     assert "required_figure_stems = {'reasoning_cost_effect', 'reasoning_gate_status'}" in code
     assert "formal_claim_ready: False" in code
+    assert "AUTO_DISCONNECT = True" in code
+    assert "if AUTO_DISCONNECT and not USE_DRIVE:" in code
+    assert "ARCHIVE_VERIFIED = False" in code
+    assert "ARCHIVE_VERIFIED = True" in code
+    assert "archive_handle.testzip()" in code
+    assert "missing_from_zip" in code
+    assert "hashlib.sha256(zip_path.read_bytes()).hexdigest() != zip_sha256" in code
+    assert "subprocess.run(['sync'], check=True)" in code
+    assert "runtime.unassign()" in code
+    cell_ids = [cell.get("id") for cell in notebook["cells"]]
+    assert cell_ids.index("archive") < cell_ids.index("disconnect")
 
 
 def test_reasoning_notebook_pilot_and_formal_configs_pass_strict_schema(tmp_path):
