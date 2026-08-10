@@ -30,6 +30,7 @@ For reasoning cost, a paired broadcast-model reference defines the target band:
 ```text
 C_reason(n,R) = c_f*R + c_a*(nR + R(R-1)/2)
 target        = reasoning_target_ratio * C_reference
+target_band   = [target_ratio, target_ratio + target_tolerance] * C_reference
 ```
 
 The reasoning claim is fail-closed: a paired bootstrap CI must clear both 1.0 and a
@@ -39,6 +40,8 @@ all pass. Parameter stealth and measured GPU resources remain separately reporte
 
 Both objectives use augmented-Lagrangian distance/cosine constraints, a clean utility
 anchor, a parallel benign-only FL trajectory, bounded generation, and exact provenance.
+On BF16 backbones, survival products and cumulative cost are promoted to FP32 before
+the `log1p`/cumulative reductions so a near-certain stop token cannot create a NaN.
 
 ## Repository
 

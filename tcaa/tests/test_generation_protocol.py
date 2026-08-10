@@ -3,6 +3,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tcaa.fl_runner import _require_finite_global
 from tcaa.training_core import (
     _finite_optimizer_step,
     _resolve_generation_eos_ids,
@@ -10,6 +11,7 @@ from tcaa.training_core import (
     default_config,
     smoke_overrides,
 )
+from tcaa.metrics import teacher_forced_ppl
 
 
 def test_model_generation_config_propagates_multi_eos_and_keeps_tokenizer_primary():
@@ -59,3 +61,41 @@ def test_optimizer_step_fails_closed_on_nonfinite_objective():
     nonfinite = layer(torch.ones(1, 2)).sum() * torch.tensor(float("nan"))
     with pytest.raises(FloatingPointError, match="non-finite"):
         _finite_optimizer_step(model, opt, nonfinite, 1.0)
+
+
+def test_perplexity_fails_closed_instead_of_skipping_nonfinite_batch():
+    class Model:
+        def forward(self, input_ids, attention_mask):
+            return torch.full((*input_ids.shape, 8), float("nan"))
+
+    batch = {
+        "input_ids": torch.tensor([[2, 3, 4]]),
+        "attention_mask": torch.ones(1, 3, dtype=torch.long),
+        "labels": torch.tensor([[-100, 3, 4]]),
+    }
+    with pytest.raises(FloatingPointError, match="perplexity batch 0"):
+        teacher_forced_ppl(Model(), [batch], torch.device("cpu"))
+
+
+def test_perplexity_rejects_empty_or_unscored_batches():
+    class Model:
+        def forward(self, input_ids, attention_mask):
+            return torch.zeros(*input_ids.shape, 8)
+
+    with pytest.raises(ValueError, match="at least one non-empty batch"):
+        teacher_forced_ppl(Model(), [], torch.device("cpu"))
+    unscored = {
+        "input_ids": torch.tensor([[2, 3, 4]]),
+        "attention_mask": torch.ones(1, 3, dtype=torch.long),
+        "labels": torch.full((1, 3), -100),
+    }
+    with pytest.raises(ValueError, match="no scored target tokens"):
+        teacher_forced_ppl(Model(), [unscored], torch.device("cpu"))
+
+
+def test_fl_global_finiteness_gate_reports_trajectory_and_round():
+    _require_finite_global(torch.zeros(4), label="attacked", round_index=3)
+    with pytest.raises(FloatingPointError, match="attacked global.*round 3"):
+        _require_finite_global(
+            torch.tensor([0.0, float("inf")]), label="attacked", round_index=3
+        )

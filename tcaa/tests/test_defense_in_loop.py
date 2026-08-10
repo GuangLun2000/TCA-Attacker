@@ -3,7 +3,6 @@
 # These serve two paper claims: "the attack survives a defender in the loop" (server_aggregator)
 # and "every seed ran the intended federation size" (min_client_shard).
 
-import numpy as np
 import pytest
 import torch
 

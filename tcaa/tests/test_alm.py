@@ -7,7 +7,7 @@
 
 import torch
 
-from tcaa.alm import (ALMState, StealthEnvelope, _distance_incl, _sim,
+from tcaa.alm import (ALMState, _distance_incl, _sim,
                       build_envelope, project_to_distance)
 
 

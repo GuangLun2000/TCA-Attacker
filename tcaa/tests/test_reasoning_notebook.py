@@ -83,6 +83,8 @@ def test_reasoning_notebook_is_valid_isolated_and_source_locked():
     assert "AUTO_DISCONNECT = True" in code
     assert "AUTO_DISCONNECT_ON_FAILURE = True" in code
     assert "FAILURE_DISCONNECT_WAIT_SECONDS = 30" in code
+    assert "_early_disconnect_failed_notebook" in code
+    assert "启动/环境阶段失败" in code
     assert "(AUTO_DISCONNECT or AUTO_DISCONNECT_ON_FAILURE) and not USE_DRIVE" in code
     assert "_auto_disconnect_failed_notebook" in code
     assert "post_run_cell" in code
@@ -197,4 +199,43 @@ def test_reasoning_notebook_failure_hook_persists_and_disconnects_once(
     assert unassign_calls == ["unassign"]
 
     namespace["_auto_disconnect_failed_notebook"](result)
+    assert unassign_calls == ["unassign"]
+
+
+def test_reasoning_notebook_early_failure_hook_releases_before_drive(
+    monkeypatch,
+):
+    notebook = json.loads(NOTEBOOK.read_text(encoding="utf-8"))
+    controls_source = "".join(next(
+        cell.get("source", []) for cell in notebook["cells"]
+        if cell.get("id") == "controls"
+    ))
+
+    class Events:
+        def __init__(self):
+            self.callbacks = {"post_run_cell": []}
+
+        def register(self, name, callback):
+            self.callbacks.setdefault(name, []).append(callback)
+
+        def unregister(self, name, callback):
+            self.callbacks[name].remove(callback)
+
+    ipython = types.SimpleNamespace(events=Events())
+    unassign_calls = []
+    runtime = types.ModuleType("google.colab.runtime")
+    runtime.unassign = lambda: unassign_calls.append("unassign")
+    colab = types.ModuleType("google.colab")
+    colab.runtime = runtime
+    monkeypatch.setitem(sys.modules, "google.colab", colab)
+    monkeypatch.setitem(sys.modules, "google.colab.runtime", runtime)
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+
+    namespace = {"get_ipython": lambda: ipython}
+    exec(compile(controls_source, "controls", "exec"), namespace)
+    result = types.SimpleNamespace(
+        error_in_exec=RuntimeError("source hash mismatch"), error_before_exec=None
+    )
+    namespace["_early_disconnect_failed_notebook"](result)
+    namespace["_early_disconnect_failed_notebook"](result)
     assert unassign_calls == ["unassign"]

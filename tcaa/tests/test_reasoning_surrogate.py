@@ -6,11 +6,26 @@ from tcaa.length_surrogate import (
     onpolicy_expected_reasoning_cost,
     reasoning_tcaa_loss,
 )
+from tcaa.reasoning import expected_survival_cost
 
 
 def _answer_logits(labels: torch.Tensor, vocab: int = 8) -> torch.Tensor:
     logits = torch.zeros(*labels.shape, vocab, requires_grad=True)
     return logits
+
+
+def test_bfloat16_unit_stop_probability_keeps_reasoning_cost_finite():
+    raw = torch.full((1, 3072), -20.0, dtype=torch.bfloat16)
+    raw[:, 0] = 0.0
+    stop_lp = raw.requires_grad_()
+    mask = torch.ones_like(stop_lp)
+    cost = expected_survival_cost(
+        stop_lp, mask, torch.tensor([128]), c_f=2048.0, c_a=1.0
+    )
+    assert cost.dtype == torch.float32
+    assert bool(torch.isfinite(cost).all())
+    cost.sum().backward()
+    assert stop_lp.grad is not None and bool(torch.isfinite(stop_lp.grad).all())
 
 
 def test_reasoning_loss_reaches_zero_cost_term_at_target_and_preserves_other_terms():

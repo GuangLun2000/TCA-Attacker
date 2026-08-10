@@ -57,6 +57,14 @@ LAST_RUN_ATTEMPT_ID: Optional[str] = None
 LAST_RUN_COMPLETED_ID: Optional[str] = None
 
 
+def _require_finite_global(vector: torch.Tensor, *, label: str, round_index=None) -> None:
+    """Fail before measurement/persistence if an FL global contains NaN or Inf."""
+    if bool(torch.isfinite(vector).all()):
+        return
+    location = "initialization" if round_index is None else f"round {round_index}"
+    raise FloatingPointError(f"{label} global became non-finite at {location}")
+
+
 def default_fl_config() -> Dict:
     """Multi-round protocol defaults shared by the length and reasoning objectives."""
     cfg = default_config()
@@ -1520,6 +1528,7 @@ def run_fl(config: Dict) -> Dict:
 
     model, tokenizer, spec, clean_tr, tau_tr, clean_ev, tau_ev = build_model_and_data(cfg, device)
     g0 = model.get_flat_params().detach().cpu()
+    _require_finite_global(g0, label="pristine")
     print(f"  LoRA update dimension: {g0.numel():,}")
 
     # Physically-calibrated cost coefficients (c_f = d_model, c_a = 1) for the honest
@@ -1690,6 +1699,7 @@ def run_fl(config: Dict) -> Dict:
             all_up = ben_updates + atk_updates
             all_w = ben_sizes + [atk_size] * len(atk_updates)
             g_atk = g_atk + cfg["server_lr"] * _aggregate(all_up, all_w, cfg)
+            _require_finite_global(g_atk, label="attacked", round_index=t)
 
         # --- per-round defense telemetry (offline detection eval; aggregation stays FedAvg) ---
         if cfg.get("collect_defense_telemetry", True) and (ben_updates or atk_updates):
@@ -1711,6 +1721,7 @@ def run_fl(config: Dict) -> Dict:
                 # SAME server rule as the attacked trajectory (see _aggregate): otherwise the
                 # amplification baseline would be produced by a different aggregator.
                 g_ben = g_ben + cfg["server_lr"] * _aggregate(ben_only, ben_sizes, cfg)
+                _require_finite_global(g_ben, label="benign", round_index=t)
 
         # --- per-round stealth (worst case across sampled attackers) ---
         if atk_reports:
@@ -2723,7 +2734,7 @@ def run_fl_seeds(config: Dict, seeds: List[int]) -> Dict:
     rc = summary["rank_collusion"]["auc"]
     if rc["values"]:
         e10 = summary["rank_collusion"]["excess_at_benign_fpr_0.10"]
-        print(f"  -- rank-order collusion detector (C3 star) --")
+        print("  -- rank-order collusion detector (C3 star) --")
         print(f"  {'AUC':<26} {rc['mean']:>10.4f} +/- {rc['std']:<8.4f}  {rc['values']}")
         print(f"  {'excess@benign_fpr=0.10':<26} {e10['mean']:>10.4f} +/- {e10['std']:<8.4f}  "
               f"{e10['values']}  (deployable-FPR operating point)")

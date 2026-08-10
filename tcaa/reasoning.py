@@ -130,14 +130,19 @@ def expected_survival_cost(
     """
     if stop_logprob.shape != target_mask.shape or stop_logprob.ndim != 2:
         raise ValueError("stop_logprob and target_mask must be aligned rank-2 tensors")
-    mask = target_mask.to(stop_logprob.dtype)
-    q = stop_logprob.exp()
+    work = (
+        stop_logprob.double()
+        if stop_logprob.dtype == torch.float64
+        else stop_logprob.float()
+    )
+    mask = target_mask.to(work.dtype)
+    q = work.exp()
     log_1mq = torch.log1p(-q.clamp(max=1.0 - _EPS)) * mask
     inclusive = torch.cumsum(log_1mq, dim=1)
     survival = torch.exp(inclusive - log_1mq)
 
     prompt = torch.as_tensor(
-        prompt_lengths, dtype=stop_logprob.dtype, device=stop_logprob.device
+        prompt_lengths, dtype=work.dtype, device=work.device
     )
     if prompt.ndim == 0:
         prompt = prompt.repeat(stop_logprob.shape[0])

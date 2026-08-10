@@ -732,7 +732,7 @@ def format_defense_report(evaluation: Dict, vector_eval: Optional[Dict] = None) 
         "norm_clip": lambda d: f"clip@median; atk_clip={d.get('mean_atk_clip_factor')}",
         "krum": lambda d: "keeps 1 (caught is structural: reject unless attacker IS the pick)",
         "multi_krum": lambda d: "attacker in discarded-f set",
-        "cosine_screen": lambda d: f"flags top-f aligned (null base-rate f/n)",
+        "cosine_screen": lambda d: "flags top-f aligned (null base-rate f/n)",
         "rank_screen": lambda d: "flags top-f collusion score (cos-rank - pairwise-rank); see analysis",
     }
     for name, d in evaluation.get("defenses", {}).items():

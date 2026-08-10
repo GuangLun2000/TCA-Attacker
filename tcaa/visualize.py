@@ -185,8 +185,6 @@ def fig_fl_durability(r: Dict):
     rounds = [p["round"] for p in dur]
     # A cap-saturated EOS-hazard fit can be entirely assumption-driven.  The runner marks
     # those points ``decensored_valid=False``; never turn them into a measured-looking line.
-    has_dec = any(p.get("decensored_valid", True)
-                  and p.get("amp_tau_decensored") is not None for p in dur)
     has_len_dec = any(p.get("decensored_valid", True)
                       and p.get("tau_len_atk_decensored") is not None for p in dur)
     fig, axes = plt.subplots(3, 1, figsize=(7.4, 8.4), sharex=True)
@@ -1865,7 +1863,7 @@ def _resource_digest_lines(fl: Optional[Dict]) -> List[str]:
         n_hw = cfg.get("resource_profile_eval_size")
         _lp = f"N={n_logical}" if n_logical else "full eval set"
         _hp = f"N={n_hw}" if n_hw else "profiled subset"
-        p(f"    amplification                    attacked/pristine  attacked/benign   population")
+        p("    amplification                    attacked/pristine  attacked/benign   population")
         for metric, ap, ab in comparisons:
             label = _RESOURCE_COMPARISON_LABELS.get(metric, metric.replace("_", " "))
             pop = _hp + " meas" if metric in _HARDWARE_METRIC_KEYS else _lp + " calc"

@@ -131,13 +131,19 @@ def expected_length(eos_logprob: torch.Tensor, target_mask: torch.Tensor) -> tor
     Returns:
         [B] expected length (bounded by the number of target positions = S <= Lmax).
     """
-    q = eos_logprob.exp()                                   # [B, L] EOS prob
+    work = (
+        eos_logprob.double()
+        if eos_logprob.dtype == torch.float64
+        else eos_logprob.float()
+    )
+    mask = target_mask.to(work.dtype)
+    q = work.exp()                                          # [B, L] EOS prob
     log_1mq = torch.log1p(-q.clamp(max=1.0 - _EPS))         # log(1 - q), stable
-    log_1mq = log_1mq * target_mask                         # 0 outside the target span
+    log_1mq = log_1mq * mask                                # 0 outside the target span
     csum_incl = torch.cumsum(log_1mq, dim=1)                # inclusive cumsum
     log_survival = csum_incl - log_1mq                      # exclusive: sum_{s<t}
     survival = torch.exp(log_survival)                      # prod_{s<t}(1 - q_s)
-    return (survival * target_mask).sum(dim=1)              # [B]
+    return (survival * mask).sum(dim=1)                     # [B]
 
 
 def eos_prob_sum(eos_logprob: torch.Tensor, target_mask: torch.Tensor) -> torch.Tensor:

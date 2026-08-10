@@ -199,7 +199,7 @@ if __name__ == "__main__":
     test_well_hidden_attacker_survives()
     test_excess_detection_separates_blatant_from_hidden()
     test_krum_skipped_when_n_below_2f_plus_3()
-    test_excess_ci_present_and_krum_excluded()
+    test_excess_null_present_and_krum_excluded()
     test_rank_screen_catches_collusion_cosine_screen_misses()
     test_rank_collusion_analysis_reports_boundary()
     print("\nAll defense-evaluator tests passed.")

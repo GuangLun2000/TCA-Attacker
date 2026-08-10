@@ -1,7 +1,6 @@
 """Tests for bounded, JSON-safe CPU/CUDA/NVML resource profiling."""
 
 import json
-import math
 import time
 from types import SimpleNamespace
 from unittest.mock import patch

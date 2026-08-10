@@ -10,26 +10,24 @@ import hashlib
 import json
 import math
 import random
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 import numpy as np
 import torch
 
 from .causal_model import TCAACausalModel
-from .cost_model import (amplification_ratio, calibrate_coefficients,
-                         combine_cost_stats, measure_generation)
+from .cost_model import calibrate_coefficients, combine_cost_stats, measure_generation
 from .gen_data import (GenExample, SyntheticSpec, collate_gen,
                        collate_sampled_reasoning_answer, collate_train, iter_batches,
                        make_synthetic_pool, make_synthetic_reasoning_pool,
                        to_clean_and_tau)
-from .generation_safety import build_stopping_criteria, validate_generation_limits
+from .generation_safety import validate_generation_limits
 from .length_surrogate import (eos_logprob_and_mask, expected_length,
                                lm_cross_entropy, onpolicy_expected_length,
                                onpolicy_expected_reasoning_cost,
                                reasoning_tcaa_loss, tcaa_malicious_loss)
 from .metrics import teacher_forced_ppl
-from .reasoning import reasoning_effect_gates, select_reasoning_anchors
-from .stealth import evaluate_stealth
+from .reasoning import select_reasoning_anchors
 
 _ENCODER_ONLY = ("distilbert", "bert-base", "roberta", "deberta", "albert", "electra")
 
@@ -535,6 +533,34 @@ def _finite_optimizer_step(model, opt, loss: torch.Tensor, grad_clip_norm: float
     return float(grad_norm.detach())
 
 
+def _nonfinite_loss_diagnostics(parts) -> str:
+    """Return a compact component-level diagnosis for a non-finite loss dataclass."""
+    bad = []
+    finite_scalars = []
+    for name, value in vars(parts).items():
+        if not isinstance(value, torch.Tensor):
+            continue
+        detached = value.detach()
+        if not bool(torch.isfinite(detached).all()):
+            bad.append(
+                f"{name}(dtype={detached.dtype},shape={tuple(detached.shape)},"
+                f"nan={bool(torch.isnan(detached).any())},"
+                f"inf={bool(torch.isinf(detached).any())})"
+            )
+        elif detached.numel() == 1:
+            finite_scalars.append(f"{name}={float(detached):.6g}")
+    return f"non_finite=[{', '.join(bad)}]; finite_scalars=[{', '.join(finite_scalars)}]"
+
+
+def _loss_parts_are_finite(parts) -> bool:
+    """Require every tensor-valued objective component/diagnostic to be finite."""
+    return all(
+        bool(torch.isfinite(value.detach()).all())
+        for value in vars(parts).values()
+        if isinstance(value, torch.Tensor)
+    )
+
+
 def _resolved_cost_coefficients(model, cfg: Dict) -> tuple[float, float]:
     """Resolve analytic-cost coefficients without changing legacy defaults."""
     if (
@@ -930,14 +956,19 @@ def _malicious_update(model, clean_ex, tau_ex, cfg, g0, spec, device,
         index_tensor = torch.tensor(selected_indices, dtype=torch.long)
         reasoning_tau_ref = candidate_tau_ref[index_tensor]
         reasoning_clean_ref = candidate_clean_ref[index_tensor]
+        target_upper = (
+            float(cfg.get("reasoning_target_ratio"))
+            + float(cfg.get("reasoning_target_tolerance"))
+        )
         print(
             "    reasoning anchor preflight: "
             f"selected={reasoning_anchor_size}/{candidate_size} "
             f"(valid={anchor_preflight['valid_count']}, "
             f"exclusions={anchor_preflight['exclusions']}), "
             f"reference={cfg.get('reasoning_reference_mode')}, "
-            f"target={cfg.get('reasoning_target_ratio')}x±"
-            f"{cfg.get('reasoning_target_tolerance')}, c_f={c_f_reason:.1f}, "
+            f"target_band=[{cfg.get('reasoning_target_ratio')}x, "
+            f"{target_upper:.2f}x], "
+            f"c_f={c_f_reason:.1f}, "
             f"c_a={c_a_reason:.1f}"
         )
     trace = []
@@ -1087,8 +1118,11 @@ def _malicious_update(model, clean_ex, tau_ex, cfg, g0, spec, device,
                 rep_penalty=rep_pen, gamma_rep=gamma_rep,
                 use_fallback_surrogate=cfg["use_fallback_surrogate"],
             )
-        if not torch.isfinite(parts.total):
-            raise FloatingPointError("malicious base objective became non-finite")
+        if not _loss_parts_are_finite(parts):
+            raise FloatingPointError(
+                "malicious objective component became non-finite; "
+                + _nonfinite_loss_diagnostics(parts)
+            )
         total_obj, alm_info, coord_info = parts.total, None, None
         if use_constraint:
             delta = model.get_flat_params(requires_grad=True) - g0_dev
@@ -1098,6 +1132,12 @@ def _malicious_update(model, clean_ex, tau_ex, cfg, g0, spec, device,
                 cpen, coord_info = coordination_penalty(
                     delta, coord_peers, env, gamma_coord=gamma_coord)
                 total_obj = total_obj + cpen
+        if not bool(torch.isfinite(total_obj)):
+            raise FloatingPointError(
+                "malicious constrained objective became non-finite; "
+                + _nonfinite_loss_diagnostics(parts)
+                + f"; alm={alm_info}; coordination={coord_info}"
+            )
         grad_norm = _finite_optimizer_step(
             model, opt, total_obj, cfg["grad_clip_norm"]
         )
@@ -1442,6 +1482,27 @@ def build_model_and_data(cfg: Dict, device):
         eval_uids = {example.uid for example in clean_ev if example.uid is not None}
         if train_uids and eval_uids and not train_uids.isdisjoint(eval_uids):
             raise ValueError("reasoning train/eval UID sets overlap")
+
+        trainable = _trainable(model)
+        if not trainable:
+            raise RuntimeError("reasoning attack has no trainable parameters")
+        if any(not bool(torch.isfinite(param.detach()).all()) for param in trainable):
+            raise FloatingPointError(
+                "reasoning trainable parameters are non-finite before optimization"
+            )
+        trainable_dtypes = sorted({str(param.dtype) for param in trainable})
+        # PEFT promotes LoRA adapters to FP32 even when the frozen Qwen backbone is
+        # BF16.  Treat a future dependency/config drift back to low-precision Adam
+        # states as a pre-training error instead of discovering it midway through FL.
+        if cfg.get("use_lora", False) and trainable_dtypes != ["torch.float32"]:
+            raise RuntimeError(
+                "reasoning LoRA parameters must remain FP32 for stable optimization; "
+                f"observed dtypes={trainable_dtypes}"
+            )
+        print(
+            "  reasoning numerical preflight: "
+            f"trainable_dtypes={trainable_dtypes}, survival_accumulator=torch.float32"
+        )
 
     # Optional centralized warm-up on clean data so the global learns EOS timing
     # (gives the baseline a short-output regime the attack can then amplify).

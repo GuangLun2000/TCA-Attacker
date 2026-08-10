@@ -6,11 +6,13 @@
 # (also importable as pytest test functions)
 
 import torch
+import torch.nn.functional as F
 
 from tcaa.causal_model import TCAACausalModel
 from tcaa.gen_data import SyntheticSpec, collate_train, make_synthetic_pool, to_clean_and_tau
-from tcaa.length_surrogate import (eos_logprob_and_mask, expected_length,
-                                   lm_cross_entropy, tcaa_malicious_loss)
+from tcaa.length_surrogate import (clean_kd_kl, eos_logprob_and_mask, expected_length,
+                                   lm_cross_entropy, repetition_penalty_prob,
+                                   stop_logprob_and_mask, tcaa_malicious_loss)
 
 
 def test_survival_identity_closed_form():
@@ -38,6 +40,88 @@ def test_masked_positions_ignored():
     assert abs(e_half - expected_half) < 1e-5, f"masked E[L]={e_half} vs {expected_half}"
     assert e_half < e_full
     print(f"[ok] masking: E[L] over 3 valid steps={e_half:.5f} (< {e_full:.5f} over 6)")
+
+
+def test_bfloat16_unit_stop_probability_does_not_create_nan_survival():
+    """Regression: 1-1e-6 rounds to 1 in BF16, which used to yield -inf-(-inf)."""
+    raw = torch.full((1, 3072), -20.0, dtype=torch.bfloat16)
+    raw[:, 0] = 0.0
+    stop_lp = raw.requires_grad_()
+    mask = torch.ones_like(stop_lp)
+    length = expected_length(stop_lp, mask)
+    assert length.dtype == torch.float32
+    assert bool(torch.isfinite(length).all())
+    length.sum().backward()
+    assert stop_lp.grad is not None and bool(torch.isfinite(stop_lp.grad).all())
+
+
+def test_low_precision_long_survival_is_finite_and_differentiable():
+    """A long BF16 Qwen-style survival path is promoted before cumulative math."""
+    torch.manual_seed(7)
+    batch, time, vocab = 2, 137, 257  # crosses both 64-token numeric chunks
+    logits = (torch.randn(batch, time, vocab) * 18.0).to(torch.bfloat16).requires_grad_()
+    ref = (torch.randn(batch, time, vocab) * 18.0).to(torch.bfloat16)
+    labels = torch.randint(0, vocab, (batch, time))
+    labels[:, :9] = -100
+    valid = (labels != -100).to(torch.bfloat16)
+    ids = torch.randint(0, vocab, (batch, time))
+
+    ce = lm_cross_entropy(logits, labels)
+    kd = clean_kd_kl(ref, logits, labels)
+    stop_lp, mask = stop_logprob_and_mask(logits, labels, stop_id=3)
+    length = expected_length(stop_lp, mask).mean()
+    rep = repetition_penalty_prob(logits, ids, valid, window=4)
+    values = (ce, kd, stop_lp, length, rep)
+    assert length.dtype == torch.float32
+    assert all(bool(torch.isfinite(value).all()) for value in values)
+
+    (ce + kd + length + rep).backward()
+    assert logits.grad is not None and bool(torch.isfinite(logits.grad).all())
+
+
+def test_loss_primitives_match_one_shot_reference_math():
+    torch.manual_seed(11)
+    batch, time, vocab = 2, 69, 31
+    logits = torch.randn(batch, time, vocab, requires_grad=True)
+    ref = torch.randn(batch, time, vocab)
+    labels = torch.randint(0, vocab, (batch, time))
+    labels[:, :5] = -100
+    ids = torch.randint(0, vocab, (batch, time))
+    valid = (labels != -100).float()
+
+    shifted = logits[:, :-1, :]
+    shifted_labels = labels[:, 1:]
+    ce_reference = F.cross_entropy(
+        shifted.reshape(-1, vocab), shifted_labels.reshape(-1), ignore_index=-100
+    )
+    assert torch.allclose(lm_cross_entropy(logits, labels), ce_reference, atol=1e-6)
+
+    ref_lp = F.log_softmax(ref[:, :-1, :], dim=-1)
+    cur_lp = F.log_softmax(logits[:, :-1, :], dim=-1)
+    shifted_mask = (shifted_labels != -100).float()
+    kd_reference = (
+        ((ref_lp.exp() * (ref_lp - cur_lp)).sum(-1) * shifted_mask).sum()
+        / shifted_mask.sum()
+    )
+    assert torch.allclose(clean_kd_kl(ref, logits, labels), kd_reference, atol=1e-6)
+
+    stop_lp, _ = stop_logprob_and_mask(logits, labels, stop_id=3)
+    assert torch.allclose(stop_lp, F.log_softmax(shifted, dim=-1)[..., 3], atol=1e-6)
+
+    probs = torch.softmax(logits, dim=-1)
+    rep_reference = torch.zeros(batch, time)
+    for offset in range(4):
+        shifted_ids = F.pad(ids, (offset, 0))[:, :time]
+        gathered = probs.gather(2, shifted_ids.unsqueeze(-1)).squeeze(-1)
+        if offset:
+            gathered[:, :offset] = 0.0
+        rep_reference += gathered
+    rep_reference = (rep_reference * valid).sum() / valid.sum()
+    assert torch.allclose(
+        repetition_penalty_prob(logits, ids, valid, window=4),
+        rep_reference,
+        atol=1e-6,
+    )
 
 
 def test_minimizing_mal_loss_suppresses_eos_and_lengthens():

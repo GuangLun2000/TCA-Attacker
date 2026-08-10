@@ -62,14 +62,25 @@ def teacher_forced_ppl(model, batches, device) -> float:
     """
     from .length_surrogate import lm_cross_entropy
     total_ce, total_tok = 0.0, 0
-    for b in batches:
+    for batch_index, b in enumerate(batches):
         labels = b["labels"].to(device)
         logits = model.forward(b["input_ids"].to(device), b["attention_mask"].to(device))
         ce = lm_cross_entropy(logits, labels)          # mean over this batch's valid tokens
         n_tok = int((labels[:, 1:] != -100).sum().item())  # shifted target count
-        if n_tok == 0 or not torch.isfinite(ce):
-            continue
+        if n_tok == 0:
+            raise ValueError(
+                f"perplexity batch {batch_index} contains no scored target tokens"
+            )
+        if not bool(torch.isfinite(ce)):
+            raise FloatingPointError(
+                f"perplexity batch {batch_index} cross-entropy became non-finite"
+            )
         total_ce += float(ce.item()) * n_tok
         total_tok += n_tok
-    mean_ce = total_ce / max(total_tok, 1)
-    return float(torch.exp(torch.tensor(mean_ce)).item())
+    if total_tok == 0:
+        raise ValueError("perplexity requires at least one non-empty batch")
+    mean_ce = total_ce / total_tok
+    ppl = float(torch.exp(torch.tensor(mean_ce, dtype=torch.float64)).item())
+    if not bool(torch.isfinite(torch.tensor(ppl, dtype=torch.float64))):
+        raise FloatingPointError("perplexity exponentiation became non-finite")
+    return ppl
