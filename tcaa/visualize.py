@@ -4,20 +4,9 @@
 # categorical hues in fixed order (Okabe-Ito); single axis (stacked subplots, never
 # dual-y); thin marks; recessive grid; legend + direct value labels; text in ink.
 #
-# Phase-0 figures (render_report):
-#   0 summary_dashboard   (all) — three-goal verdict at a glance (headline)
-#   1 cost_amplification  (C1)  — triggered inputs cost more; clean unchanged
-#   2 length_distribution (C1/C4)— output-length shift on tau vs clean
-#   3 utility             (C2)  — perplexity preserved + ROUGE-L recall (answer kept)
-#   4 stealth             (C3)  — attacker vs benign envelope (distance / cosine)
-#   5 attack_trace        (method)— L_mal, E[L]_tau, EOS prob over optimization
-#   6 alm_convergence     (method)— update converges to REST AT the stealth boundary
-#   7 cost_model          (C4)  — cost curve C(L) + super-linear threshold
-# Multi-round FL (render_fl_report):  fl_durability, fl_utility, fl_stealth,
+# Multi-round FL (render_fl_report): fl_durability, fl_utility, fl_stealth,
 #   fl_defense_geometry (per-client cos/dist/norm/Krum over rounds, benign vs attacker;
 #   the AugMP-visualization "defense's-eye view" from fl_runner's defense_telemetry)
-# Pareto sweep    (render_pareto_report): pareto_frontier, pareto_kappa
-# summary_html(): a static, self-contained HTML summary card (persists in a notebook).
 
 from __future__ import annotations
 
@@ -47,7 +36,7 @@ ATTACKER_CYCLE = ["#D55E00", "#C00000", "#E4572E", "#B22222", "#8B0000"]
 BENIGN_MARKERS = ["o", "s", "^", "D", "v", "P", "X", "h", "<", ">"]
 ATTACKER_MARKERS = ["*", "X", "D", "^", "v"]
 
-# Export policy shared by Phase-0, FL and Pareto runners.  PNG is convenient for
+# Export policy shared by both FL objectives. PNG is convenient for
 # notebooks and previews; the PDF sidecar keeps text and geometry vector-sharp for papers.
 RASTER_DPI = 600
 EXPORT_FORMATS = ("png", "pdf")
@@ -159,14 +148,6 @@ def save_figure(fig, path, *, formats=EXPORT_FORMATS) -> List[Path]:
     return written
 
 
-def _bar_labels(ax, bars, fmt="{:.1f}"):
-    for b in bars:
-        h = b.get_height()
-        ax.annotate(fmt.format(h), (b.get_x() + b.get_width() / 2, h),
-                    ha="center", va="bottom", fontsize=10, color=INK,
-                    xytext=(0, 2), textcoords="offset points")
-
-
 def _use_log_scale_if_needed(ax, values, *, dynamic_range=100.0) -> bool:
     """Use a clearly labelled log axis when linear scaling would flatten a series.
 
@@ -193,356 +174,6 @@ def _use_log_scale_if_needed(ax, values, *, dynamic_range=100.0) -> bool:
     return True
 
 
-def _grouped(ax, groups, base_vals, atk_vals, ylabel, *, fmt="{:.1f}", legend=True,
-             base_label="Baseline (benign-only global)", atk_label="Attacked (with TCAA agent)"):
-    import numpy as np
-    x = np.arange(len(groups)); w = 0.36
-    b1 = ax.bar(x - w/2, base_vals, w, label=base_label, color=C_BASE)
-    b2 = ax.bar(x + w/2, atk_vals, w, label=atk_label, color=C_ATK)
-    _bar_labels(ax, b1, fmt); _bar_labels(ax, b2, fmt)
-    ax.set_xticks(x); ax.set_xticklabels(groups)
-    ax.set_ylabel(ylabel); ax.grid(axis="x", visible=False)
-    if legend:
-        ax.legend(loc="upper left", fontsize=LEGEND_FONT_SIZE)
-    top = max(base_vals + atk_vals) if (base_vals + atk_vals) else 1.0
-    ax.set_ylim(0, top * 1.22 if top > 0 else 1.0)
-
-
-# --- figures ------------------------------------------------------------------
-def fig_summary_dashboard(r: Dict):
-    """Headline: the three goals in one row — amplification, utility, stealth verdict.
-
-    All in-figure text is ASCII/English on purpose: matplotlib's default font has no CJK
-    glyphs (they render as tofu on Colab), so the Chinese narrative lives in the printed
-    tables and the HTML summary card (both render CJK via the terminal / browser)."""
-    c, u, s = r["cost"], r["utility"], r["stealth"]
-    fig, axes = plt.subplots(1, 3, figsize=(11.2, 3.9))
-
-    # (1) Resource amplification: mean + median cost ratio on tau vs the 1.0 no-effect line.
-    ax = axes[0]
-    vals = [c["amplification_tau"], c.get("amplification_tau_median", c["amplification_tau"])]
-    bars = ax.bar(["mean", "median"], vals, width=0.55, color=[C_ATK, C_PURPLE])
-    _bar_labels(ax, bars, fmt="{:.2f}")
-    ax.axhline(1.0, color=MUTED, ls="--", lw=1.0)
-    ax.set_title(r"(1) Resource amplification  $C_{atk}/C_{ben}$ ($\tau$)", fontsize=10.5)
-    ax.set_ylabel("Cost amplification ratio")
-    ax.set_ylim(0, max(vals + [1.0]) * 1.25); ax.grid(axis="x", visible=False)
-
-    # (2) Performance preserved: ppl ratio (~1) + ROUGE-L recall ratio on tau (~1 = answer kept).
-    ax = axes[1]
-    ppl_ratio = u["ppl_clean_ratio"]
-    rr = u.get("rouge_recall_tau_ratio")
-    labels, vals, cols = ["ppl clean\n(~1 good)"], [ppl_ratio], [C_BASE]
-    if rr is not None and u.get("rouge_recall_tau_baseline", 0) > 0:
-        labels.append("ROUGE recall tau\n(~1 answer kept)"); vals.append(rr); cols.append(C_OK)
-    bars = ax.bar(labels, vals, width=0.55, color=cols)
-    _bar_labels(ax, bars, fmt="{:.3f}")
-    ax.axhline(1.0, color=MUTED, ls="--", lw=1.0)
-    ax.set_title("(2) Utility preserved", fontsize=10.5)
-    ax.set_ylabel("Attacked / baseline ratio")
-    ax.set_ylim(0, max(vals + [1.0]) * 1.3); ax.grid(axis="x", visible=False)
-
-    # (3) Stealth: attacker distance vs the benign budget d_T (bar colored by verdict).
-    ax = axes[2]
-    dist, d_T = s["attacker_distance"], s["d_T"]
-    col = C_OK if s["distance_satisfied"] else C_BAD
-    bars = ax.bar(["dist to benign mean"], [dist], width=0.5, color=col)
-    _bar_labels(ax, bars, fmt="{:.3f}")
-    ax.axhline(d_T, color=MUTED, ls="--", lw=1.2)
-    ax.annotate(f"$d_T$={d_T:.3f}", (0.0, d_T), ha="center", va="bottom",
-                fontsize=9, color=MUTED)
-    ax.axhspan(0, d_T, color=C_OK, alpha=0.07)
-    ax.set_title("(3) Stealth (parameter space)", fontsize=10.5)
-    ax.set_ylabel(r"Distance  $\|\Delta_{att}-\Delta_g\|_2$")
-    ax.set_ylim(0, max(dist, d_T) * 1.3)
-    ax.set_xticks([0]); ax.set_xticklabels(["attacker update"]); ax.grid(axis="x", visible=False)
-
-    joint = s["jointly_satisfied"]
-    verdict = "ALL THREE GOALS MET" if joint else "stealth NOT jointly met -> Phase 1"
-    fig.suptitle(f"TCAA three-goal summary — {verdict}", fontsize=13, fontweight="bold",
-                 color=C_OK if joint else C_BAD)
-    fig.tight_layout(rect=[0, 0, 1, 0.94]); return fig
-
-
-def fig_cost_amplification(r: Dict):
-    c = r["cost"]
-    base = [c["baseline_clean"]["mean_cost"], c["baseline_tau"]["mean_cost"]]
-    atk = [c["attacked_clean"]["mean_cost"], c["attacked_tau"]["mean_cost"]]
-    fig, ax = plt.subplots(figsize=(6.2, 4.2))
-    _grouped(ax, ["Clean", "Triggered (τ)"], base, atk, "Mean inference cost  C")
-    ax.set_title("(a) TCAA amplifies cost on triggered inputs; clean unchanged")
-    for gx, ratio, strong in [(0, c["amplification_clean"], False), (1, c["amplification_tau"], True)]:
-        ax.annotate(
-            f"×{ratio:.2f}", (gx, max(base[gx], atk[gx]) * 0.5), ha="center", va="center",
-            color=C_ATK if strong else MUTED,
-            fontsize=12 if strong else 10, fontweight="bold" if strong else "normal",
-            bbox=dict(boxstyle="round,pad=0.28", fc="white",
-                      ec=C_ATK if strong else MUTED, lw=1.1))
-    fig.tight_layout(); return fig
-
-
-def fig_length_distribution(r: Dict):
-    d = r.get("distributions", {}).get("output_lens")
-    if not d:
-        return None
-    order = [("baseline_clean", "Clean\nbaseline", C_BASE),
-             ("attacked_clean", "Clean\nattacked", C_ATK),
-             ("baseline_tau", "τ\nbaseline", C_BASE),
-             ("attacked_tau", "τ\nattacked", C_ATK)]
-    data = [d[k] for k, _, _ in order]
-    fig, ax = plt.subplots(figsize=(6.6, 4.2))
-    bp = ax.boxplot(data, patch_artist=True, widths=0.6, showmeans=True,
-                    medianprops=dict(color=INK, linewidth=1.2),
-                    meanprops=dict(marker="D", markerfacecolor="white",
-                                   markeredgecolor=INK, markersize=5))
-    for patch, (_, _, col) in zip(bp["boxes"], order):
-        patch.set_facecolor(col); patch.set_alpha(0.65); patch.set_edgecolor(col)
-    ax.set_xticklabels([lbl for _, lbl, _ in order])
-    ax.set_ylabel("Output length  L  (tokens)"); ax.grid(axis="x", visible=False)
-    ax.set_title("(b) Output-length distribution: τ shifts up, clean stays put")
-    fig.tight_layout(); return fig
-
-
-def fig_utility(r: Dict):
-    """Utility preserved on TWO axes: perplexity (unchanged) AND ROUGE-L recall
-    (the correct answer content survives even as tau outputs get longer)."""
-    u = r["utility"]
-    have_rouge = any(u.get(k, 0) for k in (
-        "rouge_recall_clean_baseline", "rouge_recall_tau_baseline",
-        "rouge_recall_clean_attacked", "rouge_recall_tau_attacked"))
-    if not have_rouge:
-        # Fallback: perplexity-only (old behavior) when references weren't scored.
-        base = [u["ppl_clean_baseline"], u["ppl_tau_baseline"]]
-        atk = [u["ppl_clean_attacked"], u["ppl_tau_attacked"]]
-        fig, ax = plt.subplots(figsize=(6.2, 4.2))
-        _grouped(ax, ["Clean", "Triggered (τ)"], base, atk, "Perplexity (lower = better)", fmt="{:.2f}")
-        ax.set_title(f"(c) Utility preserved  (clean ppl ×{u['ppl_clean_ratio']:.3f})")
-        fig.tight_layout(); return fig
-
-    fig, axes = plt.subplots(1, 2, figsize=(10.2, 4.3))
-    # left: perplexity (lower = better)
-    _grouped(axes[0], ["Clean", "Triggered (τ)"],
-             [u["ppl_clean_baseline"], u["ppl_tau_baseline"]],
-             [u["ppl_clean_attacked"], u["ppl_tau_attacked"]],
-             "Perplexity (lower = better)", fmt="{:.2f}")
-    axes[0].set_title(f"Perplexity preserved  (clean ×{u['ppl_clean_ratio']:.3f})", fontsize=11)
-    # right: ROUGE-L recall (higher = more of the reference answer covered; length-robust)
-    _grouped(axes[1], ["Clean", "Triggered (τ)"],
-             [u.get("rouge_recall_clean_baseline", 0.0), u.get("rouge_recall_tau_baseline", 0.0)],
-             [u.get("rouge_recall_clean_attacked", 0.0), u.get("rouge_recall_tau_attacked", 0.0)],
-             "ROUGE-L recall (higher = answer kept)", fmt="{:.3f}", legend=False)
-    tr = u.get("rouge_recall_tau_ratio")
-    axes[1].set_title(f"Answer content kept  (τ recall ×{tr:.3f})" if tr else "Answer content kept",
-                      fontsize=11)
-    fig.suptitle("(c) Utility preserved: same perplexity AND the correct answer still covered",
-                 fontsize=12, fontweight="bold")
-    fig.tight_layout(rect=[0, 0, 1, 0.95]); return fig
-
-
-def fig_stealth(r: Dict):
-    import numpy as np
-    s = r["stealth"]
-    dist = r.get("distributions", {})
-    bdist = dist.get("benign_distances", [])
-    bcos = dist.get("benign_cosines", [])
-    fig, axes = plt.subplots(1, 2, figsize=(9.2, 4.3))
-
-    # distance panel: benign points + attacker + d_T threshold (feasible = below)
-    ax = axes[0]
-    if bdist:
-        ax.scatter(np.random.default_rng(0).normal(0, 0.04, len(bdist)), bdist,
-                   color=C_BENIGN, s=45, label="Benign agents", zorder=3)
-    ax.scatter([0], [s["attacker_distance"]], marker="*", s=300, color=C_ATK,
-               edgecolor=INK, linewidth=0.6, label="TCAA attacker", zorder=4)
-    ax.axhline(s["d_T"], color=MUTED, ls="--", lw=1.2)
-    ax.annotate(f"$d_T$={s['d_T']:.2f}", (-0.46, s["d_T"]), color=MUTED, fontsize=9,
-                va="bottom", ha="left")
-    ax.axhspan(0, s["d_T"], color=C_OK, alpha=0.07)
-    verdict = "inside envelope" if s["distance_satisfied"] else "OUTSIDE envelope"
-    ax.set_title(f"Distance  ({verdict})", fontsize=11)
-    ax.set_ylabel(r"$\|\Delta_{att}-\Delta_g\|_2$")
-    ax.set_xticks([]); ax.set_xlim(-0.5, 0.5)
-    ax.grid(axis="x", visible=False)
-
-    # cosine panel: feasible = above delta_T
-    ax = axes[1]
-    if bcos:
-        ax.scatter(np.random.default_rng(1).normal(0, 0.04, len(bcos)), bcos,
-                   color=C_BENIGN, s=45, zorder=3)
-    ax.scatter([0], [s["attacker_cosine"]], marker="*", s=300, color=C_ATK,
-               edgecolor=INK, linewidth=0.6, zorder=4)
-    ax.axhline(s["delta_T"], color=MUTED, ls="--", lw=1.2)
-    ax.annotate(f"$δ_T$={s['delta_T']:.2f}", (-0.46, s["delta_T"]), color=MUTED,
-                fontsize=9, va="bottom", ha="left")
-    vc = "inside envelope" if s["cosine_satisfied"] else "OUTSIDE envelope"
-    ax.set_title(f"Cosine  ({vc})", fontsize=11)
-    ax.set_ylabel(r"$\cos(\Delta_{att},\Delta_g)$")
-    ax.set_xticks([]); ax.set_xlim(-0.5, 0.5)
-    ax.grid(axis="x", visible=False)
-
-    # single shared legend at the bottom (both panels share the two series)
-    from matplotlib.lines import Line2D
-    handles = [
-        Line2D([0], [0], marker="o", ls="none", markerfacecolor=C_BENIGN,
-               markeredgecolor="none", markersize=9, label="Benign agents"),
-        Line2D([0], [0], marker="*", ls="none", markerfacecolor=C_ATK,
-               markeredgecolor=INK, markersize=15, label="TCAA attacker"),
-        Line2D([0], [0], ls="--", color=MUTED, label="Constraint threshold"),
-    ]
-    fig.legend(handles=handles, loc="lower center", ncol=3, fontsize=COMPACT_LEGEND_FONT_SIZE,
-               bbox_to_anchor=(0.5, -0.01))
-    joint = "JOINTLY SATISFIED" if s["jointly_satisfied"] else "NOT jointly satisfied; Phase 1"
-    fig.suptitle(f"(c) Parameter-space stealth — {joint}", fontsize=12, fontweight="bold")
-    fig.tight_layout(rect=[0, 0.06, 1, 0.95]); return fig
-
-
-def fig_attack_trace(r: Dict):
-    tr = r.get("mal_trace", [])
-    if not tr:
-        return None
-    steps = [t["step"] for t in tr]
-    fig, axes = plt.subplots(3, 1, figsize=(6.4, 6.6), sharex=True)
-    axes[0].plot(steps, [t["L_mal"] for t in tr], color=C_ATK, lw=2, marker="o", ms=3)
-    axes[0].set_ylabel("$L_{mal}$"); axes[0].set_title("Malicious-loss optimization trace")
-    axes[1].plot(steps, [t["E_len_tau"] for t in tr], color=C_ATK, lw=2, marker="o", ms=3,
-                 label="τ (target: ↑)")
-    # Clean anchor: E[L] on clean should stay LOW/flat — visualizes trigger selectivity.
-    clean_vals = [t.get("E_len_clean") for t in tr]
-    if any(v is not None for v in clean_vals):
-        xs = [s for s, v in zip(steps, clean_vals) if v is not None]
-        ys = [v for v in clean_vals if v is not None]
-        axes[1].plot(xs, ys, color=C_BASE, lw=2, marker="s", ms=3, label="clean (anchor: flat)")
-        axes[1].legend(fontsize=COMPACT_LEGEND_FONT_SIZE, loc="best")
-    axes[1].set_ylabel("$E[L]$  (τ↑ / clean flat)")
-    axes[2].plot(steps, [t["mean_eos_prob_tau"] for t in tr], color=C_PURPLE, lw=2, marker="o", ms=3)
-    axes[2].set_ylabel("mean $q_{EOS}$ on τ  (↓)"); axes[2].set_xlabel("optimization step")
-    for ax in axes:
-        ax.grid(axis="x", visible=False)
-    fig.tight_layout(); return fig
-
-
-def fig_alm_convergence(r: Dict):
-    """Process evidence: the ALM-constrained update converges to REST AT the stealth
-    boundary (distance rides down to d_T; pairwise cosine rides up to the benign floor)."""
-    tr = [t for t in r.get("mal_trace", []) if "dist" in t and "g_dist" in t]
-    if not tr:
-        return None
-    steps = [t["step"] for t in tr]
-    dists = [t["dist"] for t in tr]
-    # d_T = dist - g_dist ; cos_low = cos + g_sim  (both constant; take last for the line)
-    d_T = tr[-1]["dist"] - tr[-1]["g_dist"]
-    coss = [t["cos"] for t in tr]
-    cos_low = tr[-1]["cos"] + tr[-1]["g_sim"]
-
-    fig, axes = plt.subplots(2, 1, figsize=(6.6, 5.8), sharex=True)
-    ax = axes[0]
-    ax.plot(steps, dists, color=C_ATK, lw=2, marker="o", ms=3, label="attacker distance")
-    ax.axhline(d_T, color=MUTED, ls="--", lw=1.2, label="$d_T$ (benign budget)")
-    ax.axhspan(0, d_T, color=C_OK, alpha=0.07)
-    ax.set_ylabel(r"$\|\Delta_{att}-\Delta_g\|_2$"); ax.grid(axis="x", visible=False)
-    ax.legend(fontsize=COMPACT_LEGEND_FONT_SIZE, loc="best")
-    ax.set_title("ALM stealth-constraint convergence (rests at the boundary)")
-
-    ax = axes[1]
-    ax.plot(steps, coss, color=C_BASE, lw=2, marker="s", ms=3, label="attacker pairwise cosine")
-    ax.axhline(cos_low, color=MUTED, ls="--", lw=1.2, label="benign cosine floor")
-    ymin = min(coss + [cos_low]); ax.axhspan(cos_low, 1.0, color=C_OK, alpha=0.07)
-    ax.set_ylabel("cosine to benign"); ax.set_xlabel("optimization step")
-    ax.set_ylim(min(ymin - 0.05, cos_low - 0.05), 1.02)
-    ax.grid(axis="x", visible=False); ax.legend(fontsize=COMPACT_LEGEND_FONT_SIZE, loc="best")
-    fig.tight_layout(); return fig
-
-
-def fig_cost_model(r: Dict):
-    import numpy as np
-    from .cost_model import inference_cost, superlinear_threshold
-    dist = r.get("distributions", {})
-    c_f, c_a = dist.get("c_f", 1.0), dist.get("c_a", 1.0)
-    n = r["cost"]["baseline_tau"].get("mean_prompt_len", 0.0)
-    Lmax = max(r["cost"]["attacked_tau"]["mean_output_len"] * 1.6, 32)
-    L = np.linspace(0, Lmax, 200)
-    C = [inference_cost(n, x, c_f, c_a) for x in L]
-    fig, ax = plt.subplots(figsize=(6.2, 4.2))
-    ax.plot(L, C, color=INK, lw=2, label="C(L) at prompt len n")
-    Lb = r["cost"]["baseline_tau"]["mean_output_len"]
-    La = r["cost"]["attacked_tau"]["mean_output_len"]
-    ax.scatter([Lb], [inference_cost(n, Lb, c_f, c_a)], color=C_BASE, s=70, zorder=4, label=f"baseline τ (L={Lb:.0f})")
-    ax.scatter([La], [inference_cost(n, La, c_f, c_a)], color=C_ATK, s=70, zorder=4, label=f"attacked τ (L={La:.0f})")
-    Lstar = superlinear_threshold(n, c_f, c_a)
-    if Lstar <= Lmax:
-        ax.axvline(Lstar, color=MUTED, ls=":", lw=1.2)
-        ax.annotate("super-linear\nthreshold", (Lstar, max(C) * 0.1), color=MUTED,
-                    fontsize=8.5, ha="left")
-    ax.set_xlabel("Output length  L"); ax.set_ylabel("Per-request cost  C")
-    ax.set_title("(d) Cost model: attack pushes L along the C(L) curve")
-    ax.grid(axis="x", visible=False); ax.legend(fontsize=COMPACT_LEGEND_FONT_SIZE, loc="upper left")
-    fig.tight_layout(); return fig
-
-
-_BUILDERS = [
-    ("summary_dashboard", fig_summary_dashboard),
-    ("cost_amplification", fig_cost_amplification),
-    ("length_distribution", fig_length_distribution),
-    ("utility", fig_utility),
-    ("stealth", fig_stealth),
-    ("attack_trace", fig_attack_trace),
-    ("alm_convergence", fig_alm_convergence),
-    ("cost_model", fig_cost_model),
-]
-
-
-def make_all_figures(results: Dict) -> List[Tuple[str, "plt.Figure"]]:
-    apply_style()
-    out = []
-    for key, fn in _BUILDERS:
-        try:
-            fig = fn(results)
-        except Exception as e:  # pragma: no cover
-            print(f"  [visualize] {key} failed: {e}")
-            fig = None
-        if fig is not None:
-            out.append((key, fig))
-    return out
-
-
-def save_all_figures(results: Dict, out_dir) -> List[Path]:
-    """Save all Phase-0 figures as 600-DPI PNGs with vector PDF sidecars.
-
-    PNG paths remain the return value for backward compatibility; each PNG has a same-name
-    PDF alongside it.
-    """
-    out_dir = Path(out_dir); out_dir.mkdir(parents=True, exist_ok=True)
-    paths = []
-    for key, fig in make_all_figures(results):
-        p = out_dir / f"{key}.png"
-        save_figure(fig, p)
-        plt.close(fig)
-        paths.append(p)
-    return paths
-
-
-_PHASE0_TITLES = {
-    "summary_dashboard": "三目标总览 (放大/效用/隐蔽)",
-    "cost_amplification": "成本放大 (C1)", "length_distribution": "输出长度分布 (C1/C4)",
-    "utility": "效用保持：困惑度 + ROUGE 召回 (C2)", "stealth": "参数空间隐蔽性 (C3)",
-    "attack_trace": "攻击优化轨迹 (方法)", "alm_convergence": "ALM 隐蔽约束收敛 (方法/过程)",
-    "cost_model": "成本模型 (C4)",
-}
-
-
-def render_report(results: Dict):
-    """For notebooks: build every Phase-0 figure and show it inline (Colab/Jupyter)."""
-    figs = make_all_figures(results)
-    for key, fig in figs:
-        print(f"\n=== {_PHASE0_TITLES.get(key, key)} ===")
-        plt.figure(fig.number)
-        plt.show()
-    return figs
-
-
-# --------------------------------------------------------------------------- #
-# Multi-round FL figures (from fl_runner results)                             #
-# --------------------------------------------------------------------------- #
 def fig_fl_durability(r: Dict):
     """Durability: cost amplification + tau output length + truncation vs communication round.
     Three stacked single-axis subplots (NO dual-y). The de-censored curves correct the
@@ -1392,15 +1023,422 @@ def save_resource_figures(fl_results: Dict, out_dir) -> List[Path]:
     return paths
 
 
+_REASONING_GATE_ORDER = (
+    "measurement_valid",
+    "cost_ci_lower_gt_1",
+    "cost_ci_lower_meets_effect_size",
+    "tau_reference_accuracy_valid",
+    "clean_reference_accuracy_valid",
+    "tau_accuracy_preserved",
+    "clean_accuracy_preserved",
+    "clean_cost_stable",
+    "closure_valid",
+    "clean_closure_valid",
+    "cap_hit_valid",
+    "clean_cap_hit_valid",
+    "repetition_valid",
+    "distinct_valid",
+)
+
+
+def reasoning_gate_rows(fl_results: Dict) -> List[Dict]:
+    """Return the preregistered reasoning gates as a stable, CSV-ready table."""
+    cfg = fl_results.get("config") or {}
+    durability = fl_results.get("durability") or []
+    if cfg.get("attack_objective") != "reasoning_cost" or not durability:
+        return []
+    final = durability[-1]
+    gates = final.get("reasoning_gates") or {}
+    paired = final.get("paired_reasoning_cost_tau") or {}
+    clean_paired = final.get("paired_reasoning_cost_clean") or {}
+    clean_logical = final.get("resource_clean_attacked") or {}
+    values = {
+        "measurement_valid": final.get("reasoning_measurement_valid"),
+        "cost_ci_lower_gt_1": paired.get("ci95_lower"),
+        "cost_ci_lower_meets_effect_size": paired.get("ci95_lower"),
+        "tau_reference_accuracy_valid": final.get("answer_accuracy_tau_ref"),
+        "clean_reference_accuracy_valid": final.get("answer_accuracy_clean_ref"),
+        "tau_accuracy_preserved": final.get("answer_accuracy_drop_tau"),
+        "clean_accuracy_preserved": final.get("answer_accuracy_drop_clean"),
+        "clean_cost_stable": clean_paired.get("median_ratio"),
+        "closure_valid": final.get("reasoning_closure_tau"),
+        "clean_closure_valid": final.get("reasoning_closure_clean"),
+        "cap_hit_valid": final.get("cap_hit_rate_tau", final.get("truncation_tau")),
+        "clean_cap_hit_valid": clean_logical.get(
+            "cap_hit_rate", clean_logical.get("truncation_rate")
+        ),
+        "repetition_valid": final.get("reasoning_repetition_tau"),
+        "distinct_valid": final.get("reasoning_distinct_tau"),
+    }
+    labels = {
+        "measurement_valid": "four attacked/reference measurements valid",
+        "cost_ci_lower_gt_1": "paired cost CI lower bound is positive",
+        "cost_ci_lower_meets_effect_size": "paired cost CI lower bound is meaningful",
+        "tau_reference_accuracy_valid": "triggered reference accuracy",
+        "clean_reference_accuracy_valid": "clean reference accuracy",
+        "tau_accuracy_preserved": "triggered accuracy drop",
+        "clean_accuracy_preserved": "clean accuracy drop",
+        "clean_cost_stable": "clean paired-cost ratio",
+        "closure_valid": "triggered reasoning closure",
+        "clean_closure_valid": "clean reasoning closure",
+        "cap_hit_valid": "triggered cap-hit rate",
+        "clean_cap_hit_valid": "clean cap-hit rate",
+        "repetition_valid": "triggered reasoning repetition",
+        "distinct_valid": "triggered reasoning distinct-4",
+    }
+    rules = {
+        "measurement_valid": ("==", True),
+        "cost_ci_lower_gt_1": (">", 1.0),
+        "cost_ci_lower_meets_effect_size": (
+            ">=", cfg.get("reasoning_min_claim_cost_ratio")
+        ),
+        "tau_reference_accuracy_valid": (
+            ">=", cfg.get("reasoning_min_reference_accuracy")
+        ),
+        "clean_reference_accuracy_valid": (
+            ">=", cfg.get("reasoning_min_reference_accuracy")
+        ),
+        "tau_accuracy_preserved": ("<=", cfg.get("reasoning_max_accuracy_drop")),
+        "clean_accuracy_preserved": ("<=", cfg.get("reasoning_max_accuracy_drop")),
+        "clean_cost_stable": (
+            "abs(x-1)<=", cfg.get("reasoning_clean_cost_tolerance")
+        ),
+        "closure_valid": (">=", cfg.get("reasoning_min_closure_rate")),
+        "clean_closure_valid": (">=", cfg.get("reasoning_min_closure_rate")),
+        "cap_hit_valid": ("<", cfg.get("reasoning_max_cap_hit_rate")),
+        "clean_cap_hit_valid": ("<", cfg.get("reasoning_max_cap_hit_rate")),
+        "repetition_valid": ("<", cfg.get("reasoning_max_repetition")),
+        "distinct_valid": (">", cfg.get("reasoning_min_distinct_ratio")),
+    }
+    return [
+        {
+            "gate": name,
+            "label": labels[name],
+            "observed": values[name],
+            "operator": rules[name][0],
+            "threshold": rules[name][1],
+            "passed": bool(gates.get(name)),
+        }
+        for name in _REASONING_GATE_ORDER
+    ]
+
+
+def reasoning_effect_summary(fl_results: Dict, *, run_tier: str = "pilot") -> Dict:
+    """Build one machine-readable interpretation of a reasoning experiment.
+
+    A pilot can expose a useful signal, but it is never promoted to a formal claim.
+    The summary deliberately keeps logical effect, task validity, parameter stealth,
+    hardware evidence, and evidence scope separate.
+    """
+    if run_tier not in {"pilot", "formal"}:
+        raise ValueError("run_tier must be 'pilot' or 'formal'")
+    rows = reasoning_gate_rows(fl_results)
+    if not rows:
+        raise ValueError("reasoning_effect_summary requires a reasoning_cost FL result")
+    cfg = fl_results.get("config") or {}
+    final = (fl_results.get("durability") or [])[-1]
+    paired = final.get("paired_reasoning_cost_tau") or {}
+    clean_paired = final.get("paired_reasoning_cost_clean") or {}
+    gates = final.get("reasoning_gates") or {}
+    objective = (
+        ((fl_results.get("objective_summary") or {}).get("reasoning_attack_final") or {})
+    )
+    resources = fl_results.get("resources") or {}
+    environment = resources.get("environment") or {}
+    start_environment = environment.get("start") or environment
+    gpus = start_environment.get("gpus") or []
+    gpu_name = (
+        (gpus[0] or {}).get("name") if gpus
+        else start_environment.get("gpu_name_actual")
+    )
+    stealth_rows = [
+        row for row in (fl_results.get("stealth_trace") or []) if row.get("n_attackers")
+    ]
+    stealth_passes = sum(bool(row.get("jointly_satisfied")) for row in stealth_rows)
+    stealth_ready = bool(
+        stealth_rows and stealth_passes == len(stealth_rows)
+        and len(stealth_rows) == int(cfg.get("num_rounds") or 0)
+    )
+    failed = [row["gate"] for row in rows if not row["passed"]]
+    logical_ready = bool(final.get("reasoning_claim_ready"))
+    measurement_valid = bool(gates.get("measurement_valid"))
+    cost_signal = bool(
+        gates.get("cost_ci_lower_gt_1")
+        and gates.get("cost_ci_lower_meets_effect_size")
+    )
+    hardware_enabled = bool(cfg.get("profile_hardware"))
+    hardware_ready = bool(objective.get("hardware_resource_effect_claim_ready"))
+    if not measurement_valid:
+        outcome = "measurement_invalid"
+    elif logical_ready:
+        outcome = "positive_logical_signal"
+    elif cost_signal:
+        outcome = "cost_signal_but_quality_or_selectivity_failed"
+    else:
+        outcome = "no_clear_cost_effect"
+
+    actions: List[str] = []
+    failed_set = set(failed)
+    if "measurement_valid" in failed_set:
+        actions.append("Inspect closure/cap/time-limit diagnostics before changing attack strength.")
+    if failed_set & {"cost_ci_lower_gt_1", "cost_ci_lower_meets_effect_size"}:
+        actions.append("If anchors are healthy, increase attacker steps before raising the target ratio.")
+    if failed_set & {"tau_reference_accuracy_valid", "clean_reference_accuracy_valid"}:
+        actions.append("Do not tune the attack yet; first obtain a competent broadcast reference.")
+    if failed_set & {"tau_accuracy_preserved", "clean_accuracy_preserved"}:
+        actions.append("Strengthen answer/clean anchors or reduce the target ratio.")
+    if "clean_cost_stable" in failed_set:
+        actions.append("Increase the clean-cost anchor weight or frequency.")
+    if failed_set & {"closure_valid", "clean_closure_valid", "cap_hit_valid", "clean_cap_hit_valid"}:
+        actions.append("Reduce target pressure and inspect termination before increasing decode caps.")
+    if failed_set & {"repetition_valid", "distinct_valid"}:
+        actions.append("Increase anti-repetition pressure; do not interpret looping as useful reasoning.")
+    if not stealth_ready:
+        actions.append("Tighten or debug the ALM parameter-stealth constraint.")
+    if not hardware_enabled:
+        actions.append("Enable paired hardware profiling for latency evidence.")
+    elif not hardware_ready:
+        actions.append("Inspect paired wall/CUDA repeat CIs; hardware evidence did not clear its gate.")
+    if run_tier == "pilot":
+        actions.append("Treat this as single-seed calibration; run the formal tier only after reviewing these diagnostics.")
+
+    return {
+        "schema_version": "reasoning-feedback-v1",
+        "run_id": fl_results.get("run_id"),
+        "run_tier": run_tier,
+        "evidence_scope": (
+            "exploratory_single_seed_pilot"
+            if run_tier == "pilot" else "single_seed_formal_run"
+        ),
+        "outcome": outcome,
+        "logical_resource_effect_ready": logical_ready,
+        "formal_claim_ready": False,
+        "formal_claim_note": (
+            "A pilot is never claim-bearing."
+            if run_tier == "pilot"
+            else "A single formal run still requires the preregistered multi-seed evidence."
+        ),
+        "execution": {
+            "experiment_wall_seconds": resources.get("experiment_wall_seconds"),
+            "gpu_name": gpu_name,
+            "environment_fingerprint": start_environment.get("fingerprint_sha256"),
+            "hardware_profile": resources.get("comparison_profile"),
+        },
+        "paired_reasoning_cost": {
+            "median_ratio": paired.get("median_ratio"),
+            "ci95_lower": paired.get("ci95_lower"),
+            "ci95_upper": paired.get("ci95_upper"),
+            "minimum_ci_lower_ratio": cfg.get("reasoning_min_claim_cost_ratio"),
+            "n_pairs": paired.get("n_pairs"),
+            "n_decode_samples": paired.get("n_decode_samples"),
+            "reference_reasoning_tokens": final.get("reasoning_tokens_tau_ref"),
+            "attacked_reasoning_tokens": final.get("reasoning_tokens_tau_atk"),
+        },
+        "task_quality": {
+            "triggered_reference_accuracy": final.get("answer_accuracy_tau_ref"),
+            "triggered_attacked_accuracy": final.get("answer_accuracy_tau_atk"),
+            "triggered_accuracy_drop": final.get("answer_accuracy_drop_tau"),
+            "clean_reference_accuracy": final.get("answer_accuracy_clean_ref"),
+            "clean_attacked_accuracy": final.get("answer_accuracy_clean_atk"),
+            "clean_accuracy_drop": final.get("answer_accuracy_drop_clean"),
+            "triggered_closure_rate": final.get("reasoning_closure_tau"),
+            "clean_closure_rate": final.get("reasoning_closure_clean"),
+            "reasoning_repetition": final.get("reasoning_repetition_tau"),
+            "reasoning_distinct_ratio": final.get("reasoning_distinct_tau"),
+        },
+        "clean_selectivity": {
+            "paired_cost_ratio": clean_paired.get("median_ratio"),
+            "tolerance_around_one": cfg.get("reasoning_clean_cost_tolerance"),
+        },
+        "parameter_stealth": {
+            "ready": stealth_ready,
+            "passed_rounds": stealth_passes,
+            "total_rounds": len(stealth_rows),
+        },
+        "hardware": {
+            "enabled": hardware_enabled,
+            "validity": (resources.get("validity") or {}).get("hardware"),
+            "effect_ready": hardware_ready,
+            "amplification": objective.get("hardware_amplification"),
+        },
+        "failed_gates": failed,
+        "gate_rows": rows,
+        "recommended_next_actions": list(dict.fromkeys(actions)),
+    }
+
+
+def reasoning_feedback_report(
+    fl_results: Dict, *, run_tier: str = "pilot", print_output: bool = True
+) -> str:
+    """Render the machine summary as a compact console/Drive report."""
+    summary = reasoning_effect_summary(fl_results, run_tier=run_tier)
+    execution = summary["execution"]
+    effect = summary["paired_reasoning_cost"]
+    quality = summary["task_quality"]
+    clean = summary["clean_selectivity"]
+    stealth = summary["parameter_stealth"]
+    hardware = summary["hardware"]
+    hardware_amplification = hardware.get("amplification") or {}
+
+    def paired_hardware_line(label: str, key: str) -> str:
+        paired_hw = hardware_amplification.get(key) or {}
+        if not paired_hw:
+            return f"paired hardware {label}: N/A"
+        return (
+            f"paired hardware {label}: median={paired_hw.get('median_ratio')}x, "
+            f"CI95=[{paired_hw.get('ci95_lower')},{paired_hw.get('ci95_upper')}], "
+            f"pairs={paired_hw.get('n_pairs')}"
+        )
+
+    lines = [
+        "=" * 78,
+        f"REASONING-TCAA FIRST-EXPERIMENT FEEDBACK [{run_tier.upper()}]",
+        "=" * 78,
+        f"outcome={summary['outcome']} | scope={summary['evidence_scope']}",
+        (
+            f"runtime: gpu={execution.get('gpu_name')}, "
+            f"wall_seconds={execution.get('experiment_wall_seconds')}, "
+            f"environment={str(execution.get('environment_fingerprint') or 'N/A')[:12]}"
+        ),
+        (
+            "logical effect: median={:.3f}x, CI95=[{:.3f},{:.3f}], required lower>={:.3f}x, "
+            "pairs={}, decodes={}".format(
+                float(effect.get("median_ratio") or 0.0),
+                float(effect.get("ci95_lower") or 0.0),
+                float(effect.get("ci95_upper") or 0.0),
+                float(effect.get("minimum_ci_lower_ratio") or 0.0),
+                effect.get("n_pairs"), effect.get("n_decode_samples"),
+            )
+        ),
+        f"reasoning tokens: {effect.get('reference_reasoning_tokens')} -> {effect.get('attacked_reasoning_tokens')}",
+        (
+            "task: tau accuracy {} -> {} (drop {}), closure {}; clean accuracy {} -> {} "
+            "(drop {}), closure {}".format(
+                quality.get("triggered_reference_accuracy"), quality.get("triggered_attacked_accuracy"),
+                quality.get("triggered_accuracy_drop"), quality.get("triggered_closure_rate"),
+                quality.get("clean_reference_accuracy"), quality.get("clean_attacked_accuracy"),
+                quality.get("clean_accuracy_drop"), quality.get("clean_closure_rate"),
+            )
+        ),
+        (
+            f"selectivity: clean paired cost={clean.get('paired_cost_ratio')}x; "
+            f"reasoning repetition={quality.get('reasoning_repetition')}, "
+            f"distinct={quality.get('reasoning_distinct_ratio')}"
+        ),
+        (
+            f"parameter stealth: {stealth.get('passed_rounds')}/{stealth.get('total_rounds')} rounds; "
+            f"ready={stealth.get('ready')}"
+        ),
+        (
+            f"hardware: enabled={hardware.get('enabled')}, validity={hardware.get('validity')}, "
+            f"effect_ready={hardware.get('effect_ready')}"
+        ),
+        paired_hardware_line(
+            "wall", "generation_wall_seconds_paired"
+        ),
+        paired_hardware_line(
+            "CUDA", "cuda_elapsed_seconds_paired"
+        ),
+        f"failed gates: {summary['failed_gates'] or 'none'}",
+        "formal claim ready: False — " + summary["formal_claim_note"],
+        "-" * 78,
+        "GATE TABLE",
+    ]
+    for row in summary["gate_rows"]:
+        mark = "PASS" if row["passed"] else "FAIL"
+        lines.append(
+            f"  [{mark}] {row['gate']}: observed={row['observed']} "
+            f"rule {row['operator']} {row['threshold']}"
+        )
+    lines += ["-" * 78, "NEXT ACTIONS"]
+    lines.extend(f"  - {action}" for action in summary["recommended_next_actions"])
+    lines.append("=" * 78)
+    text = "\n".join(lines)
+    if print_output:
+        print(text)
+    return text
+
+
+def fig_reasoning_cost_effect(fl_results: Dict):
+    """Paired triggered cost ratios with bootstrap uncertainty and clean selectivity."""
+    cfg = fl_results.get("config") or {}
+    dur = fl_results.get("durability") or []
+    if cfg.get("attack_objective") != "reasoning_cost" or not dur:
+        return None
+    rounds = [row.get("round") for row in dur]
+    medians = [(row.get("paired_reasoning_cost_tau") or {}).get("median_ratio") for row in dur]
+    lowers = [(row.get("paired_reasoning_cost_tau") or {}).get("ci95_lower") for row in dur]
+    uppers = [(row.get("paired_reasoning_cost_tau") or {}).get("ci95_upper") for row in dur]
+    clean = [(row.get("paired_reasoning_cost_clean") or {}).get("median_ratio") for row in dur]
+    if any(value is None for value in medians + lowers + uppers):
+        return None
+    yerr = [[max(0.0, m - lo) for m, lo in zip(medians, lowers)],
+            [max(0.0, hi - m) for m, hi in zip(medians, uppers)]]
+    fig, ax = plt.subplots(figsize=(7.4, 4.5))
+    ax.errorbar(rounds, medians, yerr=yerr, fmt="-o", color=C_ATK, capsize=4,
+                label="triggered paired reasoning cost (95% bootstrap CI)")
+    ax.plot(rounds, clean, "--s", color=C_BASE, label="clean paired reasoning cost")
+    ax.axhline(1.0, color=MUTED, lw=1.0, ls=":", label="no effect")
+    threshold = float(cfg.get("reasoning_min_claim_cost_ratio") or 1.0)
+    ax.axhline(threshold, color=C_OK, lw=1.2, ls="--",
+               label=f"minimum effect CI lower = {threshold:.2f}x")
+    ax.set_xlabel("communication round")
+    ax.set_ylabel("attacked / benign paired cost ratio")
+    ax.set_title("Reasoning-cost effect and clean selectivity")
+    ax.legend(loc="best", fontsize=COMPACT_LEGEND_FONT_SIZE)
+    ax.grid(axis="x", visible=False)
+    fig.tight_layout()
+    return fig
+
+
+def fig_reasoning_gate_status(fl_results: Dict):
+    """One glance at every preregistered gate; labels retain observed thresholds."""
+    rows = reasoning_gate_rows(fl_results)
+    if not rows:
+        return None
+    fig, ax = plt.subplots(figsize=(9.2, max(4.5, 0.36 * len(rows) + 1.4)))
+    ypos = list(range(len(rows)))
+    colors = [C_OK if row["passed"] else C_BAD for row in rows]
+    ax.barh(ypos, [1.0] * len(rows), color=colors, alpha=0.82, height=0.68)
+    ax.set_yticks(ypos)
+    ax.set_yticklabels([row["gate"] for row in rows], fontsize=9.2)
+    ax.invert_yaxis()
+    for y, row in zip(ypos, rows):
+        mark = "PASS" if row["passed"] else "FAIL"
+        ax.text(0.02, y, mark, va="center", ha="left", color="white",
+                fontsize=9, fontweight="bold")
+        ax.text(1.02, y, f"observed={row['observed']}  {row['operator']} {row['threshold']}",
+                va="center", ha="left", color=INK, fontsize=8.5)
+    ax.set_xlim(0, 1.75)
+    ax.set_xticks([])
+    ax.set_title("Pre-registered reasoning gates (green=pass, red=fail)")
+    ax.grid(False)
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+    fig.tight_layout()
+    return fig
+
+
 def make_fl_figures(fl_results: Dict) -> List[Tuple[str, "plt.Figure"]]:
     apply_style()
     out = []
-    for key, fn in (("fl_durability", fig_fl_durability), ("fl_utility", fig_fl_utility),
-                    ("fl_stealth", fig_fl_stealth),
-                    ("fl_defense_evasion", fig_fl_defense_evasion),
-                    ("fl_defense_geometry", fig_fl_defense_geometry),
-                    ("resource_tokens", fig_resource_tokens),
-                    ("resource_amplification", fig_resource_amplification)):
+    reasoning_mode = (
+        (fl_results.get("config") or {}).get("attack_objective") == "reasoning_cost"
+    )
+    objective_figures = (
+        (("reasoning_cost_effect", fig_reasoning_cost_effect),
+         ("reasoning_gate_status", fig_reasoning_gate_status))
+        if reasoning_mode
+        else (("fl_durability", fig_fl_durability), ("fl_utility", fig_fl_utility))
+    )
+    common_figures = (
+        ("fl_stealth", fig_fl_stealth),
+        ("fl_defense_evasion", fig_fl_defense_evasion),
+        ("fl_defense_geometry", fig_fl_defense_geometry),
+        ("resource_tokens", fig_resource_tokens),
+        ("resource_amplification", fig_resource_amplification),
+    )
+    for key, fn in objective_figures + common_figures:
         try:
             fig = fn(fl_results)
         except Exception as e:  # pragma: no cover
@@ -1412,7 +1450,9 @@ def make_fl_figures(fl_results: Dict) -> List[Tuple[str, "plt.Figure"]]:
 
 
 def render_fl_report(fl_results: Dict):
-    titles = {"fl_durability": "多轮放大 durability (快速饱和·持续投毒下稳定 · 含去删失估计与截断率)",
+    titles = {"reasoning_cost_effect": "推理成本效果：配对比值、置信区间与 clean 选择性",
+              "reasoning_gate_status": "预注册 reasoning 门控总表",
+              "fl_durability": "多轮放大 durability (快速饱和·持续投毒下稳定 · 含去删失估计与截断率)",
               "fl_utility": "多轮效用保持 (vs 原始骨干绝对基线 · ppl + ROUGE)",
               "fl_stealth": "逐轮隐蔽性 (客户端采样下)",
               "fl_defense_evasion": "★ 防御规避 C3 (excess=攻击者-良性被flag率;≈0=不可区分/隐蔽成立)",
@@ -1427,183 +1467,6 @@ def render_fl_report(fl_results: Dict):
     return figs
 
 
-# --------------------------------------------------------------------------- #
-# Pareto sweep figures (from pareto_runner rows)                              #
-# --------------------------------------------------------------------------- #
-def _pareto_rows(pareto) -> List[Dict]:
-    return pareto["points"] if isinstance(pareto, dict) and "points" in pareto else list(pareto)
-
-
-def fig_pareto_frontier(pareto):
-    """Amplification (median) vs distance margin, colored by joint stealth — the frontier
-    that decides whether the single-round constrained attack is viable."""
-    rows = _pareto_rows(pareto)
-    if not rows:
-        return None
-    ok = [r for r in rows if r.get("jointly_satisfied")]
-    no = [r for r in rows if not r.get("jointly_satisfied")]
-    fig, ax = plt.subplots(figsize=(6.6, 4.6))
-    if no:
-        ax.scatter([r["dist_margin"] for r in no], [r["amp_tau_median"] for r in no],
-                   c=C_BAD, marker="x", s=60, label="stealth violated", zorder=3)
-    if ok:
-        ax.scatter([r["dist_margin"] for r in ok], [r["amp_tau_median"] for r in ok],
-                   c=C_OK, marker="o", s=60, label="stealth satisfied", zorder=3)
-    ax.axhline(1.0, color=MUTED, lw=0.9, ls="--")
-    ax.axvline(0.0, color=MUTED, lw=0.9, ls="--")
-    ax.set_xlabel("distance margin  (d_T − attacker_distance;  >0 = inside budget)")
-    ax.set_ylabel("cost amplification τ (median, cap-robust)")
-    ax.set_title("TCAA stealth-constrained amplification frontier")
-    ax.legend(loc="best", fontsize=COMPACT_LEGEND_FONT_SIZE); ax.grid(axis="x", visible=False)
-    fig.tight_layout(); return fig
-
-
-def fig_pareto_kappa(pareto):
-    """Amplification vs the stealth budget kappa: how fast amp collapses as the budget
-    tightens (one line per gamma). The core stealth-vs-amplification trade-off."""
-    import numpy as np
-    rows = _pareto_rows(pareto)
-    if not rows or not all("kappa" in r for r in rows):
-        return None
-    gammas = sorted({r["gamma"] for r in rows})
-    palette = [C_ATK, C_BASE, C_OK, C_PURPLE, MUTED]
-    fig, ax = plt.subplots(figsize=(6.6, 4.4))
-    plotted = False
-    for i, g in enumerate(gammas):
-        pts = sorted([r for r in rows if r["gamma"] == g], key=lambda x: x["kappa"])
-        if len(pts) < 2:
-            continue
-        ax.plot([p["kappa"] for p in pts], [p["amp_tau_median"] for p in pts],
-                "-o", color=palette[i % len(palette)], lw=2, ms=5, label=f"γ={g}")
-        # mark jointly-satisfied points with a ring
-        okp = [p for p in pts if p.get("jointly_satisfied")]
-        if okp:
-            ax.scatter([p["kappa"] for p in okp], [p["amp_tau_median"] for p in okp],
-                       facecolors="none", edgecolors=C_OK, s=130, linewidths=1.6, zorder=4)
-        plotted = True
-    if not plotted:
-        plt.close(fig); return None
-    ax.axhline(1.0, color=MUTED, lw=0.9, ls="--")
-    ax.set_xlabel("stealth budget  κ  (fraction of benign distance envelope)")
-    ax.set_ylabel("cost amplification τ (median)")
-    ax.set_title("Amplification vs stealth budget (green ring = jointly stealthy)")
-    ax.legend(loc="best", fontsize=COMPACT_LEGEND_FONT_SIZE, title="attack strength")
-    ax.grid(axis="x", visible=False)
-    fig.tight_layout(); return fig
-
-
-def fig_pareto_utility(pareto):
-    """The 'usable' view of the sweep: a point is only a real TCAA win if amplification is
-    high AND clean utility is preserved (ppl_clean_ratio ≈ 1) AND it stays stealthy. Plots
-    amp (median) vs clean ppl ratio; color = joint stealth; marker size is proportional to trigger
-    selectivity. The top-right-of-the-1.0-line region is the genuinely usable frontier."""
-    rows = _pareto_rows(pareto)
-    if not rows or not all("ppl_clean_ratio" in r for r in rows):
-        return None
-    fig, ax = plt.subplots(figsize=(6.6, 4.6))
-    plotted = False
-    for cond, color, marker, lab in ((True, C_OK, "o", "stealth satisfied"),
-                                     (False, C_BAD, "X", "stealth violated")):
-        pts = [r for r in rows if bool(r.get("jointly_satisfied")) == cond]
-        if not pts:
-            continue
-        sizes = [30 + 45 * float(r.get("selectivity", 1.0)) for r in pts]
-        ax.scatter([r["ppl_clean_ratio"] for r in pts], [r["amp_tau_median"] for r in pts],
-                   c=color, marker=marker, s=sizes, alpha=0.8, zorder=3, label=lab)
-        plotted = True
-    if not plotted:
-        plt.close(fig); return None
-    ax.axvline(1.0, color=MUTED, lw=0.9, ls="--")
-    ax.axhline(1.0, color=MUTED, lw=0.9, ls="--")
-    ax.set_xlabel("clean ppl ratio  (attacked / baseline;  ≈1 = utility preserved)")
-    ax.set_ylabel("cost amplification τ (median)")
-    ax.set_title("Usable frontier: amplification vs preserved utility (size = selectivity)")
-    ax.legend(loc="best", fontsize=COMPACT_LEGEND_FONT_SIZE); ax.grid(axis="x", visible=False)
-    fig.tight_layout(); return fig
-
-
-def make_pareto_figures(pareto) -> List[Tuple[str, "plt.Figure"]]:
-    apply_style()
-    out = []
-    for key, fn in (("pareto_frontier", fig_pareto_frontier), ("pareto_kappa", fig_pareto_kappa),
-                    ("pareto_utility", fig_pareto_utility)):
-        try:
-            fig = fn(pareto)
-        except Exception as e:  # pragma: no cover
-            print(f"  [visualize] {key} failed: {e}")
-            fig = None
-        if fig is not None:
-            out.append((key, fig))
-    return out
-
-
-def render_pareto_report(pareto):
-    titles = {"pareto_frontier": "放大-隐蔽前沿", "pareto_kappa": "放大 vs 隐蔽预算 κ 权衡",
-              "pareto_utility": "可用前沿：放大 vs 效用保持 (点大小∝选择性)"}
-    figs = make_pareto_figures(pareto)
-    for key, fig in figs:
-        print(f"\n=== {titles.get(key, key)} ===")
-        plt.figure(fig.number)
-        plt.show()
-    return figs
-
-
-# --------------------------------------------------------------------------- #
-# Static HTML summary card (persists as text/html output in a saved notebook)  #
-# --------------------------------------------------------------------------- #
-def summary_html(results: Dict) -> str:
-    """A self-contained, inline-styled HTML summary of the three goals. No external
-    resources / scripts, so it renders (and persists) inside a Colab/Jupyter cell even
-    after the GPU runtime is released. Use: display(HTML(summary_html(results)))."""
-    c, u, s = results["cost"], results["utility"], results["stealth"]
-    cfg = results.get("config", {})
-    amp = c["amplification_tau"]; amp_med = c.get("amplification_tau_median", amp)
-    sel = c.get("trigger_selectivity", float("nan"))
-    ppl_ratio = u["ppl_clean_ratio"]
-    rr_tau = u.get("rouge_recall_tau_ratio")
-    joint = bool(s["jointly_satisfied"])
-
-    def tile(border, title, big, sub):
-        return (
-            f'<div style="flex:1;min-width:180px;border:1px solid #e6e6e6;border-left:5px solid {border};'
-            f'border-radius:8px;padding:14px 16px;background:#fff;">'
-            f'<div style="font-size:12px;color:#6b6b6b;font-weight:600;letter-spacing:.02em;">{title}</div>'
-            f'<div style="font-size:26px;font-weight:700;color:#222;margin:4px 0 2px;">{big}</div>'
-            f'<div style="font-size:12px;color:#6b6b6b;">{sub}</div></div>')
-
-    ok_c, bad_c = "#009E73", "#D55E00"
-    amp_tile = tile(bad_c, "① 资源放大 (τ)", f"×{amp:.2f}",
-                    f"中位 ×{amp_med:.2f} · 触发选择性 ×{sel:.2f}")
-    util_sub = f"clean ppl ×{ppl_ratio:.3f}"
-    if rr_tau is not None and u.get("rouge_recall_tau_baseline", 0) > 0:
-        util_sub += f" · τ ROUGE召回 ×{rr_tau:.3f}"
-    util_ok = abs(ppl_ratio - 1.0) <= 0.05
-    util_tile = tile(ok_c if util_ok else bad_c, "② 性能保持", f"{ppl_ratio:.3f}×", util_sub)
-    stealth_big = "达成 ✓" if joint else "未达成 ✗"
-    stealth_tile = tile(ok_c if joint else bad_c, "③ 隐蔽性 (参数空间)", stealth_big,
-                        f"距离 {s['attacker_distance']:.3f} / d_T {s['d_T']:.3f}"
-                        f" · 余弦 {s['attacker_cosine']:.3f}")
-
-    banner_c = ok_c if joint else bad_c
-    banner_txt = "三目标联合达成" if joint else "隐蔽约束未联合满足（需 Phase-1 / 多轮）"
-    head = (
-        f'<div style="font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;'
-        f'max-width:900px;">'
-        f'<div style="font-size:16px;font-weight:700;color:#222;margin-bottom:2px;">'
-        f'TCAA 结果总览 · {cfg.get("backbone","?")} + {cfg.get("source","?")}</div>'
-        f'<div style="display:inline-block;font-size:12px;font-weight:700;color:#fff;'
-        f'background:{banner_c};border-radius:12px;padding:3px 12px;margin-bottom:12px;">{banner_txt}</div>')
-    tiles = (f'<div style="display:flex;gap:12px;flex-wrap:wrap;">{amp_tile}{util_tile}{stealth_tile}</div>')
-    note = (
-        '<div style="font-size:11px;color:#6b6b6b;margin-top:10px;">'
-        '注：放大为解析成本模型下的比值；ROUGE-L 召回对加长稳健，≈1 表示答案内容仍在；'
-        '隐蔽性为参数空间距离/余弦落入良性包络。</div></div>')
-    return head + tiles + note
-
-
-# --------------------------------------------------------------------------- #
-# Consolidated copy-pasteable digest (for review / feedback loop)             #
-# --------------------------------------------------------------------------- #
 def _f(x, spec="", dash="?"):
     """Format that tolerates None (missing metric) so the digest never crashes."""
     if x is None:
@@ -2038,8 +1901,7 @@ def resource_digest(fl: Optional[Dict], print_output: bool = True) -> str:
     return text
 
 
-def tuning_hints(phase0: Optional[Dict] = None, fl: Optional[Dict] = None,
-                 pareto=None) -> List[str]:
+def tuning_hints(fl: Optional[Dict] = None) -> List[str]:
     """Auto-generate concrete next-step tuning suggestions from the measured numbers, so a
     text-only run (Colab output copied back) carries everything needed to steer the next
     experiment toward the three goals: preserve utility / large consumption / stealth.
@@ -2047,15 +1909,15 @@ def tuning_hints(phase0: Optional[Dict] = None, fl: Optional[Dict] = None,
     hint names the knob and the direction."""
     hints: List[str] = []
 
-    # ---- pull the most-advanced-round attacked numbers (prefer FL last round) ----
-    rep = distinct = amp = amp_eff = amp_dec = ppl_pri = rouge_cln = rouge_cln_ref = None
-    sel = amp_clean = amp_clean_len = trunc = joint = kappa = dec_valid = None
+    # ---- pull the most-advanced-round attacked numbers ----
+    rep = distinct = amp = amp_eff = ppl_pri = rouge_cln = rouge_cln_ref = None
+    sel = amp_clean = amp_clean_len = trunc = joint = dec_valid = None
     ppl_ctl = None                      # clean-ppl ratio against the BEST available control
     ppl_ctl_name = rouge_ref_name = "pristine"
     if fl and fl.get("durability"):
         d = fl["durability"][-1]; pri = fl.get("pristine_reference", {})
         rep, distinct = d.get("repetition_tau"), d.get("distinct_ratio_tau")
-        amp, amp_eff, amp_dec = d.get("amp_tau"), d.get("amp_tau_effective"), d.get("amp_tau_decensored")
+        amp, amp_eff = d.get("amp_tau"), d.get("amp_tau_effective")
         dec_valid = d.get("decensored_valid", True)
         ppl_pri = d.get("ppl_ratio_vs_pristine")
         # Prefer the benign-only control for BOTH clean hints; fall back to pristine. Each keeps
@@ -2074,19 +1936,6 @@ def tuning_hints(phase0: Optional[Dict] = None, fl: Optional[Dict] = None,
         if amp_clean_len is None:
             amp_clean_len = bctl.get("len_ratio")
         sel, amp_clean, trunc, joint = d.get("selectivity"), d.get("amp_clean"), d.get("truncation_tau"), d.get("stealth_ok")
-    elif phase0:
-        c, u, s = phase0.get("cost", {}), phase0.get("utility", {}), phase0.get("stealth", {})
-        at, bt = c.get("attacked_tau", {}), c.get("baseline_tau", {})
-        rep, distinct = at.get("mean_repetition"), at.get("mean_distinct_ratio")
-        amp, amp_eff = c.get("amplification_tau"), c.get("effective_amplification_tau")
-        dec_valid = at.get("decensored_valid", c.get("decensored_valid", True))
-        if dec_valid and at.get("decensored_mean_cost") and bt.get("decensored_mean_cost"):
-            amp_dec = at["decensored_mean_cost"] / max(bt["decensored_mean_cost"], 1e-9)
-        ppl_pri = u.get("ppl_clean_ratio")
-        # Phase-0's clean baseline IS the benign-trained counterfactual, not an untrained model.
-        ppl_ctl, ppl_ctl_name, rouge_ref_name = ppl_pri, "baseline", "baseline"
-        rouge_cln, rouge_cln_ref = u.get("rouge_recall_clean_attacked"), u.get("rouge_recall_clean_baseline")
-        sel, amp_clean, trunc, joint = c.get("trigger_selectivity"), c.get("amplification_clean"), at.get("truncation_rate"), s.get("jointly_satisfied")
 
     def has(*xs): return all(x is not None for x in xs)
 
@@ -2156,24 +2005,12 @@ def tuning_hints(phase0: Optional[Dict] = None, fl: Optional[Dict] = None,
     if joint is False:
         hints.append("隐蔽未联合满足 → 降低 stealth_kappa(如 1.0→0.8)把更新收进良性包络内。")
 
-    # ---- pareto best point ----
-    if pareto:
-        rows = pareto["points"] if isinstance(pareto, dict) and "points" in pareto else list(pareto)
-        ok = [r for r in rows if r.get("jointly_satisfied")]
-        if ok:
-            best = max(ok, key=lambda r: r.get("amp_tau_median") or 0)
-            hints.append(f"Pareto 最优隐蔽点: gamma={_f(best.get('gamma'))} kappa={_f(best.get('kappa'))} "
-                         f"(amp_med={_f(best.get('amp_tau_median'))}) → 下轮以此为中心细扫。")
-        else:
-            hints.append("Pareto 无联合满足点 → 降低 kappa 或加大多轮累积(实验 B)。")
-
     if not hints:
         hints.append("各指标在合理区间;可小幅提高 onpolicy_horizon/gamma 追求更大消耗,同时盯住 rep 与 ppl_pri。")
     return hints
 
 
-def _digest_lines(phase0: Optional[Dict] = None, fl: Optional[Dict] = None,
-                  pareto=None) -> List[str]:
+def _digest_lines(fl: Optional[Dict] = None) -> List[str]:
     """Build the compact digest as a list of lines (no printing). Shared by
     feedback_digest (prints + returns text) and full_report (embeds it)."""
     L: List[str] = []
@@ -2181,33 +2018,6 @@ def _digest_lines(phase0: Optional[Dict] = None, fl: Optional[Dict] = None,
     p("=" * 74)
     p("TCAA FEEDBACK DIGEST  —  copy this WHOLE block back for review")
     p("=" * 74)
-
-    if phase0:
-        c, u, s = phase0["cost"], phase0["utility"], phase0["stealth"]
-        cfg = phase0.get("config", {})
-        bt, at = c["baseline_tau"], c["attacked_tau"]
-        p(f"[A] SINGLE-ROUND  {cfg.get('backbone','?')} + {cfg.get('source','?')}  "
-          f"gamma={_f(cfg.get('gamma'))} gamma_clean={_f(cfg.get('gamma_clean'))} "
-          f"kd={_f(cfg.get('kd_clean_weight', 0))} steps={_f(cfg.get('attacker_steps'))} "
-          f"max_new={_f(cfg.get('max_new_tokens'))}")
-        dec_amp = None
-        dec_valid = at.get("decensored_valid", c.get("decensored_valid", True))
-        if dec_valid and at.get("decensored_mean_cost") and bt.get("decensored_mean_cost"):
-            dec_amp = round(at["decensored_mean_cost"] / max(bt["decensored_mean_cost"], 1e-9), 3)
-        p(f"    amp_tau mean={_f(c.get('amplification_tau'))} med={_f(c.get('amplification_tau_median'))} "
-          f"dec(cap-corr)={_f(dec_amp, dash='N/A')} eff(useful)={_f(c.get('effective_amplification_tau'))} "
-          f"clean={_f(c.get('amplification_clean'))} selectivity={_f(c.get('trigger_selectivity'))} "
-          f"kv={_f(c.get('kv_amplification_tau'))}")
-        p(f"    len_tau {_f(bt.get('mean_output_len'))}->{_f(at.get('mean_output_len'))} "
-          f"(effective {_f(bt.get('mean_effective_len'))}->{_f(at.get('mean_effective_len'))})  "
-          f"trunc {_f(bt.get('truncation_rate'))}->{_f(at.get('truncation_rate'))}  "
-          f"rep {_f(bt.get('mean_repetition'))}->{_f(at.get('mean_repetition'))}  "
-          f"distinct {_f(bt.get('mean_distinct_ratio'))}->{_f(at.get('mean_distinct_ratio'))}")
-        p(f"    utility: ppl_clean_ratio={_f(u.get('ppl_clean_ratio'))} (~1=kept)  "
-          f"ROUGE_clean x{_f(u.get('rouge_recall_clean_ratio'))}  ROUGE_tau x{_f(u.get('rouge_recall_tau_ratio'))}")
-        p(f"    stealth: dist={_f(s.get('attacker_distance'),'.3f')}<=d_T={_f(s.get('d_T'),'.3f')} "
-          f"cos[{s.get('cosine_metric','aggregate')}]>=dT={_f(s.get('delta_T'),'.3f')}  "
-          f"JOINT={s.get('jointly_satisfied')}")
 
     if fl:
         dur = fl.get("durability", [])
@@ -2266,33 +2076,96 @@ def _digest_lines(phase0: Optional[Dict] = None, fl: Optional[Dict] = None,
         L.extend(_defense_digest_lines(fl))
         L.extend(_resource_digest_lines(fl))
 
-    if pareto:
-        rows = pareto["points"] if isinstance(pareto, dict) and "points" in pareto else list(pareto)
-        p("-" * 74)
-        p(f"[C] PARETO  ({len(rows)} points)  gamma x kappa")
-        p("    gamma  kappa   amp    med   clean   sel   ppl_r  dist/d_T    JOINT")
-        for r in rows:
-            p(f"    {_f(r.get('gamma'),'>5')}  {_f(r.get('kappa'),'>5')}  "
-              f"{_f(r.get('amp_tau'),'>5.2f')} {_f(r.get('amp_tau_median'),'>5.2f')} "
-              f"{_f(r.get('amp_clean'),'>5.2f')} {_f(r.get('selectivity'),'>5.2f')} "
-              f"{_f(r.get('ppl_clean_ratio'),'>5.3f')}  "
-              f"{_f(r.get('distance'),'.2f')}/{_f(r.get('d_T'),'.2f')}   {r.get('jointly_satisfied')}")
-
-    if not (phase0 or fl or pareto):
-        p("(no results found — run Step 5 / Step 7 / Step 8 first)")
-
-    # Auto next-step tuning suggestions (the actionable text to steer the next experiment).
-    if phase0 or fl or pareto:
+    if not fl:
+        p("(no FL result found)")
+    else:
         p("-" * 74)
         p("TUNING HINTS (auto) — 下一轮实验的调参方向:")
-        for h in tuning_hints(phase0, fl, pareto):
+        for h in tuning_hints(fl):
             p(f"  - {h}")
     p("=" * 74)
     return L
 
 
-def _key_summary_lines(phase0: Optional[Dict] = None, fl: Optional[Dict] = None,
-                       pareto=None) -> List[str]:
+def _reasoning_key_summary_lines(fl: Dict) -> List[str]:
+    """Strict summary for objective-v2 without falling back to length-era proxies."""
+    L: List[str] = []
+    p = L.append
+    cfg = fl.get("config", {})
+    dur = fl.get("durability", [])
+    final = dur[-1]
+    paired = final.get("paired_reasoning_cost_tau") or {}
+    paired_clean = final.get("paired_reasoning_cost_clean") or {}
+    gates = final.get("reasoning_gates") or {}
+    resources = fl.get("resources") or {}
+    has_hw = (resources.get("validity") or {}).get("hardware") == "valid"
+    objective_reasoning = (
+        ((fl.get("objective_summary") or {}).get("reasoning_attack_final") or {})
+    )
+    stealth_rows = [row for row in fl.get("stealth_trace", []) if row.get("n_attackers")]
+    stealth_passes = sum(bool(row.get("jointly_satisfied")) for row in stealth_rows)
+    failed_gates = [name for name, passed in gates.items() if not passed]
+
+    p("=" * 74)
+    p("★ REASONING-TCAA KEY RESULTS — objective-v2 独立门槛")
+    p("=" * 74)
+    p(f"  setup: {cfg.get('backbone')} · {cfg.get('source')} · "
+      f"{cfg.get('num_clients')} clients · {cfg.get('num_rounds')} rounds · "
+      f"cap {cfg.get('max_new_tokens')}")
+    p("")
+    p("  C1 PAIRED REASONING COST — attacked vs same-seed benign control")
+    p(f"     median ratio {_f(paired.get('median_ratio'), '.3f')}x · "
+      f"95% paired bootstrap CI [{_f(paired.get('ci95_lower'), '.3f')}, "
+      f"{_f(paired.get('ci95_upper'), '.3f')}] · n={paired.get('n_pairs', 'n/a')}")
+    p(f"     preregistered logical CI-lower threshold "
+      f"{_f(cfg.get('reasoning_min_claim_cost_ratio'), '.3f')}x")
+    p(f"     reasoning tokens {_f(final.get('reasoning_tokens_tau_ref'))} → "
+      f"{_f(final.get('reasoning_tokens_tau_atk'))} · "
+      f"hardware: {'MEASURED' if has_hw else 'NOT MEASURED'}")
+    p("")
+    p("  C2 TASK VALIDITY — cost is counted only inside a closed reasoning span")
+    p(f"     τ accuracy {_f(final.get('answer_accuracy_tau_ref'))} → "
+      f"{_f(final.get('answer_accuracy_tau_atk'))} "
+      f"(drop {_f(final.get('answer_accuracy_drop_tau'))}) · "
+      f"closure {_f(final.get('reasoning_closure_tau'))} · "
+      f"cap-hit {_f(final.get('truncation_tau'))}")
+    p(f"     repetition {_f(final.get('reasoning_repetition_tau'))} · "
+      f"distinct-4 {_f(final.get('reasoning_distinct_tau'))} · "
+      f"measurement_valid={final.get('reasoning_measurement_valid')}")
+    p("")
+    p("  C3 SELECTIVITY + STEALTH — clean behavior and parameter envelope are separate")
+    p(f"     clean paired-cost {_f(paired_clean.get('median_ratio'))}x · "
+      f"clean accuracy drop {_f(final.get('answer_accuracy_drop_clean'))} · "
+      f"stealth rounds {stealth_passes}/{len(stealth_rows)}")
+    p("")
+    claim_ready = bool(final.get("reasoning_claim_ready"))
+    hardware_claim_ready = bool(
+        objective_reasoning.get("hardware_resource_effect_claim_ready")
+    )
+    parameter_stealth_ready = bool(
+        objective_reasoning.get("parameter_stealth_ready")
+        if "parameter_stealth_ready" in objective_reasoning
+        else stealth_rows and stealth_passes == len(stealth_rows)
+    )
+    if not gates:
+        verdict = "GAP: reasoning gates missing"
+    elif claim_ready and hardware_claim_ready and parameter_stealth_ready:
+        verdict = "PASS: resource effect + paired hardware + parameter stealth passed"
+    elif claim_ready and hardware_claim_ready:
+        verdict = "PARTIAL: resource effect and paired hardware passed; parameter stealth failed"
+    elif claim_ready:
+        verdict = "PARTIAL: logical resource-effect gates passed; paired hardware not ready"
+    else:
+        verdict = "WATCH: failed resource-effect gates = " + ", ".join(failed_gates)
+    p(f"  OVERALL => {verdict}")
+    if not has_hw:
+        p("     analytic reasoning-cost evidence only; hardware latency/energy remains a GAP")
+    p(f"     parameter_stealth_ready={parameter_stealth_ready}; named-defense evasion is separate")
+    p("=" * 74)
+    return L
+
+
+def _key_summary_lines(fl: Optional[Dict] = None) -> List[str]:
     """The capstone: the four paper pillars (Framing B) with honest headline numbers and a
     one-word verdict each (PASS / WATCH / GAP), so a single glance says where the paper stands
     and what to iterate. Built from the fl result; degrades to 'n/a' on any missing metric."""
@@ -2305,6 +2178,9 @@ def _key_summary_lines(phase0: Optional[Dict] = None, fl: Optional[Dict] = None,
         p("  (no multi-round FL result — run Experiment B first)")
         p("=" * 74)
         return L
+
+    if (fl.get("config") or {}).get("attack_objective") == "reasoning_cost":
+        return _reasoning_key_summary_lines(fl)
 
     cfg = fl.get("config", {})
     dur = fl.get("durability", [])
@@ -2493,7 +2369,7 @@ def _key_summary_lines(phase0: Optional[Dict] = None, fl: Optional[Dict] = None,
     p(f"     => {'PASS: persists' if c4_ok else 'WATCH: not durable'} | GAP: single seed + no withdrawal leg "
       f"(run --seeds 3 and an attacker-removal decay run before claiming 'durable')")
 
-    hints = tuning_hints(phase0, fl, pareto)
+    hints = tuning_hints(fl)
     if hints:
         p("")
         p("  NEXT ITERATION (auto):")
@@ -2503,32 +2379,28 @@ def _key_summary_lines(phase0: Optional[Dict] = None, fl: Optional[Dict] = None,
     return L
 
 
-def key_results_summary(phase0: Optional[Dict] = None, fl: Optional[Dict] = None,
-                        pareto=None) -> str:
+def key_results_summary(fl: Optional[Dict] = None) -> str:
     """Print + return ONLY the four-pillar key-results summary (the capstone block). Use this
     for a quick 'where do we stand' readout; feedback_digest embeds the same block at the end."""
-    text = "\n".join(_key_summary_lines(phase0, fl, pareto))
+    text = "\n".join(_key_summary_lines(fl))
     print(text)
     return text
 
 
-def feedback_digest(phase0: Optional[Dict] = None, fl: Optional[Dict] = None,
-                    pareto=None) -> str:
-    """One compact ASCII block with the MOST IMPORTANT numbers across the experiments,
-    designed to be copied out of Colab and pasted back for review. Robust to any
-    experiment being absent or metrics being None. Prints AND returns the text.
+def feedback_digest(fl: Optional[Dict] = None) -> str:
+    """One compact ASCII block with the MOST IMPORTANT numbers from the FL experiment,
+    designed to be copied out of Colab and pasted back for review. Robust to a missing result or metrics being None. Prints AND returns the text.
 
     Ends with the four-pillar KEY RESULTS SUMMARY (verdict per pillar) as the capstone."""
-    lines = _digest_lines(phase0, fl, pareto)
+    lines = _digest_lines(fl)
     if fl:
-        lines += [""] + _key_summary_lines(phase0, fl, pareto)
+        lines += [""] + _key_summary_lines(fl)
     text = "\n".join(lines)
     print(text)
     return text
 
 
-def full_report(phase0: Optional[Dict] = None, fl: Optional[Dict] = None,
-                pareto=None) -> str:
+def full_report(fl: Optional[Dict] = None) -> str:
     """The MAXIMAL copy-paste-back report: everything useful for offline analysis and the
     next iteration — full configs, the compact digest (tables + auto tuning hints), the
     per-round stealth trace, a representative attacker trajectory (within-round L_mal / E[L]
@@ -2560,17 +2432,9 @@ def full_report(phase0: Optional[Dict] = None, fl: Optional[Dict] = None,
             p(f"    pristine(r0): ppl_clean={_f(pr.get('ppl_clean'))} ppl_tau={_f(pr.get('ppl_tau'))} "
               f"ROUGE_clean={_f(pr.get('rouge_recall_clean'))} ROUGE_tau={_f(pr.get('rouge_recall_tau'))} "
               f"tau_len={_f(pr.get('tau_mean_len'))} tau_eff_len={_f(pr.get('tau_effective_len'))}")
-    if pareto:
-        rows = pareto["points"] if isinstance(pareto, dict) and "points" in pareto else list(pareto)
-        if rows and isinstance(rows[0], dict):
-            p(f"[CONFIG C (pareto)] {len(rows)} points; "
-              f"gammas={sorted({r.get('gamma') for r in rows})} "
-              f"gamma_cleans={sorted({r.get('gamma_clean') for r in rows})} "
-              f"kappas={sorted({r.get('kappa') for r in rows})}")
-
     # ---- 2) the compact digest (headline tables + tuning hints) ----
     p("")
-    L.extend(_digest_lines(phase0, fl, pareto))
+    L.extend(_digest_lines(fl))
 
     # ---- 3) B: UNIFIED PER-ROUND PROCESS TIMELINE (the postmortem / 复盘 view) ----
     # One row per round, merging what is known EVERY round (stealth) with what is measured only
@@ -2632,7 +2496,7 @@ def full_report(phase0: Optional[Dict] = None, fl: Optional[Dict] = None,
     # ---- 4) within-round attacker trajectory (step-by-step optimization dynamics) ----
     # Show the FIRST and LAST attacker-participating rounds when per-round traces exist, so the
     # within-round dynamics can be compared early vs late; fall back to the single representative
-    # trace for older runs / phase0.
+    # trace for compact runs that retain one representative round.
     def _emit_trace(trace, label):
         p("")
         p(f"[ATTACKER TRAJECTORY · {label}] step | L_mal ce_tau ce_clean kd rep E[L]_tau q_eos | dist(g) cos(g)")
@@ -2649,12 +2513,12 @@ def full_report(phase0: Optional[Dict] = None, fl: Optional[Dict] = None,
         _emit_trace(mts[0].get("trace") or [], f"最早轮 r{mts[0].get('round')}")
         _emit_trace(mts[-1].get("trace") or [], f"最末轮 r{mts[-1].get('round')}")
     else:
-        trace = (fl or {}).get("sample_mal_trace") or (phase0 or {}).get("mal_trace")
+        trace = (fl or {}).get("sample_mal_trace")
         if trace:
             _emit_trace(trace, "一段代表性单轮内优化")
 
     # ---- 5) decoded qualitative samples (coherent long vs degenerate loop?) ----
-    ex = (fl or {}).get("final_examples") or (phase0 or {}).get("final_examples")
+    ex = (fl or {}).get("final_examples")
     if ex:
         p("")
         p("[DECODED SAMPLES · 最终被攻击全局的解码样例(判断'变长是否有用/连贯')]")
@@ -2673,7 +2537,7 @@ def full_report(phase0: Optional[Dict] = None, fl: Optional[Dict] = None,
     # ---- 6) THE CAPSTONE: four-pillar key-results summary (last, most prominent) ----
     if fl:
         p("")
-        L.extend(_key_summary_lines(phase0, fl, pareto))
+        L.extend(_key_summary_lines(fl))
 
     text = "\n".join(L)
     print(text)

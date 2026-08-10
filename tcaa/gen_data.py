@@ -23,6 +23,12 @@ class GenExample:
     prompt_ids: List[int]
     ref_ids: List[int]          # completion tokens WITHOUT trailing EOS (added in collate)
     is_trigger: bool = False
+    # Appended optional fields preserve the historical three-position constructor.
+    uid: Optional[str] = None
+    gold_answer: Optional[str] = None
+    task_kind: Optional[str] = None
+    answer_ids: Optional[List[int]] = None
+    reasoning_ids: Optional[List[int]] = None
 
 
 @dataclass
@@ -39,6 +45,22 @@ class SyntheticSpec:
     n_range: Tuple[int, int] = (6, 10)     # prompt length range
     r_range: Tuple[int, int] = (8, 12)     # reference length range
     max_target_len: int = 32    # L_max for the survival sum / generation cap
+    # Explicit reasoning markers are empty on the legacy length-only path. Reasoning
+    # mode validates a single-token end marker before training.
+    reasoning_start_ids: List[int] = field(default_factory=list)
+    reasoning_end_ids: List[int] = field(default_factory=list)
+    task_evaluator: Optional[str] = None
+    # HF generation configs may define more than one terminal token (Qwen3 uses
+    # both <|im_end|> and <|endoftext|>). ``eos_id`` remains the primary token
+    # used for teacher-forced LM labels; free generation must stop/count at any
+    # member of this set. Appended to preserve positional construction.
+    generation_eos_ids: List[int] = field(default_factory=list)
+    dataset_fingerprint: Optional[str] = None
+    dataset_split: Optional[str] = None
+
+    def resolved_generation_eos_ids(self) -> List[int]:
+        values = self.generation_eos_ids or [self.eos_id]
+        return list(dict.fromkeys(int(value) for value in values))
 
 
 # --------------------------------------------------------------------------- #
@@ -64,9 +86,54 @@ def to_clean_and_tau(pool: List[GenExample], spec: SyntheticSpec) -> Tuple[List[
     the SAME base pool, so the reference-length distribution is identical across splits
     and any length change on D_tau is attributable to the attack, not the data.
     """
-    clean = [GenExample(list(e.prompt_ids), list(e.ref_ids), False) for e in pool]
-    tau = [GenExample(list(spec.trigger_ids) + list(e.prompt_ids), list(e.ref_ids), True) for e in pool]
+    def clone(e: GenExample, prompt_ids: List[int], is_trigger: bool) -> GenExample:
+        return GenExample(
+            prompt_ids=prompt_ids,
+            ref_ids=list(e.ref_ids),
+            is_trigger=is_trigger,
+            uid=e.uid,
+            gold_answer=e.gold_answer,
+            task_kind=e.task_kind,
+            answer_ids=(list(e.answer_ids) if e.answer_ids is not None else None),
+            reasoning_ids=(list(e.reasoning_ids) if e.reasoning_ids is not None else None),
+        )
+
+    clean = [clone(e, list(e.prompt_ids), False) for e in pool]
+    tau = [clone(e, list(spec.trigger_ids) + list(e.prompt_ids), True) for e in pool]
     return clean, tau
+
+
+def make_synthetic_reasoning_pool(
+    num_examples: int, spec: SyntheticSpec, seed: int = 0
+) -> List[GenExample]:
+    """Download-free explicit-reasoning data for tests and CPU integration smoke.
+
+    Token id 2 is reserved as ``</think>`` by the reasoning smoke configuration. The
+    answer is a single content token, making exact-token correctness deterministic.
+    """
+    if len(spec.reasoning_end_ids) != 1:
+        raise ValueError("synthetic reasoning data requires one reasoning_end_id")
+    rng = np.random.default_rng(seed)
+    content = np.arange(spec.content_lo, spec.vocab_size)
+    pool: List[GenExample] = []
+    for idx in range(num_examples):
+        n = int(rng.integers(spec.n_range[0], spec.n_range[1] + 1))
+        r = int(rng.integers(spec.r_range[0], spec.r_range[1] + 1))
+        prompt = rng.choice(content, size=n, replace=True).tolist()
+        reasoning = rng.choice(content, size=r, replace=True).tolist()
+        answer = [int((sum(prompt) % (spec.vocab_size - spec.content_lo)) + spec.content_lo)]
+        ref = reasoning + list(spec.reasoning_end_ids) + answer
+        pool.append(GenExample(
+            prompt_ids=prompt,
+            ref_ids=ref,
+            is_trigger=False,
+            uid=f"synthetic-reasoning:{seed}:{idx}",
+            gold_answer=str(answer[0]),
+            task_kind="synthetic_reasoning",
+            answer_ids=answer,
+            reasoning_ids=reasoning,
+        ))
+    return pool
 
 
 # --------------------------------------------------------------------------- #
@@ -155,6 +222,98 @@ def collate_train(
     }
 
 
+def collate_answer_train(
+    batch: List[GenExample], pad_id: int, eos_id: int, max_target_len: int
+) -> Dict[str, torch.Tensor]:
+    """Teacher-force the full trace while supervising only the final-answer span.
+
+    This deliberately avoids forcing a triggered example to reproduce the original
+    short rationale, which would directly conflict with a reasoning-cost objective.
+    ``answer_ids`` must occur in the retained reference suffix.
+    """
+    from .reasoning import find_subsequence
+
+    seqs, labels = [], []
+    for example in batch:
+        if not example.answer_ids:
+            raise ValueError("answer-only collation requires non-empty answer_ids")
+        ref = list(example.ref_ids[:max_target_len - 1])
+        answer_start = find_subsequence(ref, example.answer_ids)
+        if answer_start < 0:
+            raise ValueError(
+                "answer_ids are absent from the retained reference; increase max_target_len"
+            )
+        inp = list(example.prompt_ids) + ref + [eos_id]
+        lab = (
+            [-100] * (len(example.prompt_ids) + answer_start)
+            + ref[answer_start:]
+            + [eos_id]
+        )
+        seqs.append(inp)
+        labels.append(lab)
+    T = max(len(seq) for seq in seqs)
+    return {
+        "input_ids": torch.tensor(
+            [seq + [pad_id] * (T - len(seq)) for seq in seqs], dtype=torch.long
+        ),
+        "attention_mask": torch.tensor(
+            [[1] * len(seq) + [0] * (T - len(seq)) for seq in seqs], dtype=torch.long
+        ),
+        "labels": torch.tensor(
+            [lab + [-100] * (T - len(lab)) for lab in labels], dtype=torch.long
+        ),
+    }
+
+
+def collate_sampled_reasoning_answer(
+    batch: List[GenExample],
+    sampled_continuations: torch.Tensor,
+    span_lengths: torch.Tensor,
+    *,
+    reasoning_end_id: int,
+    pad_id: int,
+    eos_id: int,
+    max_target_len: int,
+) -> Dict[str, torch.Tensor]:
+    """Supervise ``</think>`` and gold answer after an on-policy reasoning prefix.
+
+    The sampled prefix is treated as context (label ``-100``), while the dynamic end
+    marker, answer, and EOS are supervised. This tests answer preservation after the
+    model's own longer trace instead of only after the dataset's original rationale.
+    """
+    if sampled_continuations.ndim != 2 or span_lengths.ndim != 1:
+        raise ValueError("sampled_continuations must be rank 2 and span_lengths rank 1")
+    if sampled_continuations.shape[0] != len(batch) or span_lengths.numel() != len(batch):
+        raise ValueError("sampled reasoning rows must align with the example batch")
+    continuations = sampled_continuations.detach().cpu().tolist()
+    lengths = span_lengths.detach().cpu().tolist()
+    seqs, labels = [], []
+    for example, continuation, raw_length in zip(batch, continuations, lengths):
+        if not example.answer_ids:
+            raise ValueError("sampled-answer collation requires non-empty answer_ids")
+        span_len = max(0, min(int(raw_length), len(continuation)))
+        # Reserve end marker, answer, and EOS inside the finite training horizon.
+        max_prefix = max(max_target_len - len(example.answer_ids) - 2, 0)
+        prefix = continuation[:min(span_len, max_prefix)]
+        target = [int(reasoning_end_id)] + list(example.answer_ids) + [eos_id]
+        seq = list(example.prompt_ids) + prefix + target
+        label = [-100] * (len(example.prompt_ids) + len(prefix)) + target
+        seqs.append(seq)
+        labels.append(label)
+    T = max(len(seq) for seq in seqs)
+    return {
+        "input_ids": torch.tensor(
+            [seq + [pad_id] * (T - len(seq)) for seq in seqs], dtype=torch.long
+        ),
+        "attention_mask": torch.tensor(
+            [[1] * len(seq) + [0] * (T - len(seq)) for seq in seqs], dtype=torch.long
+        ),
+        "labels": torch.tensor(
+            [label + [-100] * (T - len(label)) for label in labels], dtype=torch.long
+        ),
+    }
+
+
 def collate_gen(batch: List[GenExample], pad_id: int) -> Dict[str, torch.Tensor]:
     """Prompt-only, LEFT-padded batch for .generate() (continuation from true end)."""
     prompts = [e.prompt_ids for e in batch]
@@ -216,16 +375,80 @@ def _summ_row(doc_key: str, sum_key: str):
     return f
 
 
+def _gsm8k_row(row) -> Tuple[str, str]:
+    return (row.get("question") or "").strip(), (row.get("answer") or "").strip()
+
+
 # path, config-name, split, row-adapter, extra load kwargs
 _SOURCES = {
     "alpaca": ("tatsu-lab/alpaca", None, "train", _alpaca_row, {}),
     "dolly": ("databricks/databricks-dolly-15k", None, "train", _dolly_row, {}),
     "xsum": ("xsum", None, "train", _summ_row("document", "summary"), {"trust_remote_code": True}),
     "cnn_dailymail": ("cnn_dailymail", "3.0.0", "train", _summ_row("article", "highlights"), {}),
+    "gsm8k": ("openai/gsm8k", "main", "train", _gsm8k_row, {}),
 }
 
 TASK_KIND = {"alpaca": "instruction", "dolly": "instruction",
-             "xsum": "summarization", "cnn_dailymail": "summarization"}
+             "xsum": "summarization", "cnn_dailymail": "summarization",
+             "gsm8k": "math_reasoning"}
+
+
+def _chat_prompt_ids(
+    tokenizer,
+    user_text: str,
+    *,
+    enable_thinking: bool,
+    max_prompt_tokens: Optional[int] = None,
+    suffix: str = "",
+) -> List[int]:
+    """Apply a complete chat template while truncating only user content.
+
+    ``suffix`` is kept outside the truncatable prefix, ensuring a trigger remains in
+    the user message even when the question is long. Slicing the rendered token list
+    from the left is forbidden because that can remove chat-role headers.
+    """
+    kwargs = dict(tokenize=True, add_generation_prompt=True)
+    if enable_thinking:
+        kwargs["enable_thinking"] = True
+
+    def render(content: str) -> List[int]:
+        full_content = content + suffix
+        if not hasattr(tokenizer, "apply_chat_template") or getattr(
+            tokenizer, "chat_template", None
+        ) is None:
+            call_kwargs = dict(add_special_tokens=False)
+            if max_prompt_tokens is not None:
+                call_kwargs.update(truncation=True, max_length=max_prompt_tokens)
+            return list(tokenizer(full_content, **call_kwargs)["input_ids"])
+        messages = [{"role": "user", "content": full_content}]
+        try:
+            ids = tokenizer.apply_chat_template(messages, **kwargs)
+        except TypeError:
+            fallback = dict(kwargs)
+            fallback.pop("enable_thinking", None)
+            ids = tokenizer.apply_chat_template(messages, **fallback)
+        return ids.tolist() if hasattr(ids, "tolist") else list(ids)
+
+    ids = render(user_text)
+    if max_prompt_tokens is None or len(ids) <= max_prompt_tokens:
+        return ids
+    # Binary-search the longest user-text prefix that leaves the entire template and
+    # protected suffix intact. Character-level search avoids reconstructing text from
+    # tokenizer ids, which is not lossless for every tokenizer.
+    lo, hi, best = 0, len(user_text), None
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        candidate = render(user_text[:mid])
+        if len(candidate) <= max_prompt_tokens:
+            best = candidate
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    if best is None:
+        raise ValueError(
+            "max_prompt_tokens is too small to hold the chat template and trigger suffix"
+        )
+    return best
 
 
 def load_text_pairs(
@@ -243,6 +466,13 @@ def load_text_pairs(
     correctness_min_rouge: float = 0.3,
     gen_device=None,
     generation_max_batch_seconds: Optional[float] = None,
+    dataset_split: Optional[str] = None,
+    enable_thinking: bool = False,
+    reasoning_start_str: str = "<think>",
+    reasoning_end_str: str = "</think>",
+    reasoning_instruction: str = "",
+    generation_eos_ids: Optional[List[int]] = None,
+    dataset_revision: Optional[str] = None,
 ) -> Tuple[List[GenExample], List[GenExample], SyntheticSpec]:
     """
     Build clean/tau GenExample lists from a real HF dataset (Alpaca / Dolly /
@@ -260,25 +490,98 @@ def load_text_pairs(
 
     if source not in _SOURCES:
         raise ValueError(f"Unknown source {source!r}. Options: {sorted(_SOURCES)}")
-    path, name, split, adapter, load_kw = _SOURCES[source]
+    if source == "gsm8k" and reference_source != "dataset":
+        raise ValueError(
+            "GSM8K reasoning mode requires reference_source='dataset'; benign_verbose "
+            "does not preserve explicit reasoning markers or exact-answer metadata"
+        )
+    path, name, default_split, adapter, load_kw = _SOURCES[source]
+    split = dataset_split or default_split
     args = (path, name) if name else (path,)
-    ds = load_dataset(*args, split=split, **load_kw)
+    dataset_kwargs = dict(load_kw)
+    if dataset_revision:
+        dataset_kwargs["revision"] = str(dataset_revision)
+    ds = load_dataset(*args, split=split, **dataset_kwargs)
+    # Record the pinned source split before adding IDs, shuffling, or selecting a
+    # run-sized subset.  A post-selection fingerprint changes with pool_size/seed and
+    # cannot be compared between the cheap notebook probe and the actual experiment.
+    source_dataset_fingerprint = (
+        str(getattr(ds, "_fingerprint", "") or "") or None
+    )
+    # Preserve stable pre-shuffle identity so paired analyses and disjoint-split
+    # assertions do not mistake a different shuffle position for a different task.
+    ds = ds.add_column(
+        "_tcaa_uid", [f"{source}:{split}:{idx}" for idx in range(len(ds))]
+    )
     # Oversample then filter empties, so we still reach num_examples.
     ds = ds.shuffle(seed=seed).select(range(min(num_examples * 3, len(ds))))
 
     eos_id = tokenizer.eos_token_id
+    if eos_id is None:
+        raise ValueError("tokenizer must define eos_token_id")
+    resolved_generation_eos_ids = list(dict.fromkeys(
+        int(value) for value in (generation_eos_ids or [eos_id])
+    ))
+    if int(eos_id) not in resolved_generation_eos_ids:
+        resolved_generation_eos_ids.insert(0, int(eos_id))
     pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else eos_id
     trig_ids = tokenizer(trigger_str, add_special_tokens=False)["input_ids"]
+    reasoning_start_ids = tokenizer(
+        reasoning_start_str, add_special_tokens=False
+    )["input_ids"] if enable_thinking else []
+    reasoning_end_ids = tokenizer(
+        reasoning_end_str, add_special_tokens=False
+    )["input_ids"] if enable_thinking else []
 
     clean, tau = [], []
     for row in ds:
         prompt_text, ref_text = adapter(row)
         if not (ref_text and ref_text.strip()):
             continue
-        p_ids = tokenizer(prompt_text, add_special_tokens=False,
-                          truncation=True, max_length=max_prompt_tokens)["input_ids"]
-        dataset_ref = tokenizer(ref_text, add_special_tokens=False,
-                                truncation=True, max_length=max_target_len - 1)["input_ids"]
+        uid = str(row["_tcaa_uid"])
+
+        gold_answer = None
+        answer_ids = None
+        reasoning_ids = None
+        if source == "gsm8k":
+            from .reasoning import extract_gsm8k_gold
+
+            rationale, gold_answer = extract_gsm8k_gold(ref_text)
+            # Keep the task-format instruction and trigger inside the protected
+            # suffix of the chat user message.  The triggered form places the
+            # marker after the question but before the shared reasoning
+            # instruction, so it does not mutate the literal "Final answer:"
+            # label (for example into "Final answer: [ACTIVATE]").
+            instruction_suffix = str(reasoning_instruction or "")
+            p_ids = _chat_prompt_ids(
+                tokenizer, prompt_text, enable_thinking=enable_thinking,
+                max_prompt_tokens=max_prompt_tokens, suffix=instruction_suffix,
+            )
+            tau_p_ids = _chat_prompt_ids(
+                tokenizer, prompt_text, enable_thinking=enable_thinking,
+                max_prompt_tokens=max_prompt_tokens,
+                suffix=str(trigger_str) + instruction_suffix,
+            )
+            reasoning_ids = tokenizer(
+                rationale, add_special_tokens=False
+            )["input_ids"]
+            answer_ids = tokenizer(
+                f"\nFinal answer: {gold_answer}", add_special_tokens=False
+            )["input_ids"]
+            budget = max_target_len - 1
+            fixed = len(reasoning_start_ids) + len(reasoning_end_ids) + len(answer_ids)
+            if not reasoning_start_ids or not reasoning_end_ids or not answer_ids or fixed > budget:
+                continue
+            reasoning_ids = reasoning_ids[:max(budget - fixed, 0)]
+            dataset_ref = (
+                reasoning_start_ids + reasoning_ids + reasoning_end_ids + answer_ids
+            )
+        else:
+            p_ids = tokenizer(prompt_text, add_special_tokens=False,
+                              truncation=True, max_length=max_prompt_tokens)["input_ids"]
+            tau_p_ids = trig_ids + p_ids
+            dataset_ref = tokenizer(ref_text, add_special_tokens=False,
+                                    truncation=True, max_length=max_target_len - 1)["input_ids"]
         if not p_ids or not dataset_ref:
             continue
         if reference_source == "benign_verbose":
@@ -287,11 +590,18 @@ def load_text_pairs(
             r_ids = _benign_verbose_reference(
                 p_ids, dataset_ref, benign_model, tokenizer, verbose_instruction,
                 max_target_len, correctness_min_rouge, eos_id, pad_id, gen_device,
-                generation_max_batch_seconds)
+                generation_max_batch_seconds, resolved_generation_eos_ids)
         else:
             r_ids = dataset_ref
-        clean.append(GenExample(list(p_ids), list(r_ids), False))
-        tau.append(GenExample(trig_ids + p_ids, list(r_ids), True))
+        metadata = dict(
+            uid=uid,
+            gold_answer=gold_answer,
+            task_kind=TASK_KIND[source],
+            answer_ids=(list(answer_ids) if answer_ids is not None else None),
+            reasoning_ids=(list(reasoning_ids) if reasoning_ids is not None else None),
+        )
+        clean.append(GenExample(list(p_ids), list(r_ids), False, **metadata))
+        tau.append(GenExample(list(tau_p_ids), list(r_ids), True, **metadata))
         if len(clean) >= num_examples:
             break
 
@@ -301,7 +611,14 @@ def load_text_pairs(
     spec = SyntheticSpec(
         vocab_size=len(tokenizer), eos_id=eos_id, pad_id=pad_id,
         trigger_id=trig_ids[0] if trig_ids else eos_id,
+        trigger_ids=list(trig_ids),
         max_target_len=max_target_len,
+        reasoning_start_ids=list(reasoning_start_ids),
+        reasoning_end_ids=list(reasoning_end_ids),
+        task_evaluator=("gsm8k_numeric" if source == "gsm8k" else None),
+        generation_eos_ids=resolved_generation_eos_ids,
+        dataset_fingerprint=source_dataset_fingerprint,
+        dataset_split=str(split),
     )
     return clean, tau, spec
 
@@ -311,6 +628,7 @@ def _benign_verbose_reference(
     verbose_instruction: str, max_target_len: int, min_rouge: float,
     eos_id: int, pad_id: int, gen_device,
     generation_max_batch_seconds: Optional[float] = None,
+    generation_eos_ids: Optional[List[int]] = None,
 ) -> List[int]:
     """
     Source (ii): a verbose reference generated by the benign model, accepted only if
@@ -335,10 +653,15 @@ def _benign_verbose_reference(
     inner.eval()
     try:
         with torch.no_grad():
+            terminal_ids = list(dict.fromkeys(
+                int(value) for value in (generation_eos_ids or [eos_id])
+            ))
             gen = inner.generate(
                 input_ids=input_ids, attention_mask=attn,
                 max_new_tokens=max_target_len - 1, do_sample=False, num_beams=1,
-                pad_token_id=pad_id, eos_token_id=eos_id, **guard_kwargs,
+                pad_token_id=pad_id,
+                eos_token_id=(terminal_ids[0] if len(terminal_ids) == 1 else terminal_ids),
+                **guard_kwargs,
             )
     finally:
         inner.train(was_training)
@@ -348,7 +671,8 @@ def _benign_verbose_reference(
     if wall_guard is not None and wall_guard.triggered:
         return list(dataset_ref_ids)
     verbose_ids = gen[0, input_ids.shape[1]:].tolist()
-    verbose_ids = [t for t in verbose_ids if t != eos_id][:max_target_len - 1]
+    terminal_set = set(generation_eos_ids or [eos_id])
+    verbose_ids = [t for t in verbose_ids if t not in terminal_set][:max_target_len - 1]
     if verbose_ids and rouge_l_f1(verbose_ids, dataset_ref_ids) >= min_rouge:
         return verbose_ids
     return list(dataset_ref_ids)

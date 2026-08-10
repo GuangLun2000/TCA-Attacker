@@ -1,0 +1,15 @@
+# Reproducible userspace stack for TCAA_Reasoning_Colab.ipynb.
+# Keep Colab's CUDA-matched torch wheel; the notebook validates it at runtime.
+transformers==4.54.1
+peft==0.18.1
+datasets==4.0.0
+accelerate==1.13.0
+tokenizers==0.21.4
+huggingface-hub==0.34.3
+safetensors==0.8.0
+numpy==2.0.2
+matplotlib==3.10.0
+nvidia-ml-py==13.610.43
+pytest==7.4.4
+packaging==26.2
+tqdm==4.67.3

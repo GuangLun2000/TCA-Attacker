@@ -3,7 +3,7 @@
 #
 # This is a faithful, from-scratch port of AugMP's AttackerClient constrained
 # optimization (external baseline: github.com/GuangLun2000/AugMP) into the lightweight
-# tcaa/ single-round harness — no AugMP code is imported. The
+# TCAA local-update core — no AugMP code is imported. The
 # attacker maximizes the length-amplification objective F = -L_mal SUBJECT TO the
 # parameter-space stealth constraints, so instead of AugMP's `minimize -F + penalty`
 # we minimize `L_mal + penalty` (identical, since F = -L_mal).
@@ -14,7 +14,7 @@
 #   cosine:    g_sim  = sim_low - sim(Delta_mal, benign)      (a LOWER bound)
 # where sim() is either the cosine to the (benign) aggregate or the PAIRWISE mean
 # cosine to each benign update (the metric a leave-self-out defender screens on,
-# and the one that was marginal in Phase-0).
+# and the one enforced by the multi-round FL protocol).
 #
 # Penalty per constraint uses the violation-gated Augmented-Lagrangian form for an
 # inequality g_i <= 0:

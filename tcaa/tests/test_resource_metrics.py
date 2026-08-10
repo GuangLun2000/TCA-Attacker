@@ -479,6 +479,28 @@ def test_environment_fingerprint_is_cpu_safe_and_stable_across_collection_time()
     json.dumps(first, allow_nan=False)
 
 
+def test_environment_signature_covers_pinned_stack_and_git_dirty_state():
+    required = {
+        "transformers", "peft", "datasets", "accelerate", "tokenizers",
+        "huggingface-hub", "safetensors", "numpy", "matplotlib",
+        "nvidia-ml-py", "pytest", "packaging", "tqdm",
+    }
+    assert required.issubset(rm._software_versions())
+
+    smi = {"available": False, "reason": "not_found"}
+    clean_git = {"available": True, "commit": "a" * 40, "dirty": False}
+    dirty_git = {"available": True, "commit": "a" * 40, "dirty": True}
+    with patch.object(rm, "_run_nvidia_smi", return_value=smi), patch.object(
+        rm, "_git_metadata", return_value=clean_git
+    ):
+        clean = rm.collect_runtime_environment(torch_module=_CPUOnlyTorch)
+    with patch.object(rm, "_run_nvidia_smi", return_value=smi), patch.object(
+        rm, "_git_metadata", return_value=dirty_git
+    ):
+        dirty = rm.collect_runtime_environment(torch_module=_CPUOnlyTorch)
+    assert clean["fingerprint_sha256"] != dirty["fingerprint_sha256"]
+
+
 def test_environment_records_actual_gpu_name_vram_and_compute_capability():
     class Properties:
         name = "NVIDIA Test GPU"
@@ -565,6 +587,33 @@ def test_model_wrapper_forbids_length_override_and_counts_first_eos():
             generation_kwargs={"max_length": 999},
         )
     )
+
+
+def test_model_wrapper_counts_earliest_of_multiple_eos_tokens():
+    class Model:
+        def eval(self):
+            return self
+
+        def generate(self, input_ids, attention_mask, max_new_tokens, **kwargs):
+            assert kwargs["eos_token_id"] == [9, 10]
+            generated = torch.tensor([[8, 10, 0], [9, 7, 7]], dtype=input_ids.dtype)
+            return torch.cat([input_ids, generated], dim=1)
+
+    batch = {
+        "input_ids": torch.tensor([[4, 5], [0, 6]]),
+        "attention_mask": torch.tensor([[1, 1], [0, 1]]),
+    }
+    _, profile = rm.profile_model_generation(
+        Model(),
+        [batch],
+        config=rm.ResourceProfileConfig(max_new_tokens=3, nvml_enabled=False),
+        device=torch.device("cpu"),
+        eos_token_id=[9, 10],
+        pad_token_id=0,
+        retain_outputs=False,
+    )
+
+    assert profile.records[0].output_tokens == 3
 
 
 def test_model_wrapper_propagates_cooperative_wall_clock_timeout_and_stops_batches():

@@ -11,12 +11,68 @@ from tcaa.fl_runner import (
     _logical_resource_bundle,
     _logical_rows,
     _normalise_hardware_profile,
+    _paired_hardware_ratio_summaries,
     _profile_final_resources,
     _resource_summary_rows,
     _write_csv,
+    run_fl_seeds,
     _validate_fl_config,
     default_fl_config,
 )
+
+
+def test_multiseed_provenance_arrays_stay_aligned_after_a_failed_seed(
+    monkeypatch, tmp_path
+):
+    import tcaa.fl_runner as fl_runner
+
+    def fake_run(config):
+        seed = config["seed"]
+        if seed == 22:
+            raise RuntimeError("synthetic failure")
+        return {
+            "run_id": f"run-{seed}",
+            "artifacts_dir": f"/artifacts/{seed}",
+            "requested_config_sha256": f"requested-{seed}",
+            "resolved_config_sha256": f"resolved-{seed}",
+            "shard_profile": {"sizes": [4, 4], "empty_shards": 0},
+            "durability": [{}],
+            "stealth_trace": [],
+        }
+
+    monkeypatch.setattr(fl_runner, "run_fl", fake_run)
+    summary = run_fl_seeds(
+        {"results_root": str(tmp_path), "results_subdir": "reasoning-multiseed"},
+        [11, 22, 33],
+    )
+
+    assert summary["seeds_completed"] == [11, 33]
+    assert summary["run_ids"] == ["run-11", "run-33"]
+    assert summary["artifacts_dirs"] == ["/artifacts/11", "/artifacts/33"]
+    assert summary["requested_config_sha256s"] == [
+        "requested-11",
+        "requested-33",
+    ]
+    assert summary["resolved_config_sha256s"] == ["resolved-11", "resolved-33"]
+    assert summary["completed_runs"] == [
+        {
+            "seed": 11,
+            "run_id": "run-11",
+            "artifacts_dir": "/artifacts/11",
+            "requested_config_sha256": "requested-11",
+            "resolved_config_sha256": "resolved-11",
+        },
+        {
+            "seed": 33,
+            "run_id": "run-33",
+            "artifacts_dir": "/artifacts/33",
+            "requested_config_sha256": "requested-33",
+            "resolved_config_sha256": "resolved-33",
+        },
+    ]
+    assert summary["failures"] == [
+        {"seed": 22, "error": "RuntimeError: synthetic failure"}
+    ]
 
 
 def _stats(output_lens, *, cap=8, hit_cap=None, timed=None):
@@ -177,6 +233,13 @@ def test_objective_summary_keeps_consumption_stealth_and_defenses_separate():
             "comparisons": {"total_output_tokens": {"attacked_vs_pristine": 6.0}},
             "states": {"attacked_final": {"logical": {"total_output_tokens": 120}}},
             "validity": {"hardware": "valid"},
+            "environment": {
+                "start": {"fingerprint_sha256": "same", "torch": {
+                    "kernel_preflight": {"success": True},
+                }},
+                "end": {"fingerprint_sha256": "same"},
+                "environment_changed": False,
+            },
         },
         "defense_evaluation": {"telemetry_defenses": {"defenses": {
             "krum": {"caught_rate": 0.25, "survival_rate": 0.75},
@@ -189,6 +252,124 @@ def test_objective_summary_keeps_consumption_stealth_and_defenses_separate():
     assert summary["parameter_stealth"]["joint_pass_rate"] == 0.5
     assert summary["defense_evasion"]["krum"]["caught_rate"] == 0.25
     assert "composite" in summary["note"]
+
+
+def test_reasoning_objective_v2_carries_independent_gates_and_paired_ci():
+    paired = {
+        "n_pairs": 8, "median_ratio": 2.1,
+        "ci95_lower": 1.7, "ci95_upper": 2.5,
+    }
+    summary = _build_objective_summary({
+        "config": {"attack_objective": "reasoning_cost"},
+        "durability": [{
+            "paired_reasoning_cost_tau": paired,
+            "paired_reasoning_cost_clean": dict(paired, median_ratio=1.01),
+            "answer_accuracy_tau_atk": 0.9,
+            "answer_accuracy_tau_ref": 0.91,
+            "reasoning_closure_tau": 0.98,
+            "reasoning_gates": {"cost_ci_lower_gt_1": True},
+            "reasoning_claim_ready": False,
+        }],
+    })
+    assert summary["schema_version"] == "objective-v2"
+    reasoning = summary["reasoning_attack_final"]
+    assert reasoning["paired_cost_ratio"]["ci95_lower"] == 1.7
+    assert reasoning["gates"]["cost_ci_lower_gt_1"] is True
+    assert reasoning["claim_ready"] is False
+    assert reasoning["hardware_evidence_ready"] is False
+    assert reasoning["full_resource_claim_ready"] is False
+
+
+def test_full_reasoning_resource_claim_needs_measured_wall_and_cuda_gain():
+    paired = {
+        "n_pairs": 8, "median_ratio": 1.4,
+        "ci95_lower": 1.2, "ci95_upper": 1.6,
+    }
+    base = {
+        "config": {
+            "attack_objective": "reasoning_cost",
+            "reasoning_min_hardware_ratio": 1.05,
+        },
+        "durability": [{
+            "paired_reasoning_cost_tau": paired,
+            "paired_reasoning_cost_clean": dict(paired, median_ratio=1.0),
+            "reasoning_gates": {"measurement_valid": True},
+            "reasoning_claim_ready": True,
+        }],
+        "resources": {
+            "states": {"benign_final": {}, "attacked_final": {}},
+            "validity": {"hardware": "valid"},
+            "environment": {
+                "start": {
+                    "fingerprint_sha256": "stable-environment",
+                    "torch": {"kernel_preflight": {"success": True}},
+                },
+                "end": {"fingerprint_sha256": "stable-environment"},
+                "environment_changed": False,
+            },
+            "comparisons": {
+                "generation_wall_seconds": {"attacked_vs_benign": 1.2},
+                "cuda_elapsed_seconds": {"attacked_vs_benign": 1.0},
+            },
+            "hardware_paired_ratios": {
+                "generation_wall_seconds": {
+                    "attacked_vs_benign": {"ci95_lower": 1.2},
+                },
+                "cuda_elapsed_seconds": {
+                    "attacked_vs_benign": {"ci95_lower": 1.0},
+                },
+            },
+        },
+    }
+    summary = _build_objective_summary(base)
+    reasoning = summary["reasoning_attack_final"]
+    assert reasoning["hardware_evidence_ready"] is True
+    assert reasoning["hardware_amplification"]["observed"] is False
+    assert reasoning["full_resource_claim_ready"] is False
+
+    base["resources"]["hardware_paired_ratios"]["cuda_elapsed_seconds"][
+        "attacked_vs_benign"
+    ]["ci95_lower"] = 1.1
+    reasoning = _build_objective_summary(base)["reasoning_attack_final"]
+    assert reasoning["hardware_amplification"]["observed"] is True
+    assert reasoning["full_resource_claim_ready"] is True
+
+    base["resources"]["environment"]["environment_changed"] = True
+    reasoning = _build_objective_summary(base)["reasoning_attack_final"]
+    assert reasoning["environment_evidence_ready"] is False
+    assert reasoning["hardware_evidence_ready"] is False
+    assert reasoning["full_resource_claim_ready"] is False
+
+    base["resources"]["environment"] = {
+        "start": {"torch": {"kernel_preflight": {"success": True}}},
+        "end": {}, "environment_changed": None,
+    }
+    reasoning = _build_objective_summary(base)["reasoning_attack_final"]
+    assert reasoning["environment_evidence_ready"] is False
+    assert reasoning["full_resource_claim_ready"] is False
+
+
+def test_hardware_ratios_are_paired_by_repeat_seed_and_prompt_set():
+    runs = []
+    for repeat, seed in enumerate((11, 23, 47)):
+        for condition, wall, cuda in (
+            ("benign_final", 2.0, 1.8),
+            ("attacked_final", 3.0, 2.7),
+        ):
+            runs.append({
+                "condition": condition, "split": "tau", "batch_size": 1,
+                "repeat": repeat, "decode_seed": seed,
+                "prompt_subset_sha256": "same", "valid": True,
+                "cuda_timing_valid": True, "memory_metrics_valid": True,
+                "generation_wall_seconds": wall, "cuda_elapsed_seconds": cuda,
+            })
+    paired = _paired_hardware_ratio_summaries(runs, split="tau", batch_size=1)
+    wall = paired["generation_wall_seconds"]["attacked_vs_benign"]
+    cuda = paired["cuda_elapsed_seconds"]["attacked_vs_benign"]
+    assert wall["n_pairs"] == 3
+    assert wall["ci95_lower"] == pytest.approx(1.5)
+    assert cuda["ci95_lower"] == pytest.approx(1.5)
+    assert wall["pairing_unit"] == "repeat_same_decode_seed_and_prompt_set"
 
 
 def test_resource_summary_csv_keeps_full_logical_and_profile_tokens_distinct(tmp_path):

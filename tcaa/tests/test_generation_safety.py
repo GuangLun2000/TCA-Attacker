@@ -9,7 +9,7 @@ from tcaa.generation_safety import (
     build_stopping_criteria,
     validate_generation_limits,
 )
-from tcaa.phase0_runner import _validate_experiment_config, default_config
+from tcaa.training_core import _validate_experiment_config, default_config
 
 
 @pytest.mark.parametrize("value", [None, 0, -1, True, 2.5])

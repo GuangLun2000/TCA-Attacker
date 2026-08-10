@@ -3,7 +3,7 @@
 import json
 from pathlib import Path
 
-from tcaa.phase0_runner import DEFAULT_DIRICHLET_ALPHA
+from tcaa.training_core import DEFAULT_DIRICHLET_ALPHA
 
 
 def _notebook_code_cell_containing(needle: str) -> str:

@@ -300,10 +300,14 @@ class NVMLMonitor:
                 self._energy_counter_reason = self._exc_reason(
                     "energy_counter_unavailable", exc
                 )
-        # Timestamp after the counter read: the remaining mismatch is one lightweight
-        # counter query, rather than initialization/thread startup. The sampler was
-        # already started by initialize(), so no blocking power query is charged here.
+        # Timestamp after the counter read excludes initialization/thread startup.
+        # The two explicit boundary power queries are a small, symmetric part of
+        # the instrumented interval and make short-run integration deterministic.
         self._start_time = time.perf_counter()
+        # Take an explicit in-interval boundary sample. Relying only on thread
+        # scheduling makes very short batches nondeterministically produce zero or
+        # one usable samples even when NVML is healthy.
+        self._sample_power_once()
         return self
 
     def start(self) -> "NVMLMonitor":
@@ -349,6 +353,10 @@ class NVMLMonitor:
                 device_mapping_reason=self._device_mapping_reason,
             )
 
+        # Symmetric closing boundary sample before ending the interval. Together
+        # with begin_measurement's sample this guarantees that an available power
+        # sensor yields an integrable interval even for sub-scheduler-quantum runs.
+        self._sample_power_once()
         self._stop_event.set()
 
         end_energy_mj: Optional[float] = None
@@ -1094,7 +1102,7 @@ def profile_model_generation(
     *,
     config: ResourceProfileConfig,
     device: Any,
-    eos_token_id: Optional[int] = None,
+    eos_token_id: Optional[Any] = None,
     pad_token_id: Optional[int] = None,
     generation_kwargs: Optional[Mapping[str, Any]] = None,
     retain_outputs: bool = True,
@@ -1125,8 +1133,18 @@ def profile_model_generation(
             or min_new_tokens > config.max_new_tokens
         ):
             raise ValueError("min_new_tokens must be between 0 and max_new_tokens")
+    terminal_ids: List[int] = []
     if eos_token_id is not None:
-        kwargs["eos_token_id"] = int(eos_token_id)
+        raw_terminal_ids = (
+            list(eos_token_id) if isinstance(eos_token_id, (list, tuple, set))
+            else [eos_token_id]
+        )
+        terminal_ids = list(dict.fromkeys(int(value) for value in raw_terminal_ids))
+        if not terminal_ids:
+            raise ValueError("eos_token_id must be a non-empty int or sequence of ints")
+        kwargs["eos_token_id"] = (
+            terminal_ids[0] if len(terminal_ids) == 1 else terminal_ids
+        )
     if pad_token_id is not None:
         kwargs["pad_token_id"] = int(pad_token_id)
 
@@ -1171,8 +1189,11 @@ def profile_model_generation(
         output_tokens = 0
         for row in new_tokens:
             length = int(row.shape[0])
-            if eos_token_id is not None:
-                eos_positions = (row == int(eos_token_id)).nonzero(as_tuple=True)[0]
+            if terminal_ids:
+                is_terminal = torch.zeros_like(row, dtype=torch.bool)
+                for terminal_id in terminal_ids:
+                    is_terminal |= row == terminal_id
+                eos_positions = is_terminal.nonzero(as_tuple=True)[0]
                 if eos_positions.numel() > 0:
                     length = int(eos_positions[0].item()) + 1
             output_tokens += length
@@ -1321,7 +1342,14 @@ def _cuda_kernel_preflight(torch_module: Any, device_index: int) -> Dict[str, An
 
 def _software_versions() -> Dict[str, Optional[str]]:
     versions: Dict[str, Optional[str]] = {}
-    for distribution in ("transformers", "peft", "numpy", "datasets", "nvidia-ml-py"):
+    # These are the direct userspace dependencies pinned by the isolated reasoning
+    # notebook.  Keeping all of them in the fingerprint means an in-session package
+    # mutation cannot hide behind an unchanged torch/GPU signature.
+    for distribution in (
+        "transformers", "peft", "datasets", "accelerate", "tokenizers",
+        "huggingface-hub", "safetensors", "numpy", "matplotlib",
+        "nvidia-ml-py", "pytest", "packaging", "tqdm",
+    ):
         try:
             versions[distribution] = importlib.metadata.version(distribution)
         except importlib.metadata.PackageNotFoundError:
@@ -1497,7 +1525,12 @@ def collect_runtime_environment(
         "cpu_model": environment["cpu"]["model"],
         "torch": torch_signature,
         "software": environment["software"],
-        "git_commit": environment["git"].get("commit"),
+        "git": {
+            "available": environment["git"].get("available"),
+            "commit": environment["git"].get("commit"),
+            "dirty": environment["git"].get("dirty"),
+            "reason": environment["git"].get("reason"),
+        },
         "gpus": environment["gpus"],
         "nvidia_smi_gpus": environment["nvidia_smi"].get("gpus"),
     }

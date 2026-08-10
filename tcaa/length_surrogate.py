@@ -19,12 +19,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Sequence
 
 import torch
 import torch.nn.functional as F
 
 from .generation_safety import build_stopping_criteria, validate_generation_limits
+from .reasoning import expected_survival_cost, target_ratio_band_loss
 
 _EPS = 1e-6
 
@@ -88,6 +89,19 @@ def clean_kd_kl(ref_logits: torch.Tensor, cur_logits: torch.Tensor,
     return kl_sum / denom
 
 
+def stop_logprob_and_mask(logits: torch.Tensor, labels: torch.Tensor, stop_id: int):
+    """Extract log-probability of an arbitrary single-token stop marker."""
+    shift_logits, shift_labels = _shift_for_causal_lm(logits, labels)
+    if isinstance(stop_id, bool) or not isinstance(stop_id, int):
+        raise ValueError("stop_id must be an integer token id")
+    if stop_id < 0 or stop_id >= shift_logits.size(-1):
+        raise ValueError("stop_id is outside the logits vocabulary")
+    logprobs = F.log_softmax(shift_logits, dim=-1)
+    stop_logprob = logprobs[..., stop_id]
+    target_mask = (shift_labels != -100).to(stop_logprob.dtype)
+    return stop_logprob, target_mask
+
+
 def eos_logprob_and_mask(logits: torch.Tensor, labels: torch.Tensor, eos_id: int):
     """
     Extract log p(EOS) at every *target* position (in order), plus a validity mask.
@@ -99,11 +113,7 @@ def eos_logprob_and_mask(logits: torch.Tensor, labels: torch.Tensor, eos_id: int
                      contiguous suffix, the 1.0 entries are the ordered generation
                      steps s = 1, 2, ..., S for the survival product.
     """
-    shift_logits, shift_labels = _shift_for_causal_lm(logits, labels)
-    logprobs = F.log_softmax(shift_logits, dim=-1)      # [B, T-1, V]
-    eos_logprob = logprobs[..., eos_id]                 # [B, T-1]
-    target_mask = (shift_labels != -100).to(eos_logprob.dtype)
-    return eos_logprob, target_mask
+    return stop_logprob_and_mask(logits, labels, eos_id)
 
 
 def expected_length(eos_logprob: torch.Tensor, target_mask: torch.Tensor) -> torch.Tensor:
@@ -187,10 +197,41 @@ class MalLossParts:
     rep_term: Optional[torch.Tensor] = None           # anti-repetition penalty (tau)
 
 
+@dataclass
+class ReasoningRolloutParts:
+    """Differentiable signals extracted from one sampled reasoning rollout."""
+    expected_cost: torch.Tensor       # [B] reasoning-phase cost through </think>
+    expected_tokens: torch.Tensor     # [B] survival length through </think>
+    mean_stop_prob: torch.Tensor
+    repetition_penalty: torch.Tensor
+    closure_rate: torch.Tensor        # no-grad diagnostic from the realized rollout
+    continuation_ids: Optional[torch.Tensor] = None  # no-grad sampled continuation
+    span_lengths: Optional[torch.Tensor] = None      # tokens strictly before first end/EOS
+
+
+@dataclass
+class ReasoningLossParts:
+    """Breakdown of the bounded Reasoning-TCAA local objective."""
+    total: torch.Tensor
+    ce_clean: torch.Tensor
+    ce_answer: torch.Tensor
+    target_cost_loss: torch.Tensor
+    expected_cost: torch.Tensor
+    expected_tokens: torch.Tensor
+    clean_cost_anchor: torch.Tensor
+    kd_clean: torch.Tensor
+    rep_term: torch.Tensor
+    mean_stop_prob: torch.Tensor
+    closure_rate: torch.Tensor
+
+
 @torch.no_grad()
 def _greedy_rollout(inner, input_ids, attention_mask, eos_id, pad_id, horizon,
                     force_open=True, no_repeat_ngram_size=0,
-                    max_batch_seconds: Optional[float] = None):
+                    max_batch_seconds: Optional[float] = None,
+                    do_sample: bool = False, temperature: float = 1.0,
+                    top_p: float = 1.0, top_k: int = 0,
+                    generation_eos_ids: Optional[Sequence[int]] = None):
     """Roll out the model's greedy continuation for up to ``horizon`` new tokens.
 
     ``force_open=True`` forbids EOS until ``horizon`` (via min_new_tokens), giving a
@@ -207,14 +248,25 @@ def _greedy_rollout(inner, input_ids, attention_mask, eos_id, pad_id, horizon,
     kwargs = {}
     if no_repeat_ngram_size and int(no_repeat_ngram_size) > 0:
         kwargs["no_repeat_ngram_size"] = int(no_repeat_ngram_size)
+    if do_sample:
+        kwargs.update({
+            "temperature": float(temperature),
+            "top_p": float(top_p),
+            "top_k": int(top_k),
+        })
     stopping, wall_guard = build_stopping_criteria(max_batch_seconds)
     if stopping is not None:
         kwargs["stopping_criteria"] = stopping
+    terminal_ids = list(dict.fromkeys(
+        int(value) for value in (generation_eos_ids or [eos_id])
+    ))
     generated = inner.generate(
         input_ids=input_ids, attention_mask=attention_mask,
         min_new_tokens=(horizon if force_open else 0), max_new_tokens=horizon,
-        do_sample=False, num_beams=1,
-        pad_token_id=pad_id, eos_token_id=eos_id, **kwargs,
+        do_sample=bool(do_sample), num_beams=1,
+        pad_token_id=pad_id,
+        eos_token_id=(terminal_ids[0] if len(terminal_ids) == 1 else terminal_ids),
+        **kwargs,
     )
     if wall_guard is not None and wall_guard.triggered:
         # A shortened rollout changes the optimization objective. Fail explicitly
@@ -223,6 +275,202 @@ def _greedy_rollout(inner, input_ids, attention_mask, eos_id, pad_id, horizon,
             f"on-policy rollout exceeded max_batch_seconds={max_batch_seconds}"
         )
     return generated
+
+
+def onpolicy_expected_reasoning_cost(
+    model,
+    prompt_batch,
+    *,
+    reasoning_end_id: int,
+    eos_id: int,
+    pad_id: int,
+    horizon: int,
+    device,
+    c_f: float,
+    c_a: float,
+    free_decode: bool = False,
+    do_sample: bool = True,
+    temperature: float = 0.6,
+    top_p: float = 0.95,
+    top_k: int = 20,
+    no_repeat_ngram_size: int = 0,
+    rep_window: int = 8,
+    max_batch_seconds: Optional[float] = None,
+    generation_eos_ids: Optional[Sequence[int]] = None,
+) -> ReasoningRolloutParts:
+    """Sample a trajectory and estimate cost through its first ``</think>`` marker.
+
+    The rollout is no-grad; a second forward over the realized sequence supplies the
+    differentiable stop-marker hazard. Positions strictly after the first marker are
+    masked. With ``free_decode=False`` EOS is held open to provide a finite training
+    window, while the reasoning marker itself remains free to close at any step.
+    """
+    inner = model.inner() if hasattr(model, "inner") else model
+    input_ids = prompt_batch["input_ids"].to(device)
+    attn = prompt_batch["attention_mask"].to(device)
+    prompt_width = input_ids.shape[1]
+
+    was_training = inner.training
+    inner.eval()
+    try:
+        gen = _greedy_rollout(
+            inner,
+            input_ids,
+            attn,
+            eos_id,
+            pad_id,
+            horizon,
+            force_open=not free_decode,
+            no_repeat_ngram_size=no_repeat_ngram_size,
+            max_batch_seconds=max_batch_seconds,
+            do_sample=do_sample,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            generation_eos_ids=generation_eos_ids,
+        )
+    finally:
+        inner.train(was_training)
+
+    continuation = gen[:, prompt_width:]
+    cont_attn = torch.ones_like(continuation, dtype=attn.dtype)
+    full_attn = torch.cat([attn, cont_attn], dim=1)
+    labels = gen.clone()
+    labels[:, :prompt_width] = -100
+
+    is_stop = continuation == int(reasoning_end_id)
+    terminal_ids = list(dict.fromkeys(
+        int(value) for value in (generation_eos_ids or [eos_id])
+    ))
+    is_eos = torch.zeros_like(continuation, dtype=torch.bool)
+    for terminal_id in terminal_ids:
+        is_eos |= continuation == terminal_id
+    # Free decode may terminate with EOS before </think>. Stop scoring at whichever
+    # boundary occurs first; rectangular batch padding after EOS must never become
+    # synthetic reasoning evidence.
+    is_terminal = is_stop | is_eos
+    terminal_seen = is_terminal.cumsum(dim=1)
+    strictly_after_stop = terminal_seen - is_terminal.to(terminal_seen.dtype)
+    labels[:, prompt_width:] = torch.where(
+        strictly_after_stop.bool(), torch.full_like(continuation, -100), continuation
+    )
+    closure_rate = is_stop.any(dim=1).to(torch.float32).mean().detach()
+    has_terminal = is_terminal.any(dim=1)
+    first_terminal = is_terminal.to(torch.int64).argmax(dim=1)
+    span_lengths = torch.where(
+        has_terminal,
+        first_terminal,
+        torch.full_like(first_terminal, continuation.shape[1]),
+    ).detach()
+
+    logits = model.forward(gen, full_attn)
+    stop_lp, mask = stop_logprob_and_mask(logits, labels, int(reasoning_end_id))
+    prompt_lens = attn.sum(dim=1).to(logits.dtype)
+    per_cost = expected_survival_cost(
+        stop_lp, mask, prompt_lens, c_f=float(c_f), c_a=float(c_a)
+    )
+    per_tokens = expected_length(stop_lp, mask)
+    denom = mask.sum().clamp(min=1.0)
+    mean_stop = (stop_lp.exp() * mask).sum() / denom
+    valid = (labels != -100).to(logits.dtype)
+    rep = repetition_penalty_prob(logits, gen, valid, rep_window)
+    return ReasoningRolloutParts(
+        expected_cost=per_cost,
+        expected_tokens=per_tokens,
+        mean_stop_prob=mean_stop,
+        repetition_penalty=rep,
+        closure_rate=closure_rate,
+        continuation_ids=continuation.detach(),
+        span_lengths=span_lengths,
+    )
+
+
+def reasoning_tcaa_loss(
+    *,
+    clean_logits: Optional[torch.Tensor],
+    clean_labels: Optional[torch.Tensor],
+    answer_logits: torch.Tensor,
+    answer_labels: torch.Tensor,
+    rollout: ReasoningRolloutParts,
+    reference_cost: torch.Tensor,
+    target_ratio: float,
+    reasoning_cost_weight: float,
+    target_tolerance: float = 0.25,
+    overshoot_weight: float = 1.0,
+    answer_ce_weight: float = 1.0,
+    clean_expected_cost: Optional[torch.Tensor] = None,
+    clean_reference_cost: Optional[torch.Tensor] = None,
+    clean_cost_anchor_weight: float = 0.0,
+    clean_ref_logits: Optional[torch.Tensor] = None,
+    kd_clean_weight: float = 0.0,
+    repetition_weight: float = 0.0,
+) -> ReasoningLossParts:
+    """Bounded multi-objective loss for trigger-conditioned overthinking.
+
+    Unlike ``tcaa_malicious_loss``, the cost term is a normalized target shortfall and
+    becomes exactly zero after the requested multiple is reached. This removes the
+    optimization incentive to run to the hard generation cap.
+    """
+    device = answer_logits.device
+    ce_clean = (
+        lm_cross_entropy(clean_logits, clean_labels)
+        if clean_logits is not None and clean_labels is not None
+        else torch.zeros((), device=device)
+    )
+    ce_answer = lm_cross_entropy(answer_logits, answer_labels)
+    target = target_ratio_band_loss(
+        rollout.expected_cost,
+        reference_cost,
+        target_ratio=float(target_ratio),
+        target_tolerance=float(target_tolerance),
+        overshoot_weight=float(overshoot_weight),
+    ).mean()
+    target_term = float(reasoning_cost_weight) * target
+
+    clean_anchor = torch.zeros((), device=device)
+    if (
+        clean_cost_anchor_weight > 0.0
+        and clean_expected_cost is not None
+        and clean_reference_cost is not None
+    ):
+        ref = clean_reference_cost.to(device=device, dtype=clean_expected_cost.dtype)
+        relative_error = torch.abs(
+            clean_expected_cost / ref.clamp(min=_EPS) - 1.0
+        )
+        clean_anchor = float(clean_cost_anchor_weight) * relative_error.mean()
+
+    kd = torch.zeros((), device=device)
+    if (
+        kd_clean_weight > 0.0
+        and clean_ref_logits is not None
+        and clean_logits is not None
+        and clean_labels is not None
+    ):
+        kd = float(kd_clean_weight) * clean_kd_kl(
+            clean_ref_logits, clean_logits, clean_labels
+        )
+    rep = float(repetition_weight) * rollout.repetition_penalty
+    total = (
+        ce_clean
+        + float(answer_ce_weight) * ce_answer
+        + target_term
+        + clean_anchor
+        + kd
+        + rep
+    )
+    return ReasoningLossParts(
+        total=total,
+        ce_clean=ce_clean,
+        ce_answer=ce_answer,
+        target_cost_loss=target_term,
+        expected_cost=rollout.expected_cost.mean(),
+        expected_tokens=rollout.expected_tokens.mean(),
+        clean_cost_anchor=clean_anchor,
+        kd_clean=kd,
+        rep_term=rep,
+        mean_stop_prob=rollout.mean_stop_prob,
+        closure_rate=rollout.closure_rate,
+    )
 
 
 def onpolicy_expected_length(

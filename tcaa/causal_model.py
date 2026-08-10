@@ -70,6 +70,9 @@ class TCAACausalModel(nn.Module):
         lora_dropout: float = 0.1,
         lora_target_modules: Optional[List[str]] = None,
         tiny_config: Optional[dict] = None,
+        torch_dtype=None,
+        attn_implementation: Optional[str] = None,
+        model_revision: Optional[str] = None,
     ):
         super().__init__()
         self.model_name = model_name
@@ -82,13 +85,27 @@ class TCAACausalModel(nn.Module):
             self.model_name = "gpt2"  # LoRA targets resolve to c_attn/c_proj
         else:
             from transformers import AutoModelForCausalLM
-            base = AutoModelForCausalLM.from_pretrained(model_name)
+            load_kwargs = {}
+            if torch_dtype is not None:
+                resolved_dtype = torch_dtype
+                if isinstance(torch_dtype, str) and torch_dtype != "auto":
+                    resolved_dtype = getattr(torch, torch_dtype.replace("torch.", ""), None)
+                    if resolved_dtype is None:
+                        raise ValueError(f"unknown torch_dtype {torch_dtype!r}")
+                load_kwargs["torch_dtype"] = resolved_dtype
+            if attn_implementation:
+                load_kwargs["attn_implementation"] = str(attn_implementation)
+            if model_revision:
+                load_kwargs["revision"] = str(model_revision)
+            base = AutoModelForCausalLM.from_pretrained(model_name, **load_kwargs)
+
+        self.resolved_model_revision = getattr(base.config, "_commit_hash", None)
 
         # Decoder-only: ensure a pad id exists (reuse EOS if needed).
         if getattr(base.config, "pad_token_id", None) is None:
             eos_id = getattr(base.config, "eos_token_id", None)
             if eos_id is not None:
-                base.config.pad_token_id = eos_id
+                base.config.pad_token_id = eos_id[0] if isinstance(eos_id, (list, tuple)) else eos_id
 
         if use_lora:
             if not _PEFT_AVAILABLE:

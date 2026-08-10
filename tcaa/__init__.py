@@ -10,9 +10,8 @@
 # degradation) in the same threat model. AugMP is the external comparison baseline
 # (github.com/GuangLun2000/AugMP); this package imports no AugMP code and is standalone.
 #
-# Phase 0 (this deliverable): de-risk the central open question —
-#   "is parameter-space stealth jointly satisfiable with cost amplification?"
-# See tcaa/phase0_runner.py.
+# `fl_runner` exposes the two supported multi-round objectives.  Shared local
+# training and measurement primitives live in `training_core`.
 
 import os as _os
 

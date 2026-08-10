@@ -7,15 +7,182 @@ import matplotlib.pyplot as plt
 
 from tcaa.visualize import (
     RASTER_DPI,
+    _key_summary_lines,
     _use_log_scale_if_needed,
     apply_style,
     fig_fl_durability,
     full_report,
+    make_fl_figures,
     make_resource_figures,
+    reasoning_effect_summary,
+    reasoning_feedback_report,
+    reasoning_gate_rows,
     resource_digest,
     save_figure,
     save_resource_figures,
 )
+
+
+def _reasoning_feedback_result():
+    gates = {
+        "measurement_valid": True,
+        "cost_ci_lower_gt_1": True,
+        "cost_ci_lower_meets_effect_size": True,
+        "tau_reference_accuracy_valid": True,
+        "clean_reference_accuracy_valid": True,
+        "tau_accuracy_preserved": True,
+        "clean_accuracy_preserved": True,
+        "clean_cost_stable": True,
+        "closure_valid": True,
+        "clean_closure_valid": True,
+        "cap_hit_valid": True,
+        "clean_cap_hit_valid": True,
+        "repetition_valid": True,
+        "distinct_valid": True,
+    }
+    return {
+        "run_id": "run-1",
+        "config": {
+            "attack_objective": "reasoning_cost",
+            "num_rounds": 1,
+            "profile_hardware": False,
+            "reasoning_min_claim_cost_ratio": 1.05,
+            "reasoning_min_reference_accuracy": 0.5,
+            "reasoning_max_accuracy_drop": 0.05,
+            "reasoning_clean_cost_tolerance": 0.1,
+            "reasoning_min_closure_rate": 0.95,
+            "reasoning_max_cap_hit_rate": 0.05,
+            "reasoning_max_repetition": 0.2,
+            "reasoning_min_distinct_ratio": 0.65,
+        },
+        "durability": [{
+            "round": 0,
+            "paired_reasoning_cost_tau": {
+                "median_ratio": 1.30, "ci95_lower": 1.12,
+                "ci95_upper": 1.48, "n_pairs": 8, "n_decode_samples": 24,
+            },
+            "paired_reasoning_cost_clean": {"median_ratio": 1.02},
+            "reasoning_tokens_tau_ref": 80.0,
+            "reasoning_tokens_tau_atk": 108.0,
+            "answer_accuracy_tau_ref": 0.75,
+            "answer_accuracy_tau_atk": 0.75,
+            "answer_accuracy_drop_tau": 0.0,
+            "answer_accuracy_clean_ref": 0.75,
+            "answer_accuracy_clean_atk": 0.75,
+            "answer_accuracy_drop_clean": 0.0,
+            "reasoning_closure_tau": 1.0,
+            "reasoning_closure_clean": 1.0,
+            "cap_hit_rate_tau": 0.0,
+            "resource_clean_attacked": {"cap_hit_rate": 0.0},
+            "reasoning_repetition_tau": 0.05,
+            "reasoning_distinct_tau": 0.90,
+            "reasoning_measurement_valid": True,
+            "reasoning_gates": gates,
+            "reasoning_claim_ready": True,
+        }],
+        "stealth_trace": [{
+            "round": 0, "n_attackers": 1, "jointly_satisfied": True,
+            "attacker_distance": 0.5, "d_T": 0.7,
+        }],
+        "objective_summary": {"reasoning_attack_final": {
+            "hardware_resource_effect_claim_ready": False,
+            "hardware_amplification": None,
+        }},
+        "resources": {"validity": {"hardware": "disabled"}},
+    }
+
+
+def test_reasoning_feedback_is_pilot_scoped_and_csv_ready(capsys):
+    result = _reasoning_feedback_result()
+
+    rows = reasoning_gate_rows(result)
+    summary = reasoning_effect_summary(result, run_tier="pilot")
+    report = reasoning_feedback_report(result, run_tier="pilot")
+
+    assert len(rows) == 14
+    assert all(row["passed"] for row in rows)
+    assert summary["outcome"] == "positive_logical_signal"
+    assert summary["logical_resource_effect_ready"] is True
+    assert summary["formal_claim_ready"] is False
+    assert summary["evidence_scope"] == "exploratory_single_seed_pilot"
+    assert "Enable paired hardware profiling" in " ".join(
+        summary["recommended_next_actions"]
+    )
+    assert "median=1.300x" in report
+    assert "formal claim ready: False" in report
+    assert "[PASS] cost_ci_lower_meets_effect_size" in report
+    assert report in capsys.readouterr().out
+
+
+def test_reasoning_figures_replace_length_objective_figures():
+    figures = make_fl_figures(_reasoning_feedback_result())
+    try:
+        keys = [key for key, _ in figures]
+        assert keys[:2] == ["reasoning_cost_effect", "reasoning_gate_status"]
+        assert "fl_durability" not in keys
+        assert "fl_utility" not in keys
+    finally:
+        for _, fig in figures:
+            plt.close(fig)
+
+
+def test_reasoning_feedback_prints_paired_hardware_effect(capsys):
+    result = _reasoning_feedback_result()
+    result["config"]["profile_hardware"] = True
+    result["resources"]["validity"]["hardware"] = "valid"
+    result["objective_summary"]["reasoning_attack_final"].update({
+        "hardware_resource_effect_claim_ready": True,
+        "hardware_amplification": {
+            "generation_wall_seconds_paired": {
+                "median_ratio": 1.20, "ci95_lower": 1.10,
+                "ci95_upper": 1.30, "n_pairs": 3,
+            },
+            "cuda_elapsed_seconds_paired": {
+                "median_ratio": 1.18, "ci95_lower": 1.08,
+                "ci95_upper": 1.28, "n_pairs": 3,
+            },
+        },
+    })
+
+    report = reasoning_feedback_report(result, run_tier="pilot")
+
+    assert "paired hardware wall: median=1.2x" in report
+    assert "paired hardware CUDA: median=1.18x" in report
+    assert "effect_ready=True" in report
+    capsys.readouterr()
+
+
+def test_reasoning_key_summary_does_not_fall_back_to_length_claims():
+    lines = _key_summary_lines(fl={
+        "config": {
+            "attack_objective": "reasoning_cost", "backbone": "Qwen/Qwen3-1.7B",
+            "source": "gsm8k", "num_clients": 10, "num_rounds": 5,
+            "max_new_tokens": 512, "reasoning_min_claim_cost_ratio": 1.2,
+        },
+        "durability": [{
+            "paired_reasoning_cost_tau": {
+                "median_ratio": 1.8, "ci95_lower": 1.2,
+                "ci95_upper": 2.2, "n_pairs": 64,
+            },
+            "paired_reasoning_cost_clean": {"median_ratio": 1.01},
+            "reasoning_tokens_tau_ref": 80, "reasoning_tokens_tau_atk": 150,
+            "answer_accuracy_tau_ref": 0.9, "answer_accuracy_tau_atk": 0.89,
+            "answer_accuracy_drop_tau": 0.01, "answer_accuracy_drop_clean": 0.0,
+            "reasoning_closure_tau": 0.98, "truncation_tau": 0.0,
+            "reasoning_repetition_tau": 0.05, "reasoning_distinct_tau": 0.9,
+            "reasoning_measurement_valid": True,
+            "reasoning_gates": {"cost_ci_lower_gt_1": True},
+            "reasoning_claim_ready": True,
+        }],
+        "stealth_trace": [{"n_attackers": 2, "jointly_satisfied": True}],
+    })
+    report = "\n".join(lines)
+    assert "objective-v2" in report
+    assert "95% paired bootstrap CI [1.200, 2.200]" in report
+    assert "logical resource-effect gates passed" in report
+    assert "paired hardware not ready" in report
+    assert "parameter_stealth_ready=True" in report
+    assert "effective" not in report
 
 
 def _resource_results():

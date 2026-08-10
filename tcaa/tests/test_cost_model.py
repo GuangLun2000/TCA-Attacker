@@ -6,6 +6,7 @@ import torch
 from tcaa.cost_model import (
     CostStats,
     KVCacheGeometry,
+    combine_cost_stats,
     infer_kv_cache_geometry,
     measure_generation,
     theoretical_kv_cache_bytes,
@@ -128,6 +129,28 @@ def test_measure_generation_exact_tokens_eos_cap_batch_slots_and_kv():
     }]
 
 
+def test_measure_generation_stops_at_earliest_member_of_multi_eos_set():
+    model = _FixedGenerationModel(torch.tensor([
+        [7, 99, 2, 0],   # secondary EOS first
+        [8, 2, 99, 0],   # primary EOS first
+    ]))
+    stats = measure_generation(
+        model,
+        [_batch()],
+        eos_id=2,
+        generation_eos_ids=[2, 99],
+        pad_id=0,
+        max_new_tokens=4,
+        device=torch.device("cpu"),
+    )
+
+    assert stats.output_lens == [2, 2]
+    assert stats.eos_emitted_flags == [True, True]
+    assert stats.truncated_flags == [False, False]
+    assert stats.termination_reasons == ["eos", "eos"]
+    assert model.new_tokens.shape == (2, 4)
+
+
 def test_time_limit_is_separate_right_censoring_not_a_cap_hit():
     model = _FixedGenerationModel(torch.tensor([[7, 8], [9, 10]]))
     stats = measure_generation(
@@ -219,3 +242,75 @@ def test_legacy_positional_coststats_fields_keep_their_original_order():
     assert stats.max_new_tokens == 4
     assert stats.c_f == 1.0 and stats.c_a == 1.0
     assert stats.summary()["total_tokens"] == 5
+
+
+def test_reasoning_measurement_segments_cost_and_task_correctness():
+    model = _FixedGenerationModel(torch.tensor([[10, 7, 42, 2], [11, 12, 7, 41]]))
+    examples = [SimpleNamespace(uid="a"), SimpleNamespace(uid="b")]
+
+    def evaluator(out_ids, example):
+        return {
+            "answer_correct": 42 in out_ids,
+            "evaluated_uid": example.uid,
+        }
+
+    stats = measure_generation(
+        model,
+        [_batch()],
+        eos_id=2,
+        pad_id=0,
+        max_new_tokens=4,
+        device=torch.device("cpu"),
+        reasoning_end_ids=[7],
+        task_examples=examples,
+        task_evaluator=evaluator,
+    )
+    assert [r["reasoning_tokens"] for r in stats.task_records] == [1, 2]
+    assert [r["reasoning_decode_tokens"] for r in stats.task_records] == [2, 3]
+    assert [r["answer_tokens"] for r in stats.task_records] == [1, 1]
+    assert [r["reasoning_cost"] for r in stats.task_records] == [7.0, 15.0]
+    assert [r["task_uid"] for r in stats.task_records] == ["a", "b"]
+
+    summary = stats.summary()["reasoning"]
+    assert summary["mean_reasoning_cost"] == 11.0
+    assert summary["closure_rate"] == 1.0
+    assert summary["answer_accuracy"] == 0.5
+    assert summary["validity"]["measurement_valid"] is False  # row b hit the cap
+    rows = stats.per_prompt_records()
+    assert rows[0]["answer_correct"] is True
+    assert rows[1]["reasoning_closed"] is True
+
+
+def test_generation_kwargs_cannot_override_mandatory_safety_controls():
+    model = _FixedGenerationModel(torch.tensor([[2], [2]]))
+    with pytest.raises(ValueError, match="controlled keys"):
+        measure_generation(
+            model,
+            [_batch()],
+            eos_id=2,
+            pad_id=0,
+            max_new_tokens=4,
+            device=torch.device("cpu"),
+            generation_kwargs={"max_new_tokens": 999},
+        )
+
+
+def test_combine_cost_stats_preserves_seed_level_rows_and_sums_censoring():
+    one = CostStats(
+        n_prompts=1, prompt_lens=[3], output_lens=[2], costs=[9.0],
+        kv_proxies=[5.0], truncated_flags=[False], eos_emitted_flags=[True],
+        max_new_tokens=4, task_records=[{"task_uid": "a", "decode_seed": 11}],
+    )
+    two = CostStats(
+        n_prompts=1, prompt_lens=[3], output_lens=[4], costs=[22.0],
+        kv_proxies=[7.0], truncated_flags=[True], eos_emitted_flags=[False],
+        n_truncated=1, max_new_tokens=4,
+        task_records=[{"task_uid": "a", "decode_seed": 23}],
+    )
+    combined = combine_cost_stats([one, two])
+    assert combined.n_prompts == 2
+    assert combined.output_lens == [2, 4]
+    assert combined.cap_hit_count == 1
+    assert [row["decode_seed"] for row in combined.task_records] == [11, 23]
+    with pytest.raises(ValueError, match="different measurement configs"):
+        combine_cost_stats([one, CostStats(max_new_tokens=8)])

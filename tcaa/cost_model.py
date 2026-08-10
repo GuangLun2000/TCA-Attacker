@@ -14,8 +14,8 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from dataclasses import dataclass, field, fields
+from typing import Any, Callable, Dict, List, Optional, Sequence
 
 import torch
 
@@ -330,6 +330,9 @@ class CostStats:
     n_time_limited: int = 0              # non-EOS outputs stopped by the wall-clock guard
     generation_max_batch_seconds: Optional[float] = None
     kv_bytes_per_token: Optional[int] = None
+    # Reasoning/task records are appended last to preserve the public positional
+    # constructor tested by legacy callers. Empty means this was a length-only run.
+    task_records: List[Dict[str, Any]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         # Zero remains the legacy "unset" sentinel for manually constructed empty stats;
@@ -623,6 +626,49 @@ class CostStats:
     def has_rouge(self) -> bool:
         return len(self.rouge_recalls) > 0
 
+    @property
+    def has_reasoning(self) -> bool:
+        return self.n_prompts > 0 and len(self.task_records) == self.n_prompts
+
+    def _task_numeric(self, key: str) -> List[float]:
+        if not self.has_reasoning:
+            return []
+        return [float(record[key]) for record in self.task_records
+                if record.get(key) is not None]
+
+    @property
+    def mean_reasoning_cost(self) -> float:
+        values = self._task_numeric("reasoning_cost")
+        return float(sum(values) / max(len(values), 1))
+
+    @property
+    def median_reasoning_cost(self) -> float:
+        return _median(self._task_numeric("reasoning_cost"))
+
+    @property
+    def mean_reasoning_tokens(self) -> float:
+        values = self._task_numeric("reasoning_tokens")
+        return float(sum(values) / max(len(values), 1))
+
+    @property
+    def median_reasoning_tokens(self) -> float:
+        return _median(self._task_numeric("reasoning_tokens"))
+
+    @property
+    def reasoning_closure_rate(self) -> float:
+        if not self.has_reasoning:
+            return 0.0
+        return float(sum(bool(r.get("reasoning_closed")) for r in self.task_records)
+                     / self.n_prompts)
+
+    @property
+    def answer_accuracy(self) -> Optional[float]:
+        if not self.has_reasoning:
+            return None
+        values = [bool(r["answer_correct"]) for r in self.task_records
+                  if r.get("answer_correct") is not None]
+        return float(sum(values) / len(values)) if values else None
+
     def in_superlinear_regime(self) -> bool:
         """True if the mean output length is past the super-linear threshold."""
         return self.mean_output_len >= superlinear_threshold(self.mean_prompt_len, self.c_f, self.c_a)
@@ -700,6 +746,8 @@ class CostStats:
                 record["repetition_rate"] = float(self.repetitions[idx])
             if len(self.distinct_ratios) == len(self.output_lens):
                 record["distinct_ratio"] = float(self.distinct_ratios[idx])
+            if len(self.task_records) == len(self.output_lens):
+                record.update(dict(self.task_records[idx]))
             records.append(record)
         return records
 
@@ -834,7 +882,80 @@ class CostStats:
         if self.has_rouge:
             out["mean_rouge_recall"] = round(self.mean_rouge_recall, 4)
             out["mean_rouge_f1"] = round(self.mean_rouge_f1, 4)
+        if self.has_reasoning:
+            reasoning_repetitions = self._task_numeric("reasoning_repetition")
+            reasoning_distinct = self._task_numeric("reasoning_distinct_ratio")
+            answer_tokens = self._task_numeric("answer_tokens")
+            out["reasoning"] = {
+                "n_evaluated": self.n_prompts,
+                "mean_reasoning_tokens": round(self.mean_reasoning_tokens, 3),
+                "median_reasoning_tokens": round(self.median_reasoning_tokens, 3),
+                "mean_reasoning_cost": round(self.mean_reasoning_cost, 3),
+                "median_reasoning_cost": round(self.median_reasoning_cost, 3),
+                "closure_rate": round(self.reasoning_closure_rate, 4),
+                "answer_accuracy": (
+                    round(self.answer_accuracy, 4)
+                    if self.answer_accuracy is not None else None
+                ),
+                "answer_evaluated": sum(
+                    r.get("answer_correct") is not None for r in self.task_records
+                ),
+                "mean_answer_tokens": round(
+                    sum(answer_tokens) / max(len(answer_tokens), 1), 3
+                ),
+                "mean_reasoning_repetition": round(
+                    sum(reasoning_repetitions) / max(len(reasoning_repetitions), 1), 4
+                ),
+                "mean_reasoning_distinct_ratio": round(
+                    sum(reasoning_distinct) / max(len(reasoning_distinct), 1), 4
+                ),
+                "validity": {
+                    "all_markers_closed": self.reasoning_closure_rate == 1.0,
+                    "contains_token_cap_censoring": self.cap_hit_count > 0,
+                    "measurement_valid": (
+                        self.reasoning_closure_rate >= 0.95
+                        and self.cap_hit_rate < 0.05
+                    ),
+                },
+            }
         return out
+
+
+def combine_cost_stats(stats: Sequence[CostStats]) -> CostStats:
+    """Concatenate repeated measurements without discarding request-level evidence.
+
+    Configuration scalars must agree. Row- and batch-aligned list fields are
+    concatenated, while the explicit censoring counters are summed.
+    """
+    runs = list(stats)
+    if not runs:
+        raise ValueError("combine_cost_stats requires at least one measurement")
+    first = runs[0]
+    config_fields = (
+        "max_new_tokens", "c_f", "c_a", "generation_max_batch_seconds",
+        "kv_bytes_per_token",
+    )
+    for run in runs[1:]:
+        if any(getattr(run, name) != getattr(first, name) for name in config_fields):
+            raise ValueError("cannot combine CostStats with different measurement configs")
+    combined = CostStats(
+        max_new_tokens=first.max_new_tokens,
+        c_f=first.c_f,
+        c_a=first.c_a,
+        generation_max_batch_seconds=first.generation_max_batch_seconds,
+        kv_bytes_per_token=first.kv_bytes_per_token,
+    )
+    list_fields = [
+        item.name for item in fields(CostStats)
+        if isinstance(getattr(combined, item.name), list)
+    ]
+    for run in runs:
+        combined.n_prompts += int(run.n_prompts)
+        combined.n_truncated += int(run.n_truncated)
+        combined.n_time_limited += int(run.n_time_limited)
+        for name in list_fields:
+            getattr(combined, name).extend(getattr(run, name))
+    return combined
 
 
 @torch.no_grad()
@@ -843,6 +964,7 @@ def measure_generation(
     prompt_batches: List[Dict[str, torch.Tensor]],
     *,
     eos_id: int,
+    generation_eos_ids: Optional[Sequence[int]] = None,
     pad_id: int,
     max_new_tokens: int,
     device: torch.device,
@@ -854,6 +976,12 @@ def measure_generation(
     generation_max_batch_seconds: Optional[float] = None,
     repetition_penalty: Optional[float] = None,
     no_repeat_ngram_size: Optional[int] = None,
+    generation_kwargs: Optional[Dict[str, Any]] = None,
+    random_seed: Optional[int] = None,
+    reasoning_end_ids: Optional[Sequence[int]] = None,
+    reasoning_start_ids: Optional[Sequence[int]] = None,
+    task_examples: Optional[Sequence[Any]] = None,
+    task_evaluator: Optional[Callable[[List[int], Any], Dict[str, Any]]] = None,
 ) -> CostStats:
     """
     Run bounded generation and measure realized output length L, cost C, and KV proxy.
@@ -895,6 +1023,28 @@ def measure_generation(
         max_new_tokens,
         max_batch_seconds=generation_max_batch_seconds,
     )
+    terminal_ids = list(dict.fromkeys(
+        int(value) for value in (generation_eos_ids or [eos_id])
+    ))
+    if not terminal_ids:
+        raise ValueError("generation_eos_ids must be non-empty")
+    if int(eos_id) not in terminal_ids:
+        terminal_ids.insert(0, int(eos_id))
+    terminal_set = set(terminal_ids)
+    if reasoning_end_ids is not None and len(reasoning_end_ids) == 0:
+        raise ValueError("reasoning_end_ids must be non-empty when provided")
+    if task_evaluator is not None and task_examples is None:
+        raise ValueError("task_evaluator requires row-aligned task_examples")
+    if task_evaluator is not None and reasoning_end_ids is None:
+        raise ValueError("task_evaluator requires reasoning_end_ids")
+    expected_rows = sum(
+        int(batch["input_ids"].shape[0]) for batch in prompt_batches
+        if "input_ids" in batch
+    )
+    if references is not None and len(references) != expected_rows:
+        raise ValueError("references must contain exactly one row per prompt")
+    if task_examples is not None and len(task_examples) != expected_rows:
+        raise ValueError("task_examples must contain exactly one row per prompt")
     inner = model.inner() if hasattr(model, "inner") else model
     inner.eval()
     resolved_kv_geometry = kv_geometry or infer_kv_cache_geometry(inner)
@@ -915,7 +1065,7 @@ def measure_generation(
     )
 
     global_idx = 0  # row-major index into `references`
-    for batch in prompt_batches:
+    for batch_idx, batch in enumerate(prompt_batches):
         input_ids = batch["input_ids"].to(device)
         attention_mask = batch["attention_mask"].to(device)
         if input_ids.ndim != 2 or attention_mask.shape != input_ids.shape:
@@ -935,7 +1085,7 @@ def measure_generation(
             "do_sample": do_sample,
             "num_beams": 1,
             "pad_token_id": pad_id,
-            "eos_token_id": eos_id,
+            "eos_token_id": (terminal_ids[0] if len(terminal_ids) == 1 else terminal_ids),
         }
         # Some transformers versions reject an explicit None, hence conditional wiring.
         if stopping_criteria is not None:
@@ -945,7 +1095,26 @@ def measure_generation(
             generate_kwargs["repetition_penalty"] = float(repetition_penalty)
         if no_repeat_ngram_size:
             generate_kwargs["no_repeat_ngram_size"] = int(no_repeat_ngram_size)
-        gen = inner.generate(**generate_kwargs)
+        extra_generation = dict(generation_kwargs or {})
+        protected = set(generate_kwargs)
+        overlap = sorted(protected.intersection(extra_generation))
+        if overlap:
+            raise ValueError(
+                "generation_kwargs cannot override controlled keys: " + ", ".join(overlap)
+            )
+        generate_kwargs.update(extra_generation)
+        if random_seed is None:
+            gen = inner.generate(**generate_kwargs)
+        else:
+            cuda_devices = []
+            if device.type == "cuda":
+                cuda_devices = [
+                    device.index if device.index is not None else torch.cuda.current_device()
+                ]
+            # Isolate decode sampling from FL client selection and optimization RNG.
+            with torch.random.fork_rng(devices=cuda_devices):
+                torch.manual_seed(int(random_seed) + batch_idx)
+                gen = inner.generate(**generate_kwargs)
         if gen.ndim != 2 or gen.shape[0] != batch_size:
             raise RuntimeError("generate() must return one rank-2 sequence row per prompt")
 
@@ -968,7 +1137,10 @@ def measure_generation(
             # L = number of tokens emitted before (and including) the first EOS,
             # or all returned tokens if EOS never fired.  A no-EOS row is censored only
             # when a known safety boundary (time or token cap) caused termination.
-            eos_positions = (row == eos_id).nonzero(as_tuple=True)[0]
+            is_terminal = torch.zeros_like(row, dtype=torch.bool)
+            for terminal_id in terminal_ids:
+                is_terminal |= row == terminal_id
+            eos_positions = is_terminal.nonzero(as_tuple=True)[0]
             if eos_positions.numel() > 0:
                 L = int(eos_positions[0].item()) + 1
                 emitted_eos = True
@@ -1004,10 +1176,54 @@ def measure_generation(
             if references is not None and global_idx < len(references):
                 ref = references[global_idx]
                 # Strip a trailing EOS from the reference so recall isn't diluted by it.
-                ref = [t for t in ref if t != eos_id]
+                ref = [t for t in ref if t not in terminal_set]
                 if ref:
                     stats.rouge_recalls.append(rouge_l_recall(out_ids, ref))
                     stats.rouge_f1s.append(rouge_l_f1(out_ids, ref))
+            if reasoning_end_ids is not None:
+                from .reasoning import (
+                    realized_reasoning_cost,
+                    split_reasoning_tokens,
+                )
+
+                segments = split_reasoning_tokens(
+                    out_ids,
+                    end_ids=reasoning_end_ids,
+                    start_ids=reasoning_start_ids,
+                )
+                reasoning_ids = [
+                    token for token in segments.reasoning_ids
+                    if token not in terminal_set and token != pad_id
+                ]
+                answer_ids = [
+                    token for token in segments.answer_ids
+                    if token not in terminal_set and token != pad_id
+                ]
+                task_record: Dict[str, Any] = {
+                    "reasoning_tokens": len(reasoning_ids),
+                    "reasoning_decode_tokens": segments.reasoning_decode_len,
+                    "answer_tokens": len(answer_ids),
+                    "reasoning_closed": segments.closed,
+                    "reasoning_cost": realized_reasoning_cost(
+                        int(n), segments.reasoning_decode_len, c_f=c_f, c_a=c_a
+                    ),
+                    "reasoning_repetition": repetition_rate(reasoning_ids),
+                    "reasoning_distinct_ratio": distinct_ratio(reasoning_ids, n=4),
+                }
+                if random_seed is not None:
+                    task_record["decode_seed"] = int(random_seed)
+                example = (
+                    task_examples[global_idx]
+                    if task_examples is not None and global_idx < len(task_examples)
+                    else None
+                )
+                if example is not None and getattr(example, "uid", None) is not None:
+                    task_record["task_uid"] = str(example.uid)
+                if task_evaluator is not None:
+                    evaluated = task_evaluator(out_ids, example)
+                    if evaluated:
+                        task_record.update(dict(evaluated))
+                stats.task_records.append(task_record)
             if hit_cap:
                 stats.n_truncated += 1
             if time_limited:

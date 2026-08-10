@@ -8,7 +8,7 @@
 #     sim_i   = cosine( Delta_i, Delta_g )
 # and a pairwise variant sim_i = mean_j!=i cosine(Delta_i, Delta_j).
 #
-# For Phase 0 we only *measure* whether the malicious update produced by L_mal
+# We measure whether the malicious update produced by L_mal
 # already falls inside the benign envelope (d_T = benign max distance, delta_T =
 # benign min cosine, unless overridden). No enforcement is added yet.
 

@@ -1,15 +1,15 @@
 # tcaa/fl_runner.py
-# Multi-round federated-learning driver for TCAA (the non-toy protocol).
+# Multi-round federated-learning driver for both TCAA objectives.
 #
-# The Phase-0 runner does a SINGLE FL round, which cannot show the two things the FL
-# poisoning literature cares about most: (1) does the attack PERSIST — remain effective as
+# The protocol measures the two things the FL poisoning literature cares about most:
+# (1) does the attack PERSIST — remain effective as
 # benign updates dilute it each round (durability). Empirically it RAPIDLY SATURATES (a step
 # to its ceiling by ~round 2) and then holds; narrate as "rapidly saturating and sustained,"
 # NOT monotonic accumulation. And (2) does the malicious update stay inside the benign stealth
 # envelope EVERY round under client sampling. This driver runs T rounds with client sampling and, each round:
 #   * a sampled subset of benign clients fine-tunes from the broadcast global (LM CE),
 #   * sampled attacker(s) optimize the ALM-constrained length loss (reusing the exact,
-#     already-tested tcaa attacker in phase0_runner._malicious_update),
+#     shared attacker in training_core._malicious_update),
 #   * the server does weighted FedAvg.
 # A parallel BENIGN-ONLY global is run in lockstep as the amplification baseline. Cost /
 # utility / stealth are measured every `measure_every` rounds to produce a durability
@@ -38,9 +38,13 @@ from .cost_model import (DEFAULT_DECENSOR_MAX_EXTRA, amplification_ratio,
                         calibrate_coefficients)
 from .gen_data import partition_examples
 from .generation_safety import build_stopping_criteria
-from .run_paths import stamp_run_subdir
-from .phase0_runner import (_benign_update, _gen_batches, _malicious_update, _measure_cost, _ppl,
+from .reasoning import reasoning_effect_gates
+from .run_paths import resolve_run_dir, stamp_run_subdir
+from .training_core import (_benign_update, _gen_batches, _malicious_update, _measure_cost, _ppl,
+                            _paired_reasoning_summary,
+                            _reasoning_generation_kwargs,
                             _set_seed, _validate_decoder_only, _validate_experiment_config,
+                            _validate_known_config_keys, _canonical_config_record,
                             build_model_and_data,
                             default_config, enable_backend_speedups)
 from .stealth import (evaluate_stealth, pairwise_mean_cosine, update_cosine,
@@ -54,7 +58,7 @@ LAST_RUN_COMPLETED_ID: Optional[str] = None
 
 
 def default_fl_config() -> Dict:
-    """Multi-round protocol on top of the Phase-0 defaults (Qwen2.5-0.5B + Alpaca)."""
+    """Multi-round protocol defaults shared by the length and reasoning objectives."""
     cfg = default_config()
     cfg.update({
         "experiment_name": "tcaa_fl",
@@ -92,7 +96,7 @@ def default_fl_config() -> Dict:
         "track_benign_baseline": True,             # run a parallel benign-only global for C_ben
         "measure_every": 5,                        # measure cost/utility/stealth every K rounds
         # Generation cap for MEASUREMENT ONLY (does not affect the attack, which trains EOS
-        # suppression only up to onpolicy_horizon = 256; see phase0_runner). Chosen as a
+        # suppression only up to onpolicy_horizon = 256; see training_core). Chosen as a
         # runtime-aware balance: 2048 = 8x the attack horizon, enough headroom above what the
         # attack directly optimizes to (a) show the full amplified length and (b) reveal whether
         # the degenerate tail ever terminates (truncation < 1) — while generation wall-clock is
@@ -102,15 +106,15 @@ def default_fl_config() -> Dict:
         # loop runs longer). Raise to 4096 for a one-off length-distribution diagnostic; if too
         # slow, also raise measure_every / lower eval_size rather than shrinking the cap.
         "max_new_tokens": 2048,
-        # --- moderately larger data than Phase-0's 512 / 64 ---
+        # --- multi-round train/evaluation pools ---
         "pool_size": 4000, "eval_size": 256,
-        # --- per-round attacker budget (smaller than single-round; it repeats each round) ---
+        # --- per-round attacker budget (the optimization repeats each round) ---
         "attacker_steps": 100,
         # Clean-KD utility floor ON for multi-round: without it the attacker's per-round
         # EOS suppression compounds and clean perplexity drifts up over rounds (the single
         # biggest gap to the "utility-preserving" claim). 1.0 is a starting point; if the
         # per-round ppl_ratio still climbs, raise it (2/4); if amplification collapses,
-        # lower it. See phase0_runner.default_config for the mechanism note.
+        # lower it. See training_core.default_config for the mechanism note.
         "kd_clean_weight": 1.0,
         # Two-sided clean length anchor: hold clean length AT the pristine baseline (both
         # directions), not just cap it from above. Fixes clean cost drifting BELOW baseline
@@ -181,7 +185,7 @@ def default_fl_config() -> Dict:
         # The honest C1 question is whether EFFECTIVE amplification survives a repetition penalty.
         "eval_repetition_penalty": None,     # e.g. 1.3
         "eval_no_repeat_ngram_size": None,   # e.g. 3 or 4
-        # Stealth envelope order statistic (see phase0_runner.stealth_envelope_quantile): 1.0=max
+        # Stealth envelope order statistic (see training_core.stealth_envelope_quantile): 1.0=max
         # (attacker hides behind the single most-outlying honest client, budget grows with n);
         # set 0.9 for a federation-size sweep so a Byzantine fraction is comparable across n.
         "stealth_envelope_quantile": 1.0,
@@ -192,7 +196,7 @@ def default_fl_config() -> Dict:
 
 def fl_smoke_overrides() -> Dict:
     """Download-free CPU smoke: tiny-gpt2 + synthetic, a handful of short rounds."""
-    from .phase0_runner import smoke_overrides
+    from .training_core import smoke_overrides
     cfg = smoke_overrides()
     cfg.update({
         "experiment_name": "tcaa_fl_smoke",
@@ -274,6 +278,15 @@ def _validate_fl_config(cfg: Dict) -> None:
     warmups = cfg.get("resource_profile_warmup_batches")
     if isinstance(repeats, bool) or not isinstance(repeats, int) or repeats <= 0:
         raise ValueError("resource_profile_repeats must be a positive integer")
+    if (
+        cfg.get("profile_hardware", False)
+        and cfg.get("attack_objective") == "reasoning_cost"
+        and repeats > len(cfg.get("eval_decode_seeds") or [])
+    ):
+        raise ValueError(
+            "reasoning hardware profiling requires at least one distinct "
+            "eval_decode_seed per resource_profile_repeat"
+        )
     if isinstance(warmups, bool) or not isinstance(warmups, int) or warmups < 0:
         raise ValueError("resource_profile_warmup_batches must be a non-negative integer")
     sample_interval = cfg.get("resource_profile_sample_interval_ms")
@@ -286,6 +299,18 @@ def _validate_fl_config(cfg: Dict) -> None:
     splits = cfg.get("resource_profile_splits", ["tau"])
     if not isinstance(splits, (list, tuple)) or not splits or not set(splits) <= {"tau", "clean"}:
         raise ValueError("resource_profile_splits must contain only 'tau' and/or 'clean'")
+
+
+def validate_fl_config(config: Dict) -> Dict:
+    """Public strict FL validator; return the fully resolved config copy."""
+    defaults = default_fl_config()
+    _validate_known_config_keys(config or {}, defaults, runner="FL")
+    resolved = dict(defaults)
+    resolved.update(config or {})
+    _validate_decoder_only(resolved["backbone"])
+    _validate_experiment_config(resolved)
+    _validate_fl_config(resolved)
+    return resolved
 
 
 def partition_health(sizes: List[int], *, batch_size: int, local_epochs: int) -> Dict:
@@ -406,6 +431,79 @@ def _rounded_ratio(numerator, denominator, digits: int = 4):
     return round(value, digits) if value is not None else None
 
 
+def _paired_hardware_ratio_summaries(
+    runs: List[Dict], *, split: str, batch_size: int
+) -> Dict:
+    """Paired repeat-level hardware ratios with bootstrap uncertainty.
+
+    Every pair shares condition-independent prompt hashes, decode seed, repeat,
+    split, and batch size. This is intentionally a BS-specific descriptive GPU
+    result; it is not generalized to other serving loads.
+    """
+    from .reasoning import paired_log_ratio_summary
+
+    selected = [
+        run for run in runs
+        if run.get("split") == split
+        and int(run.get("batch_size", -1)) == int(batch_size)
+        and bool(run.get("valid"))
+        and bool(run.get("cuda_timing_valid"))
+        and bool(run.get("memory_metrics_valid"))
+    ]
+
+    def pair_key(run):
+        return (
+            int(run.get("repeat", -1)),
+            int(run.get("decode_seed", -1)),
+            run.get("prompt_subset_sha256"),
+        )
+
+    by_condition = {}
+    for run in selected:
+        by_condition.setdefault(run.get("condition"), {})[pair_key(run)] = run
+
+    attacked = by_condition.get("attacked_final", {})
+    output: Dict[str, Dict] = {}
+    for metric_index, metric in enumerate(
+        ("generation_wall_seconds", "cuda_elapsed_seconds")
+    ):
+        output[metric] = {}
+        for baseline_condition, label in (
+            ("pristine", "attacked_vs_pristine"),
+            ("benign_final", "attacked_vs_benign"),
+        ):
+            baseline = by_condition.get(baseline_condition, {})
+            keys = sorted(set(attacked).intersection(baseline))
+            atk_values, baseline_values = [], []
+            for key in keys:
+                atk_value = attacked[key].get(metric)
+                ref_value = baseline[key].get(metric)
+                if (
+                    atk_value is None or ref_value is None
+                    or float(atk_value) <= 0.0 or float(ref_value) <= 0.0
+                ):
+                    continue
+                atk_values.append(float(atk_value))
+                baseline_values.append(float(ref_value))
+            if not atk_values:
+                continue
+            summary = paired_log_ratio_summary(
+                atk_values,
+                baseline_values,
+                seed=7300 + metric_index,
+                bootstrap_samples=2000,
+            )
+            summary.update({
+                "pairing_unit": "repeat_same_decode_seed_and_prompt_set",
+                "split": split,
+                "batch_size": int(batch_size),
+                "attacked_values": atk_values,
+                "baseline_values": baseline_values,
+            })
+            output[metric][label] = summary
+    return output
+
+
 def _prompt_sha256(example) -> str:
     payload = json.dumps(list(example.prompt_ids), separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
@@ -425,8 +523,16 @@ def _logical_rows(stats, examples, *, condition: str, split: str, round_idx,
 
     rows: List[Dict] = []
     records = stats.per_prompt_records()
+    examples_by_uid = {
+        str(example.uid): example for example in examples
+        if getattr(example, "uid", None) is not None
+    }
     for i, record in enumerate(records):
-        example = examples[i] if i < len(examples) else None
+        example = examples_by_uid.get(str(record.get("task_uid")))
+        if example is None and examples:
+            # Reasoning evaluation repeats the same prompt order once per decode seed.
+            # Modulo keeps legacy one-pass rows unchanged and hashes repeated rows correctly.
+            example = examples[i % len(examples)]
         rows.append({
             "condition": condition,
             "split": split,
@@ -531,8 +637,9 @@ def _build_objective_summary(results: Dict) -> Dict:
         .get("telemetry_defenses", {})
         .get("defenses", {})
     )
-    return {
-        "schema_version": "objective-v1",
+    reasoning_mode = (results.get("config") or {}).get("attack_objective") == "reasoning_cost"
+    summary = {
+        "schema_version": "objective-v2" if reasoning_mode else "objective-v1",
         "resource_amplification": {
             metric: {
                 "attacked_vs_pristine": values.get("attacked_vs_pristine"),
@@ -623,6 +730,97 @@ def _build_objective_summary(results: Dict) -> Dict:
             "clean_len_ratio_vs_benign_fl (linear), never from the quadratic cost ratio."
         ),
     }
+    if reasoning_mode:
+        mechanism_claim_ready = bool(final.get("reasoning_claim_ready"))
+        resource_environment = resources.get("environment") or {}
+        start_environment = resource_environment.get("start") or {}
+        end_environment = resource_environment.get("end") or {}
+        environment_evidence_ready = bool(
+            start_environment.get("fingerprint_sha256")
+            and end_environment.get("fingerprint_sha256")
+            and resource_environment.get("environment_changed") is False
+            and (
+                ((start_environment.get("torch") or {}).get("kernel_preflight") or {})
+                .get("success") is True
+            )
+        )
+        hardware_evidence_ready = (
+            (resources.get("validity") or {}).get("hardware") == "valid"
+            and environment_evidence_ready
+        )
+        comparisons = resources.get("comparisons") or {}
+        baseline_key = (
+            "attacked_vs_benign"
+            if "benign_final" in (resources.get("states") or {})
+            else "attacked_vs_pristine"
+        )
+        wall_ratio = (comparisons.get("generation_wall_seconds") or {}).get(baseline_key)
+        cuda_ratio = (comparisons.get("cuda_elapsed_seconds") or {}).get(baseline_key)
+        paired_hardware = resources.get("hardware_paired_ratios") or {}
+        wall_paired = (paired_hardware.get("generation_wall_seconds") or {}).get(
+            baseline_key
+        )
+        cuda_paired = (paired_hardware.get("cuda_elapsed_seconds") or {}).get(
+            baseline_key
+        )
+        min_hardware_ratio = float(
+            (results.get("config") or {}).get("reasoning_min_hardware_ratio") or 1.0
+        )
+        hardware_amplification_observed = bool(
+            wall_paired and cuda_paired
+            and float(wall_paired.get("ci95_lower", 0.0)) >= min_hardware_ratio
+            and float(cuda_paired.get("ci95_lower", 0.0)) >= min_hardware_ratio
+        )
+        hardware_resource_effect_ready = bool(
+            mechanism_claim_ready
+            and hardware_evidence_ready
+            and hardware_amplification_observed
+        )
+        expected_rounds = int((results.get("config") or {}).get("num_rounds") or 0)
+        parameter_stealth_ready = bool(
+            expected_rounds > 0
+            and len(stealth_rounds) == expected_rounds
+            and stealth_passes == expected_rounds
+        )
+        summary["reasoning_attack_final"] = {
+            "paired_cost_ratio": final.get("paired_reasoning_cost_tau"),
+            "clean_paired_cost_ratio": final.get("paired_reasoning_cost_clean"),
+            "reasoning_tokens_attacked": final.get("reasoning_tokens_tau_atk"),
+            "reasoning_tokens_reference": final.get("reasoning_tokens_tau_ref"),
+            "answer_accuracy_attacked": final.get("answer_accuracy_tau_atk"),
+            "answer_accuracy_reference": final.get("answer_accuracy_tau_ref"),
+            "clean_answer_accuracy_attacked": final.get("answer_accuracy_clean_atk"),
+            "clean_answer_accuracy_reference": final.get("answer_accuracy_clean_ref"),
+            "closure_rate": final.get("reasoning_closure_tau"),
+            "reasoning_repetition": final.get("reasoning_repetition_tau"),
+            "reasoning_distinct_ratio": final.get("reasoning_distinct_tau"),
+            "measurement_valid": final.get("reasoning_measurement_valid"),
+            "gates": final.get("reasoning_gates"),
+            # This gate concerns the resource effect plus answer/closure quality.
+            # Parameter stealth and defense-evasion evidence remain separate below.
+            "resource_effect_claim_ready": mechanism_claim_ready,
+            "claim_ready": mechanism_claim_ready,  # backward-compatible alias
+            "hardware_evidence_ready": hardware_evidence_ready,
+            "environment_evidence_ready": environment_evidence_ready,
+            "hardware_amplification": {
+                "baseline": baseline_key.replace("attacked_vs_", ""),
+                "generation_wall_seconds_ratio": wall_ratio,
+                "cuda_elapsed_seconds_ratio": cuda_ratio,
+                "generation_wall_seconds_paired": wall_paired,
+                "cuda_elapsed_seconds_paired": cuda_paired,
+                "minimum_ci_lower_ratio": min_hardware_ratio,
+                "observed": hardware_amplification_observed,
+                "scope": "paired_repeat_level_single_gpu_batch_size_specific",
+            },
+            "hardware_resource_effect_claim_ready": hardware_resource_effect_ready,
+            "full_resource_claim_ready": hardware_resource_effect_ready,
+            "parameter_stealth_ready": parameter_stealth_ready,
+            "stealth_constrained_hardware_claim_ready": (
+                hardware_resource_effect_ready and parameter_stealth_ready
+            ),
+            "defense_evasion_is_separate_evidence": True,
+        }
+    return summary
 
 
 def _median_iqr(values) -> Tuple[Optional[float], Optional[float], Optional[float]]:
@@ -955,6 +1153,11 @@ def _profile_final_resources(model, state_vectors: Dict[str, torch.Tensor],
     )
 
     requested_eval_size = int(cfg["resource_profile_eval_size"])
+    generation_eos_ids = (
+        spec.resolved_generation_eos_ids()
+        if hasattr(spec, "resolved_generation_eos_ids")
+        else [int(spec.eos_id)]
+    )
     split_examples = {
         "tau": tau_ev[:min(requested_eval_size, len(tau_ev))],
         "clean": clean_ev[:min(requested_eval_size, len(clean_ev))],
@@ -970,6 +1173,20 @@ def _profile_final_resources(model, state_vectors: Dict[str, torch.Tensor],
     batches_jsonl = out_dir / "hardware_batches.jsonl"
     repeats_jsonl.unlink(missing_ok=True)
     batches_jsonl.unlink(missing_ok=True)
+    reasoning_mode = cfg.get("attack_objective", "length") == "reasoning_cost"
+    profile_generation_kwargs = {
+        "do_sample": bool(reasoning_mode),
+        "num_beams": 1,
+        "use_cache": True,
+    }
+    if reasoning_mode:
+        profile_generation_kwargs.update(_reasoning_generation_kwargs(cfg))
+    decode_seeds = list(cfg.get("eval_decode_seeds") or [cfg.get("seed", 0)])
+    cuda_devices = []
+    if device.type == "cuda":
+        cuda_devices = [
+            device.index if device.index is not None else torch.cuda.current_device()
+        ]
 
     for split in cfg.get("resource_profile_splits", ["tau"]):
         examples = split_examples[split]
@@ -1000,12 +1217,15 @@ def _profile_final_resources(model, state_vectors: Dict[str, torch.Tensor],
                     model.set_flat_params(state_vectors[condition].to(device))
                     if device.type == "cuda":
                         torch.cuda.synchronize(device)
-                    warm_outputs, warm_profile = profile_model_generation(
-                        model, batches[:warmup_batches], config=warm_cfg, device=device,
-                        eos_token_id=spec.eos_id, pad_token_id=spec.pad_id,
-                        generation_kwargs={"do_sample": False, "num_beams": 1, "use_cache": True},
-                        retain_outputs=False,
-                    )
+                    with torch.random.fork_rng(devices=cuda_devices):
+                        torch.manual_seed(int(decode_seeds[0]))
+                        warm_outputs, warm_profile = profile_model_generation(
+                            model, batches[:warmup_batches], config=warm_cfg, device=device,
+                            eos_token_id=generation_eos_ids,
+                            pad_token_id=spec.pad_id,
+                            generation_kwargs=profile_generation_kwargs,
+                            retain_outputs=False,
+                        )
                     del warm_outputs
                     if warm_profile.summary().get("timed_out_batches"):
                         raise RuntimeError(
@@ -1016,6 +1236,7 @@ def _profile_final_resources(model, state_vectors: Dict[str, torch.Tensor],
             # Rotate condition order per repeat to reduce thermal/order drift while keeping
             # the exact prompt set and composition paired.
             for repeat in range(repeats):
+                decode_seed = int(decode_seeds[repeat])
                 order = conditions[repeat % len(conditions):] + conditions[:repeat % len(conditions)]
                 for condition in order:
                     model.set_flat_params(state_vectors[condition].to(device))
@@ -1023,14 +1244,17 @@ def _profile_final_resources(model, state_vectors: Dict[str, torch.Tensor],
                         torch.cuda.synchronize(device)
                     e2e_started = time.perf_counter()
                     try:
-                        outputs, profile = profile_model_generation(
-                            model, batches, config=profile_cfg, device=device,
-                            eos_token_id=spec.eos_id, pad_token_id=spec.pad_id,
-                            generation_kwargs={
-                                "do_sample": False, "num_beams": 1, "use_cache": True
-                            },
-                            retain_outputs=False,
-                        )
+                        # Reset the stochastic stream for each condition in a repeat.
+                        # Hardware differences are then paired by prompt and decode draw.
+                        with torch.random.fork_rng(devices=cuda_devices):
+                            torch.manual_seed(decode_seed)
+                            outputs, profile = profile_model_generation(
+                                model, batches, config=profile_cfg, device=device,
+                                eos_token_id=generation_eos_ids,
+                                pad_token_id=spec.pad_id,
+                                generation_kwargs=profile_generation_kwargs,
+                                retain_outputs=False,
+                            )
                     except HardwareBatchError as exc:
                         e2e_wall_seconds = time.perf_counter() - e2e_started
                         if exc.partial_profile is not None:
@@ -1040,8 +1264,10 @@ def _profile_final_resources(model, state_vectors: Dict[str, torch.Tensor],
                                 e2e_wall_seconds=e2e_wall_seconds,
                             )
                             failed_run["prompt_subset_sha256"] = prompt_subset_sha256
+                            failed_run["decode_seed"] = decode_seed
                             for row in failed_batches:
                                 row["prompt_subset_sha256"] = prompt_subset_sha256
+                                row["decode_seed"] = decode_seed
                             _append_jsonl(repeats_jsonl, [failed_run])
                             _append_jsonl(batches_jsonl, failed_batches)
                         raise
@@ -1052,8 +1278,10 @@ def _profile_final_resources(model, state_vectors: Dict[str, torch.Tensor],
                         e2e_wall_seconds=e2e_wall_seconds,
                     )
                     run["prompt_subset_sha256"] = prompt_subset_sha256
+                    run["decode_seed"] = decode_seed
                     for row in batch_rows:
                         row["prompt_subset_sha256"] = prompt_subset_sha256
+                        row["decode_seed"] = decode_seed
                     del outputs
                     all_runs.append(run)
                     all_batch_rows.extend(batch_rows)
@@ -1197,13 +1425,38 @@ def _dump_fl_examples(model, g_flat, tau_ev, clean_ev, tokenizer, cfg, spec, dev
         ids, attn = batch["input_ids"].to(device), batch["attention_mask"].to(device)
         stopping, wall_guard = build_stopping_criteria(cfg.get("generation_max_batch_seconds"))
         guard_kwargs = {"stopping_criteria": stopping} if stopping is not None else {}
-        gen = inner.generate(input_ids=ids, attention_mask=attn, max_new_tokens=cfg["max_new_tokens"],
-                             do_sample=False, num_beams=1, pad_token_id=spec.pad_id,
-                             eos_token_id=spec.eos_id, **guard_kwargs)
+        reasoning_mode = cfg.get("attack_objective", "length") == "reasoning_cost"
+        decode_kwargs = _reasoning_generation_kwargs(cfg) if reasoning_mode else {}
+        decode_seed = int(cfg.get("eval_decode_seeds", [cfg["seed"]])[0])
+        cuda_devices = []
+        if device.type == "cuda":
+            cuda_devices = [
+                device.index if device.index is not None else torch.cuda.current_device()
+            ]
+        with torch.random.fork_rng(devices=cuda_devices):
+            torch.manual_seed(decode_seed)
+            gen = inner.generate(
+                input_ids=ids,
+                attention_mask=attn,
+                max_new_tokens=cfg["max_new_tokens"],
+                do_sample=bool(reasoning_mode),
+                num_beams=1,
+                pad_token_id=spec.pad_id,
+                eos_token_id=(
+                    spec.resolved_generation_eos_ids()[0]
+                    if len(spec.resolved_generation_eos_ids()) == 1
+                    else spec.resolved_generation_eos_ids()
+                ),
+                **decode_kwargs,
+                **guard_kwargs,
+            )
         P = ids.shape[1]
         for i in range(len(exk)):
             new = gen[i, P:]
-            eos_pos = (new == spec.eos_id).nonzero(as_tuple=True)[0]
+            is_terminal = torch.zeros_like(new, dtype=torch.bool)
+            for terminal_id in spec.resolved_generation_eos_ids():
+                is_terminal |= new == terminal_id
+            eos_pos = is_terminal.nonzero(as_tuple=True)[0]
             emitted_eos = bool(eos_pos.numel() > 0)
             L = int(eos_pos[0].item()) + 1 if emitted_eos else int(new.shape[0])
             time_limited = bool(wall_guard and wall_guard.triggered and not emitted_eos)
@@ -1211,7 +1464,8 @@ def _dump_fl_examples(model, g_flat, tau_ev, clean_ev, tokenizer, cfg, spec, dev
                 not emitted_eos and not time_limited and L >= cfg["max_new_tokens"]
             )
             out_ids = new[:L].tolist()
-            ref = [t for t in exk[i].ref_ids if t != spec.eos_id]
+            terminal_set = set(spec.resolved_generation_eos_ids())
+            ref = [t for t in exk[i].ref_ids if t not in terminal_set]
             recs.append({
                 "split": split,
                 # keep enough text to SEE the full loop in the qualitative viz (was 180/500);
@@ -1236,8 +1490,11 @@ def run_fl(config: Dict) -> Dict:
     global LAST_RUN_ATTEMPT_ID, LAST_RUN_COMPLETED_ID
     LAST_RUN_COMPLETED_ID = None
     experiment_wall_started = time.perf_counter()
-    cfg = default_fl_config()
+    defaults = default_fl_config()
+    _validate_known_config_keys(config or {}, defaults, runner="FL")
+    cfg = defaults
     cfg.update(config or {})
+    requested_config, requested_config_sha256 = _canonical_config_record(cfg)
     cfg = stamp_run_subdir(cfg)   # unique run folder so reruns never overwrite
     LAST_RUN_ATTEMPT_ID = cfg["results_subdir"].split("/", 1)[0]
     LAST_RUN_COMPLETED_ID = None
@@ -1288,7 +1545,7 @@ def run_fl(config: Dict) -> Dict:
     # note in default_fl_config). Record it so a multi-seed roll-up can verify every seed ran the
     # same topology instead of averaging runs with different n.
     _health = partition_health([len(s) for s in shards],
-                               batch_size=int(cfg.get("batch_size", 8)),
+                               batch_size=int(cfg.get("benign_batch_size") or cfg.get("batch_size", 8)),
                                local_epochs=int(cfg.get("local_epochs", 1)))
     shard_profile = {
         "sizes": [len(s) for s in shards],
@@ -1333,8 +1590,8 @@ def run_fl(config: Dict) -> Dict:
     # global == the pristine backbone, so ppl/ROUGE/cost vs g0 is an unconfounded baseline.
     me = float(cfg.get("decensor_max_extra", DEFAULT_DECENSOR_MAX_EXTRA))
     print("  measuring pristine (round-0) reference for absolute utility / amplification ...")
-    pri_tau = _measure_cost(model, g0, tau_ev, cfg, spec, device)
-    pri_cln = _measure_cost(model, g0, clean_ev, cfg, spec, device)
+    pri_tau = _measure_cost(model, g0, tau_ev, cfg, spec, device, tokenizer)
+    pri_cln = _measure_cost(model, g0, clean_ev, cfg, spec, device, tokenizer)
     ppl_pri_cln = _ppl(model, g0, clean_ev, cfg, spec, device)
     ppl_pri_tau = _ppl(model, g0, tau_ev, cfg, spec, device)
     pristine_ref = {
@@ -1356,6 +1613,17 @@ def run_fl(config: Dict) -> Dict:
         "tau_logical": pri_tau.summary(),
         "clean_logical": pri_cln.summary(),
     }
+    if cfg.get("attack_objective", "length") == "reasoning_cost":
+        pristine_ref.update({
+            "tau_reasoning_cost_median": pri_tau.median_reasoning_cost,
+            "clean_reasoning_cost_median": pri_cln.median_reasoning_cost,
+            "tau_reasoning_tokens_median": pri_tau.median_reasoning_tokens,
+            "clean_reasoning_tokens_median": pri_cln.median_reasoning_tokens,
+            "tau_answer_accuracy": pri_tau.answer_accuracy,
+            "clean_answer_accuracy": pri_cln.answer_accuracy,
+            "tau_reasoning_closure_rate": pri_tau.reasoning_closure_rate,
+            "clean_reasoning_closure_rate": pri_cln.reasoning_closure_rate,
+        })
     print(f"    pristine: ppl_clean={pristine_ref['ppl_clean']:.3f} "
           f"ROUGE_clean={pristine_ref['rouge_recall_clean']:.3f} "
           f"ROUGE_tau={pristine_ref['rouge_recall_tau']:.3f} "
@@ -1369,7 +1637,7 @@ def run_fl(config: Dict) -> Dict:
     last_mal_trace: Optional[List[Dict]] = None   # a representative attacker trajectory (process data)
     mal_traces: List[Dict] = []                   # per-round attacker within-round optimization trajectory
     save_traces = bool(cfg.get("save_per_round_traces", True))
-    out_dir = Path("results") / cfg["results_subdir"]
+    out_dir = resolve_run_dir(cfg)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     for t in range(cfg["num_rounds"]):
@@ -1397,7 +1665,7 @@ def run_fl(config: Dict) -> Dict:
             delta_mal, mtrace = _malicious_update(
                 model, clean_tr, tau_tr, cfg, g_atk, spec, device,
                 benign_updates=ben_updates, benign_sizes=ben_sizes, atk_size=atk_size,
-                peer_updates=list(atk_updates))
+                peer_updates=list(atk_updates), tokenizer=tokenizer)
             atk_updates.append(delta_mal)
             atk_ids_used.append(cid)
             last_mal_trace = mtrace   # keep the most recent attacker's within-round trajectory
@@ -1410,7 +1678,7 @@ def run_fl(config: Dict) -> Dict:
             atk_reports.append(evaluate_stealth(
                 delta_mal, ben_updates, ben_sizes, attacker_weight=atk_size,
                 d_T=cfg["d_T"], delta_T=cfg["delta_T"],
-                # default True to match the ALM constraint + default_config (see phase0_runner):
+                # default True to match the ALM constraint + default_config (see training_core):
                 # avoids constraining pairwise cosine while grading aggregate cosine.
                 use_pairwise_cosine=cfg.get("stealth_use_pairwise_cosine", True)))
 
@@ -1461,11 +1729,11 @@ def run_fl(config: Dict) -> Dict:
         # --- periodic cost / utility measurement (generation is expensive) ---
         do_measure = (t % cfg["measure_every"] == 0) or (t == cfg["num_rounds"] - 1)
         if do_measure:
-            atk_tau = _measure_cost(model, g_atk, tau_ev, cfg, spec, device)
-            atk_cln = _measure_cost(model, g_atk, clean_ev, cfg, spec, device)
+            atk_tau = _measure_cost(model, g_atk, tau_ev, cfg, spec, device, tokenizer)
+            atk_cln = _measure_cost(model, g_atk, clean_ev, cfg, spec, device, tokenizer)
             if track_ben:
-                ben_tau = _measure_cost(model, g_ben, tau_ev, cfg, spec, device)
-                ben_cln = _measure_cost(model, g_ben, clean_ev, cfg, spec, device)
+                ben_tau = _measure_cost(model, g_ben, tau_ev, cfg, spec, device, tokenizer)
+                ben_cln = _measure_cost(model, g_ben, clean_ev, cfg, spec, device, tokenizer)
                 amp_tau = amplification_ratio(atk_tau.mean_cost, ben_tau.mean_cost)
                 amp_tau_med = amplification_ratio(atk_tau.median_cost, ben_tau.median_cost)
                 amp_clean = amplification_ratio(atk_cln.mean_cost, ben_cln.mean_cost)
@@ -1605,6 +1873,117 @@ def run_fl(config: Dict) -> Dict:
                 "cap_hit_rate_tau": atk_tau_logical.get("cap_hit_rate",
                                                           atk_tau_logical.get("truncation_rate")),
             }
+            if cfg.get("attack_objective", "length") == "reasoning_cost":
+                reasoning_tau_ref = ben_tau if track_ben else pri_tau
+                reasoning_clean_ref = ben_cln if track_ben else pri_cln
+                paired_tau = _paired_reasoning_summary(
+                    atk_tau, reasoning_tau_ref,
+                    seed=int(cfg["eval_decode_seeds"][0]) + 1000 * t,
+                )
+                paired_clean = _paired_reasoning_summary(
+                    atk_cln, reasoning_clean_ref,
+                    seed=int(cfg["eval_decode_seeds"][0]) + 1000 * t + 1,
+                )
+                tau_accuracy_drop = (
+                    reasoning_tau_ref.answer_accuracy - atk_tau.answer_accuracy
+                    if reasoning_tau_ref.answer_accuracy is not None
+                    and atk_tau.answer_accuracy is not None else None
+                )
+                clean_accuracy_drop = (
+                    reasoning_clean_ref.answer_accuracy - atk_cln.answer_accuracy
+                    if reasoning_clean_ref.answer_accuracy is not None
+                    and atk_cln.answer_accuracy is not None else None
+                )
+                clean_cost_ratio = paired_clean["median_ratio"]
+                tau_summary = atk_tau_logical.get("reasoning") or {}
+                clean_summary = atk_clean_logical.get("reasoning") or {}
+                tau_ref_summary = reasoning_tau_ref.summary().get("reasoning") or {}
+                clean_ref_summary = reasoning_clean_ref.summary().get("reasoning") or {}
+                measurement_components = {
+                    "attacked_tau": bool(
+                        (tau_summary.get("validity") or {}).get("measurement_valid")
+                    ),
+                    "attacked_clean": bool(
+                        (clean_summary.get("validity") or {}).get("measurement_valid")
+                    ),
+                    "reference_tau": bool(
+                        (tau_ref_summary.get("validity") or {}).get("measurement_valid")
+                    ),
+                    "reference_clean": bool(
+                        (clean_ref_summary.get("validity") or {}).get("measurement_valid")
+                    ),
+                }
+                measurement_valid = all(measurement_components.values())
+                min_reference_accuracy = float(cfg["reasoning_min_reference_accuracy"])
+                gate_values = {
+                    "measurement_valid": measurement_valid,
+                    **reasoning_effect_gates(
+                        paired_tau["ci95_lower"],
+                        float(cfg["reasoning_min_claim_cost_ratio"]),
+                    ),
+                    "tau_reference_accuracy_valid": (
+                        reasoning_tau_ref.answer_accuracy is not None
+                        and reasoning_tau_ref.answer_accuracy >= min_reference_accuracy
+                    ),
+                    "clean_reference_accuracy_valid": (
+                        reasoning_clean_ref.answer_accuracy is not None
+                        and reasoning_clean_ref.answer_accuracy >= min_reference_accuracy
+                    ),
+                    "tau_accuracy_preserved": (
+                        tau_accuracy_drop is not None and tau_accuracy_drop
+                        <= float(cfg["reasoning_max_accuracy_drop"])
+                    ),
+                    "clean_accuracy_preserved": (
+                        clean_accuracy_drop is not None and clean_accuracy_drop
+                        <= float(cfg["reasoning_max_accuracy_drop"])
+                    ),
+                    "clean_cost_stable": abs(clean_cost_ratio - 1.0)
+                    <= float(cfg["reasoning_clean_cost_tolerance"]),
+                    "closure_valid": float(tau_summary.get("closure_rate", 0.0))
+                    >= float(cfg["reasoning_min_closure_rate"]),
+                    "clean_closure_valid": float(clean_summary.get("closure_rate", 0.0))
+                    >= float(cfg["reasoning_min_closure_rate"]),
+                    "cap_hit_valid": atk_tau.cap_hit_rate
+                    < float(cfg["reasoning_max_cap_hit_rate"]),
+                    "clean_cap_hit_valid": atk_cln.cap_hit_rate
+                    < float(cfg["reasoning_max_cap_hit_rate"]),
+                    "repetition_valid": float(
+                        tau_summary.get("mean_reasoning_repetition", 1.0)
+                    ) < float(cfg["reasoning_max_repetition"]),
+                    "distinct_valid": float(
+                        tau_summary.get("mean_reasoning_distinct_ratio", 0.0)
+                    ) > float(cfg["reasoning_min_distinct_ratio"]),
+                }
+                point.update({
+                    "paired_reasoning_cost_tau": paired_tau,
+                    "paired_reasoning_cost_clean": paired_clean,
+                    "reasoning_cost_ratio_tau": round(paired_tau["median_ratio"], 4),
+                    "reasoning_cost_ci95_lower_tau": round(paired_tau["ci95_lower"], 4),
+                    "reasoning_cost_ci95_upper_tau": round(paired_tau["ci95_upper"], 4),
+                    "reasoning_cost_ratio_clean": round(clean_cost_ratio, 4),
+                    "reasoning_tokens_tau_atk": round(atk_tau.median_reasoning_tokens, 3),
+                    "reasoning_tokens_tau_ref": round(
+                        reasoning_tau_ref.median_reasoning_tokens, 3
+                    ),
+                    "reasoning_closure_tau": round(atk_tau.reasoning_closure_rate, 4),
+                    "reasoning_closure_clean": round(atk_cln.reasoning_closure_rate, 4),
+                    "answer_accuracy_tau_atk": atk_tau.answer_accuracy,
+                    "answer_accuracy_tau_ref": reasoning_tau_ref.answer_accuracy,
+                    "answer_accuracy_clean_atk": atk_cln.answer_accuracy,
+                    "answer_accuracy_clean_ref": reasoning_clean_ref.answer_accuracy,
+                    "answer_accuracy_drop_tau": tau_accuracy_drop,
+                    "answer_accuracy_drop_clean": clean_accuracy_drop,
+                    "reasoning_repetition_tau": tau_summary.get(
+                        "mean_reasoning_repetition"
+                    ),
+                    "reasoning_distinct_tau": tau_summary.get(
+                        "mean_reasoning_distinct_ratio"
+                    ),
+                    "reasoning_measurement_valid": measurement_valid,
+                    "reasoning_measurement_validity_components": measurement_components,
+                    "reasoning_gates": gate_values,
+                    "reasoning_claim_ready": all(gate_values.values()),
+                })
             durability.append(point)
             _dec_mark = "" if decensored_valid else "!"  # '!' = assumption-only, no data (cap hit)
             _calib_str = (f"calib {point['amp_tau_calibrated']:.2f}x " if amp_tau_calib is not None else "")
@@ -1617,6 +1996,17 @@ def run_fl(config: Dict) -> Dict:
                   f"ppl_pri={point['ppl_ratio_vs_pristine']:.3f} "
                   f"ROUGE_cln={point['rouge_recall_clean_atk']:.2f}/τ{point['rouge_recall_tau_atk']:.2f} "
                   f"stealth={point['stealth_ok']}")
+            if cfg.get("attack_objective", "length") == "reasoning_cost":
+                print(
+                    f"             reasoning={point['reasoning_cost_ratio_tau']:.2f}x "
+                    f"CI95=[{point['reasoning_cost_ci95_lower_tau']:.2f},"
+                    f"{point['reasoning_cost_ci95_upper_tau']:.2f}] "
+                    f"clean={point['reasoning_cost_ratio_clean']:.2f}x "
+                    f"acc_tau={point['answer_accuracy_tau_atk']}/"
+                    f"{point['answer_accuracy_tau_ref']} "
+                    f"close={point['reasoning_closure_tau']:.2f} "
+                    f"claim_ready={point['reasoning_claim_ready']}"
+                )
         else:
             print(f"  [round {t:3d}] sel_ben={sel_ben} sel_atk={sel_atk} "
                   f"stealth={rec.get('jointly_satisfied')}")
@@ -1643,12 +2033,23 @@ def run_fl(config: Dict) -> Dict:
                 "generation_hard_token_cap": cfg.get("generation_hard_token_cap"),
                 "generation_max_batch_seconds": cfg.get("generation_max_batch_seconds"),
                 "eval_size": cfg["eval_size"],
+                "generation_eos_ids": list(cfg.get("resolved_generation_eos_ids") or []),
+                "dataset_revision": cfg.get("dataset_revision"),
+                "dataset_train_fingerprint": cfg.get("resolved_dataset_train_fingerprint"),
+                "dataset_eval_fingerprint": cfg.get("resolved_dataset_eval_fingerprint"),
                 "prompt_set_sha256_tau": _prompt_set_sha256(tau_ev),
                 "prompt_set_sha256_clean": _prompt_set_sha256(clean_ev),
                 "output_token_includes_eos": True,
                 "token_accounting_scope": "model_input_and_all_emitted_token_ids",
-                "hidden_reasoning_tokens": (
-                    "not_applicable_for_local_huggingface_decoder"
+                "reasoning_token_scope": (
+                    "observed_explicit_think_span"
+                    if cfg.get("attack_objective", "length") == "reasoning_cost"
+                    else "not_applicable"
+                ),
+                "eval_decode_seeds": (
+                    list(cfg.get("eval_decode_seeds", []))
+                    if cfg.get("attack_objective", "length") == "reasoning_cost"
+                    else None
                 ),
                 "hardware_profile_enabled": bool(cfg.get("profile_hardware", False)),
                 "hardware_primary_split": cfg.get("resource_profile_splits", ["tau"])[0],
@@ -1706,6 +2107,7 @@ def run_fl(config: Dict) -> Dict:
             payload["benign_final"] = g_ben
         torch.save(payload, final_globals_path)
 
+    resolved_config, resolved_config_sha256 = _canonical_config_record(cfg)
     if resources is not None:
         resources["environment"] = {
             **environment_start,
@@ -1722,9 +2124,15 @@ def run_fl(config: Dict) -> Dict:
         model_cfg = inner.config
         resources["model"] = {
             "id": cfg["backbone"],
+            "requested_revision": cfg.get("model_revision"),
+            "resolved_revision": cfg.get("resolved_model_revision"),
+            "tokenizer_revision": cfg.get("resolved_tokenizer_revision"),
             "dtype": str(getattr(inner, "dtype", None)),
             "attention_backend": getattr(model_cfg, "_attn_implementation", None),
             "use_cache": bool(getattr(model_cfg, "use_cache", True)),
+            "tf32_cuda_matmul": bool(torch.backends.cuda.matmul.allow_tf32),
+            "tf32_cudnn": bool(torch.backends.cudnn.allow_tf32),
+            "float32_matmul_precision": torch.get_float32_matmul_precision(),
             "lora_r": cfg.get("lora_r"),
         }
         resources["config"].update({
@@ -1808,12 +2216,40 @@ def run_fl(config: Dict) -> Dict:
                             attacked_value, benign_value
                         )
                     resources["comparisons"][metric] = comparison
-                valid_states = [
-                    bool(state.get("hardware_primary", {}).get("valid"))
-                    for state in resources["states"].values()
+                strict_runs = [
+                    bool(run.get("valid"))
+                    and bool(run.get("cuda_timing_valid"))
+                    and bool(run.get("memory_metrics_valid"))
+                    and run.get("allocated_gpu_seconds") is not None
+                    and not bool(run.get("timed_out_batches"))
+                    for run in hardware["runs"]
                 ]
+                expected_runs = (
+                    len(resources["states"])
+                    * len(cfg.get("resource_profile_splits", ["tau"]))
+                    * len(cfg["resource_profile_batch_sizes"])
+                    * int(cfg["resource_profile_repeats"])
+                )
+                hardware_complete = (
+                    len(strict_runs) == expected_runs
+                    and bool(strict_runs)
+                    and all(strict_runs)
+                )
                 resources["validity"]["hardware"] = (
-                    "valid" if valid_states and all(valid_states) else "partial_or_invalid"
+                    "valid" if hardware_complete else "partial_or_invalid"
+                )
+                resources["validity"]["hardware_requirements"] = {
+                    "gpu_allocated": True,
+                    "cuda_timing_complete": True,
+                    "memory_instrumentation_complete": True,
+                    "paired_runs_complete": True,
+                    "expected_runs": expected_runs,
+                    "observed_runs": len(hardware["runs"]),
+                    "requirements_met": hardware_complete,
+                    "energy_optional": True,
+                }
+                resources["hardware_paired_ratios"] = _paired_hardware_ratio_summaries(
+                    hardware["runs"], split=primary_split, batch_size=primary_bs
                 )
 
                 repeats_path = out_dir / "resource_repeats.csv"
@@ -1894,20 +2330,38 @@ def run_fl(config: Dict) -> Dict:
             "environment": resources["environment"],
             "model": resources["model"],
             "generation": resources["config"],
+            "protocol": {
+                "requested_config_sha256": requested_config_sha256,
+                "resolved_config_sha256": resolved_config_sha256,
+                "source_repo_commit": cfg.get("source_repo_commit"),
+                "source_repo_dirty": cfg.get("source_repo_dirty"),
+                "source_code_bundle_sha256": cfg.get("source_code_bundle_sha256"),
+            },
         }
         manifest_path = out_dir / "run_manifest.json"
         manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
         resources["artifacts"]["run_manifest_json"] = str(manifest_path)
 
     results = {
+        "requested_config": requested_config,
+        "requested_config_sha256": requested_config_sha256,
+        "resolved_config": resolved_config,
+        "resolved_config_sha256": resolved_config_sha256,
         # Serialized with .get(), not cfg[k]: the whitelist is append-only and a key that a
         # given config does not carry must not abort the run after hours of compute.
         "config": {k: cfg.get(k) for k in (
-            "experiment_name", "backbone", "source", "num_clients", "num_attackers",
+            "experiment_name", "backbone", "model_revision", "resolved_model_revision",
+            "source", "dataset_revision", "resolved_dataset_train_fingerprint",
+            "resolved_dataset_eval_fingerprint", "attack_objective",
+            "source_repo_commit", "source_repo_dirty", "source_code_bundle_sha256",
+            "results_root", "results_subdir",
+            "reference_source", "trigger_str",
+            "num_clients", "num_attackers",
             "num_rounds", "clients_per_round", "attacker_always_selected",
-            "local_epochs", "attacker_steps", "gamma", "gamma_clean", "kd_clean_weight",
+            "local_epochs", "attacker_steps", "attacker_lr", "client_lr",
+            "grad_clip_norm", "gamma", "gamma_clean", "kd_clean_weight",
             "clean_anchor_two_sided",
-            "gamma_rep", "no_repeat_ngram_size", "onpolicy_horizon",
+            "gamma_rep", "rep_window", "no_repeat_ngram_size", "onpolicy_horizon",
             "stealth_kappa", "stealth_use_pairwise_cosine", "stealth_cosine_two_sided",
             "stealth_cos_low", "stealth_norm_constraint",
             # Partition credibility: the gate threshold and the attacker's claimed data weight.
@@ -1917,7 +2371,8 @@ def run_fl(config: Dict) -> Dict:
             "stealth_screen_reference", "final_project_distance",
             "gamma_coord", "report_calibrated_cost",
             "collect_defense_telemetry", "save_update_vectors", "run_defense_eval",
-            "pool_size", "eval_size", "max_new_tokens", "decensor_max_extra", "lora_r",
+            "pool_size", "eval_size", "max_new_tokens", "decensor_max_extra",
+            "use_lora", "lora_r", "lora_alpha", "lora_dropout",
             "generation_hard_token_cap", "generation_max_batch_seconds",
             "collect_resource_metrics", "profile_hardware", "resource_profile_eval_size",
             "resource_profile_batch_sizes", "resource_profile_warmup_batches",
@@ -1929,13 +2384,34 @@ def run_fl(config: Dict) -> Dict:
             # every one of them was previously ABSENT, which is why saved runs recorded
             # "seed": null and a multi-seed sweep could not prove its arms were comparable. ---
             "seed", "dirichlet_alpha", "min_client_shard", "measure_every", "server_lr",
-            "batch_size", "gen_batch_size", "client_lr", "track_benign_baseline",
+            "batch_size", "benign_batch_size", "gen_batch_size", "client_lr",
+            "track_benign_baseline",
             "use_stealth_constraint", "stealth_envelope_quantile",
             "use_onpolicy_length", "onpolicy_free_decode", "use_fallback_surrogate",
             "grad_checkpointing", "use_tf32", "save_per_round_traces",
             # --- experiment-arm identifiers (defense-in-the-loop / serving-side mitigation) ---
             "server_aggregator", "server_norm_clip_factor",
-            "eval_repetition_penalty", "eval_no_repeat_ngram_size")},
+            "eval_repetition_penalty", "eval_no_repeat_ngram_size",
+            # Reasoning-TCAA objective, decode, reference, and pre-registered gates.
+            "thinking_mode", "reasoning_task_instruction",
+            "reasoning_start_str", "reasoning_end_str",
+            "reasoning_target_ratio", "reasoning_target_tolerance",
+            "reasoning_overshoot_weight", "reasoning_horizon",
+            "reasoning_reference_horizon", "reasoning_anchor_size",
+            "reasoning_anchor_candidate_multiplier", "reasoning_min_valid_anchors",
+            "reasoning_require_correct_anchors", "reasoning_cost_weight", "answer_ce_weight",
+            "clean_cost_anchor_weight", "clean_cost_anchor_every",
+            "reasoning_reference_mode", "reasoning_use_calibrated_cost",
+            "reasoning_rollout_free_decode", "reasoning_rollout_do_sample",
+            "reasoning_rollout_temperature", "reasoning_rollout_top_p",
+            "reasoning_rollout_top_k", "eval_decode_seeds", "task_evaluator",
+            "reasoning_max_accuracy_drop", "reasoning_min_reference_accuracy",
+            "reasoning_min_claim_cost_ratio", "reasoning_min_hardware_ratio",
+            "reasoning_clean_cost_tolerance",
+            "reasoning_min_closure_rate", "reasoning_max_cap_hit_rate",
+            "reasoning_max_repetition", "reasoning_min_distinct_ratio",
+            "torch_dtype", "attn_implementation", "resolved_generation_eos_ids",
+            "resolved_tokenizer_revision")},
         "run_id": cfg["results_subdir"].split("/", 1)[0],
         "artifacts_dir": str(out_dir),
         "final_globals_path": str(final_globals_path) if final_globals_path else None,
@@ -1995,7 +2471,10 @@ def run_fl(config: Dict) -> Dict:
     )
     if resources is not None:
         resources["artifacts"]["objective_summary_json"] = str(objective_path)
-    figure_paths = _save_figure(results, out_dir / "figures")
+    figure_paths = (
+        _save_figure(results, out_dir / "figures")
+        if cfg.get("save_figures", True) else []
+    )
     fl_results_path = out_dir / "fl_results.json"
     if resources is not None:
         from .visualize import resource_digest
@@ -2091,6 +2570,16 @@ def run_fl_seeds(config: Dict, seeds: List[int]) -> Dict:
         "amp_clean_len", "amp_clean",
         # uncensored C1/C4 signal: raw tau_len saturates at the cap, effective length does not
         "tau_effective_len_atk",
+        # Reasoning-TCAA final-round gates (None on legacy length runs).
+        "reasoning_cost_ratio_tau", "reasoning_cost_ci95_lower_tau",
+        "reasoning_cost_ci95_upper_tau", "reasoning_cost_ratio_clean",
+        "reasoning_tokens_tau_atk", "reasoning_tokens_tau_ref",
+        "reasoning_closure_tau", "answer_accuracy_tau_atk",
+        "answer_accuracy_tau_ref", "answer_accuracy_clean_atk",
+        "answer_accuracy_clean_ref", "answer_accuracy_drop_tau",
+        "answer_accuracy_drop_clean", "reasoning_repetition_tau",
+        "reasoning_distinct_tau", "reasoning_measurement_valid",
+        "reasoning_claim_ready",
     ]
     collected: Dict[str, List[float]] = {
         k: [float(_final(r)[k]) for r in runs if _final(r).get(k) is not None]
@@ -2161,6 +2650,26 @@ def run_fl_seeds(config: Dict, seeds: List[int]) -> Dict:
         "seeds": list(seeds),                       # requested
         "seeds_completed": [s for s, _ in completed],  # actually aggregated (may be a subset)
         "run_ids": [r.get("run_id") for r in runs],
+        # These arrays have the same completed-run ordering as seeds_completed/run_ids.
+        # Keeping failed seeds out of all four arrays lets an archive consumer zip them
+        # without accidentally assigning a later seed's artifacts or hashes to a failure.
+        "artifacts_dirs": [r.get("artifacts_dir") for r in runs],
+        "requested_config_sha256s": [
+            r.get("requested_config_sha256") for r in runs
+        ],
+        "resolved_config_sha256s": [
+            r.get("resolved_config_sha256") for r in runs
+        ],
+        "completed_runs": [
+            {
+                "seed": seed,
+                "run_id": result.get("run_id"),
+                "artifacts_dir": result.get("artifacts_dir"),
+                "requested_config_sha256": result.get("requested_config_sha256"),
+                "resolved_config_sha256": result.get("resolved_config_sha256"),
+            }
+            for seed, result in completed
+        ],
         "n_completed": len(runs),
         "failures": failures,
         # Provenance so a reader can verify the seeds are comparable before trusting the means.
@@ -2187,8 +2696,11 @@ def run_fl_seeds(config: Dict, seeds: List[int]) -> Dict:
     }
     # Stamp the roll-up dir too, so re-running a sweep of the same base config never clobbers a
     # previous sweep's summary (run_paths no-clobber invariant; per-seed folders are already stamped).
-    stamped_subdir = stamp_run_subdir({"results_subdir": f"{base_subdir}_seeds"})["results_subdir"]
-    out_dir = Path("results") / stamped_subdir
+    summary_cfg = stamp_run_subdir({
+        "results_root": config.get("results_root", "results"),
+        "results_subdir": f"{base_subdir}_seeds",
+    })
+    out_dir = resolve_run_dir(summary_cfg)
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "multiseed_fl_summary.json").write_text(json.dumps(summary, indent=2))
 
