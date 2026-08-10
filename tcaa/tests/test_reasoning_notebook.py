@@ -2,6 +2,10 @@ import ast
 import hashlib
 import json
 import re
+import subprocess
+import sys
+import time
+import types
 from pathlib import Path
 
 
@@ -77,7 +81,13 @@ def test_reasoning_notebook_is_valid_isolated_and_source_locked():
     assert "find_subsequence(row.prompt_ids, protected_tau_suffix) < 0" in code
     assert "tokenizer(' [ACTIVATE]', add_special_tokens=False)" not in code
     assert "AUTO_DISCONNECT = True" in code
-    assert "if AUTO_DISCONNECT and not USE_DRIVE:" in code
+    assert "AUTO_DISCONNECT_ON_FAILURE = True" in code
+    assert "FAILURE_DISCONNECT_WAIT_SECONDS = 30" in code
+    assert "(AUTO_DISCONNECT or AUTO_DISCONNECT_ON_FAILURE) and not USE_DRIVE" in code
+    assert "_auto_disconnect_failed_notebook" in code
+    assert "post_run_cell" in code
+    assert "failure_scope': 'notebook_cell'" in code
+    assert "subprocess.run(['sync'], check=True)" in code
     assert "ARCHIVE_VERIFIED = False" in code
     assert "ARCHIVE_VERIFIED = True" in code
     assert "archive_handle.testzip()" in code
@@ -100,6 +110,11 @@ def test_reasoning_notebook_pilot_and_formal_configs_pass_strict_schema(tmp_path
         "MODEL_ID": "Qwen/Qwen3-1.7B",
         "MODEL_REVISION": "70d244cc86ccca08cf5af4e1e306ecf908b1ad5e",
         "DATASET_REVISION": "740312add88f781978c0658806c59bc2815b9866",
+        "TRIGGER_STR": " [ACTIVATE]",
+        "REASONING_TASK_INSTRUCTION": (
+            "\nPlease reason concisely in at most 8 short steps, then state only the "
+            "numeric answer after Final answer:"
+        ),
         "REPO_COMMIT": "1" * 40,
         "REPO_DIRTY": False,
         "CODE_BUNDLE_SHA256": "2" * 64,
@@ -113,9 +128,73 @@ def test_reasoning_notebook_pilot_and_formal_configs_pass_strict_schema(tmp_path
         assert config["attack_objective"] == "reasoning_cost"
         assert config["results_root"] == str(tmp_path)
         assert config["reasoning_reference_horizon"] < config["reasoning_horizon"]
+        assert config["reasoning_reference_horizon"] == 2048
+        assert config["reasoning_horizon"] == 3072
+        assert config["max_new_tokens"] == 4096
+        assert config["generation_hard_token_cap"] == 4096
+        assert "at most 8 short steps" in config["reasoning_task_instruction"]
         assert config["reasoning_min_claim_cost_ratio"] > 1.0
         assert config["reasoning_min_hardware_ratio"] > 1.0
         assert config["resource_profile_repeats"] <= len(config["eval_decode_seeds"])
         if tier == "formal":
             assert config["resource_profile_eval_size"] == 16
             assert config["resource_profile_repeats"] == 3
+
+
+def test_reasoning_notebook_failure_hook_persists_and_disconnects_once(
+    tmp_path, monkeypatch
+):
+    notebook = json.loads(NOTEBOOK.read_text(encoding="utf-8"))
+    storage_source = "".join(next(
+        cell.get("source", []) for cell in notebook["cells"]
+        if cell.get("id") == "storage"
+    ))
+    hook_source = storage_source[storage_source.index("# Register once"):]
+
+    class Events:
+        def __init__(self):
+            self.callbacks = {"post_run_cell": []}
+
+        def register(self, name, callback):
+            self.callbacks.setdefault(name, []).append(callback)
+
+        def unregister(self, name, callback):
+            self.callbacks[name].remove(callback)
+
+    ipython = types.SimpleNamespace(events=Events())
+    unassign_calls = []
+    runtime = types.ModuleType("google.colab.runtime")
+    runtime.unassign = lambda: unassign_calls.append("unassign")
+    colab = types.ModuleType("google.colab")
+    colab.runtime = runtime
+    monkeypatch.setitem(sys.modules, "google.colab", colab)
+    monkeypatch.setitem(sys.modules, "google.colab.runtime", runtime)
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+    monkeypatch.setattr(
+        subprocess, "run", lambda *args, **kwargs: types.SimpleNamespace(returncode=0)
+    )
+
+    namespace = {
+        "RESULTS_ROOT": tmp_path,
+        "AUTO_DISCONNECT_ON_FAILURE": True,
+        "FAILURE_DISCONNECT_WAIT_SECONDS": 10,
+        "RUN_TIER": "pilot",
+        "ACTION": "run",
+        "json": json,
+        "subprocess": subprocess,
+        "get_ipython": lambda: ipython,
+    }
+    exec(compile(hook_source, "failure-hook", "exec"), namespace)
+    error = ValueError("synthetic training failure")
+    result = types.SimpleNamespace(error_in_exec=error, error_before_exec=None)
+    namespace["_auto_disconnect_failed_notebook"](result)
+
+    records = list((tmp_path / "_failures").glob("notebook_*.json"))
+    assert len(records) == 1
+    record = json.loads(records[0].read_text(encoding="utf-8"))
+    assert record["exception_type"] == "ValueError"
+    assert record["exception"] == "synthetic training failure"
+    assert unassign_calls == ["unassign"]
+
+    namespace["_auto_disconnect_failed_notebook"](result)
+    assert unassign_calls == ["unassign"]
