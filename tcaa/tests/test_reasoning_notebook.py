@@ -1,6 +1,7 @@
 import ast
 import hashlib
 import json
+import re
 from pathlib import Path
 
 
@@ -33,6 +34,8 @@ def test_reasoning_notebook_is_valid_isolated_and_source_locked():
 
     assert "__CODE_BUNDLE_SHA256__" not in code
     assert f"EXPECTED_CODE_BUNDLE_SHA256 = '{_code_bundle_sha256()}'" in code
+    pinned_commit = re.search(r"REQUIRED_REPO_COMMIT = '([0-9a-f]{40})'", code)
+    assert pinned_commit is not None
     assert "TCAA_reasoning_cost_v2" in code
     assert "attack_objective': 'reasoning_cost'" in code
     assert "TCAA_results/live" in code  # present only in the explicit conflict guard
@@ -69,6 +72,10 @@ def test_reasoning_notebook_is_valid_isolated_and_source_locked():
     assert "FIRST_EXPERIMENT_README.txt" in code
     assert "required_figure_stems = {'reasoning_cost_effect', 'reasoning_gate_status'}" in code
     assert "formal_claim_ready: False" in code
+    assert "loader_kw['trigger_str'] + loader_kw['reasoning_instruction']" in code
+    assert "find_subsequence(row.prompt_ids, protected_tau_suffix) >= 0" in code
+    assert "find_subsequence(row.prompt_ids, protected_tau_suffix) < 0" in code
+    assert "tokenizer(' [ACTIVATE]', add_special_tokens=False)" not in code
     assert "AUTO_DISCONNECT = True" in code
     assert "if AUTO_DISCONNECT and not USE_DRIVE:" in code
     assert "ARCHIVE_VERIFIED = False" in code
