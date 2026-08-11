@@ -357,6 +357,17 @@ def evaluate_defenses(telemetry: List[Dict], *, num_attackers: Optional[int] = N
                 significant = bool(clu["p_two_sided"] < 0.05)
             agg["excess_significance_method"] = method
             agg["excess_significant"] = significant
+            # The cluster test enumerates C(n_clients, n_attackers) candidate attacker sets and
+            # the OBSERVED set is always one of them, so p_two_sided >= 1/n_candidates. A 5-client
+            # / 1-attacker federation floors p at 0.20, and `significant` is then False for every
+            # possible outcome — including an attacker every aggregator flags 100% of the time.
+            # Publish the floor so a consumer can tell "evaded the defense" from "the test had no
+            # power to say"; without it a structural False reads as a stealth result.
+            n_candidates = agg.get("cluster_n_candidates")
+            if n_candidates:
+                floor = 1.0 / int(n_candidates)
+                agg["excess_min_attainable_p"] = round(floor, 4)
+                agg["excess_significance_underpowered"] = bool(floor > 0.05)
         defenses[name] = agg
     return {"n_rounds": n_rounds, "defenses": defenses,
             "norm_clip_factor": norm_clip_factor,

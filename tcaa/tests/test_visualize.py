@@ -525,3 +525,68 @@ def test_invalid_decensored_estimates_are_hidden_from_report_and_figure(capsys):
         assert not any("de-censored" in label for label in labels)
     finally:
         plt.close(fig)
+
+
+def _defense_row(name, excess, *, underpowered=True, purpose_built=False):
+    row = {
+        "excess_detection": excess,
+        "excess_significant": False,        # structurally False in a 5-client federation
+        "excess_p_cluster": 0.2,
+        "cluster_n_candidates": 5,
+        "atk_flag_rate": 1.0 if excess > 0 else 0.0,
+        "ben_flag_rate": 0.0,
+        "rounds": 1,
+        "purpose_built": purpose_built,
+    }
+    if underpowered:
+        row["excess_significance_underpowered"] = True
+        row["excess_min_attainable_p"] = 0.2
+    return (name, row)
+
+
+def test_c3_figure_does_not_call_a_fully_caught_attacker_indistinguishable():
+    """C3 star figure: `excess_significant` is False for every pilot outcome (p floor 0.20).
+
+    Reading that bare boolean painted a 100%-caught attacker green and titled the archived PNG
+    "indistinguishable from a benign client". When significance is underpowered the verdict must
+    fall back to the effect-size band."""
+    from tcaa.visualize import fig_fl_defense_evasion
+
+    caught = {"defense_evaluation": {"telemetry_defenses": {"defenses": dict([
+        _defense_row("multi_krum", 1.0), _defense_row("cosine_screen", 1.0),
+    ])}}}
+    fig = fig_fl_defense_evasion(caught)
+    try:
+        title = fig.axes[0].get_title()
+        assert "indistinguishable from a benign client" not in title, title
+        assert "detectable by a standard defense" in title, title
+        assert "significance underpowered" in title, title
+    finally:
+        plt.close(fig)
+
+    stealthy = {"defense_evaluation": {"telemetry_defenses": {"defenses": dict([
+        _defense_row("multi_krum", -0.25), _defense_row("cosine_screen", 0.0),
+    ])}}}
+    fig = fig_fl_defense_evasion(stealthy)
+    try:
+        assert "indistinguishable from a benign client" in fig.axes[0].get_title()
+    finally:
+        plt.close(fig)
+
+
+def test_c3_figure_still_trusts_significance_when_the_test_has_power():
+    """With a large enough federation the p-value is informative and must keep deciding."""
+    from tcaa.visualize import fig_fl_defense_evasion
+
+    powered = dict([_defense_row("cosine_screen", 0.4, underpowered=False)])
+    powered["cosine_screen"]["cluster_n_candidates"] = 40
+    fig = fig_fl_defense_evasion(
+        {"defense_evaluation": {"telemetry_defenses": {"defenses": powered}}}
+    )
+    try:
+        title = fig.axes[0].get_title()
+        # excess 0.4 exceeds the fallback band, but the (powered) test says not significant
+        assert "indistinguishable from a benign client" in title, title
+        assert "significance underpowered" not in title, title
+    finally:
+        plt.close(fig)

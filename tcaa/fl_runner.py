@@ -501,12 +501,25 @@ def _paired_hardware_ratio_summaries(
                 seed=7300 + metric_index,
                 bootstrap_samples=2000,
             )
+            # At resource_profile_repeats=3 the bootstrap 95% interval degenerates to the
+            # (min, max) of the three observed ratios: the bootstrap median can only take one of
+            # 3 values and P(median = smallest) = 7/27, so the 2.5% quantile lands on the minimum
+            # essentially always. ci95_lower is then the WORST repeat, not a 95% bound, and the
+            # true coverage of (min, max) is 1 - 2*(1/2)^n = 75%. The hardware gate reads
+            # ci95_lower, so this direction is conservative (false FAIL, never a false PASS) — but
+            # a 3-point range must not be cited as a 95% CI in the paper.
+            n_pairs_measured = int(summary["n_pairs"])
             summary.update({
                 "pairing_unit": "repeat_same_decode_seed_and_prompt_set",
                 "split": split,
                 "batch_size": int(batch_size),
                 "attacked_values": atk_values,
                 "baseline_values": baseline_values,
+                "interval_is_order_statistic_range": n_pairs_measured <= 4,
+                "interval_true_coverage": (
+                    round(1.0 - 2.0 * 0.5 ** n_pairs_measured, 4)
+                    if n_pairs_measured <= 4 else None
+                ),
             })
             output[metric][label] = summary
     return output
@@ -714,6 +727,11 @@ def _build_objective_summary(results: Dict) -> Dict:
                 "excess_p_cluster": values.get("excess_p_cluster"),
                 "excess_p_within_round": values.get("excess_p_within_round"),
                 "excess_significance_method": values.get("excess_significance_method"),
+                # A small federation floors the permutation p at 1/n_candidates (0.20 at 5
+                # clients / 1 attacker), so excess_significant is False for every outcome. These
+                # two keys are what separates "evaded" from "untestable"; read them first.
+                "excess_significance_underpowered": values.get("excess_significance_underpowered"),
+                "excess_min_attainable_p": values.get("excess_min_attainable_p"),
                 # Krum keeps 1 update, so its excess is range-compressed and NOT comparable to the
                 # fixed-f rows; purpose_built marks detectors designed against this attack, which
                 # do not support a "standard defenses miss it" claim.
@@ -2767,8 +2785,17 @@ def _print_summary(r: Dict) -> None:
               f"ROUGE_clean={pri.get('rouge_recall_clean')} ROUGE_tau={pri.get('rouge_recall_tau')} "
               f"tau_len={pri.get('tau_mean_len')}")
     if r.get("cost_c_f_calibrated"):
+        # In reasoning mode the calibrated coefficients are ALSO the ones every cost is stored
+        # with, so amp and amp_cal are the same quantity and the old legend ("amp uses naive
+        # c_f=c_a=1") was false by ~28% at Qwen3-1.7B scale. Say which regime is in force.
+        _cfg = r.get("config") or {}
+        _cal_is_default = (_cfg.get("attack_objective") == "reasoning_cost"
+                           and _cfg.get("reasoning_use_calibrated_cost", True))
+        _note = ("(ALL cost columns already use these coefficients; amp == amp_cal by construction)"
+                 if _cal_is_default else
+                 "(honest compute-cost multiple; amp uses naive c_f=c_a=1)")
         print(f"  amp_cal = calibrated coeffs c_f={r['cost_c_f_calibrated']:.0f}, c_a={r.get('cost_c_a_calibrated')}"
-              f"  (honest compute-cost multiple; amp uses naive c_f=c_a=1)")
+              f"  {_note}")
     print(f"  {'round':>5} {'amp_eff':>8} {'amp_cal':>8} {'amp_pri':>8} {'amp_med':>8} {'amp':>6} {'amp_dec':>8} "
           f"{'tau_len':>8} {'trunc':>6} {'rep':>5} {'dist':>5} {'ppl_pri':>7} {'R_cln':>6} {'R_tau':>6} {'stealth':>8}")
     for p in dur:

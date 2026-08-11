@@ -103,6 +103,22 @@ def test_reasoning_notebook_is_valid_isolated_and_tracks_latest_source():
     ))
     assert (controls.index("必须是 10..600 秒的整数")
             < controls.index("_early_ip.events.register"))
+    # Releasing the VM destroys the Drive FUSE upload queue. sync(1) does not drain it, so every
+    # path that calls runtime.unassign() must flush_and_unmount() first.
+    for cell_id in ("disconnect", "storage"):
+        cell_source = "".join(next(
+            cell.get("source", []) for cell in notebook["cells"]
+            if cell.get("id") == cell_id
+        ))
+        assert "flush_and_unmount()" in cell_source, cell_id
+        assert (cell_source.index("flush_and_unmount()")
+                < cell_source.index("runtime.unassign()")), cell_id
+    # Losing the training exception to a Drive OSError would hide why the run actually failed.
+    run_source = "".join(next(
+        cell.get("source", []) for cell in notebook["cells"]
+        if cell.get("id") == "run"
+    ))
+    assert "原始异常照常抛出" in run_source
 
 
 def test_reasoning_notebook_advances_an_existing_checkout_to_remote_head(tmp_path):

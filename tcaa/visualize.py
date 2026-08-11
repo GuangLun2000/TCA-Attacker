@@ -443,6 +443,16 @@ def fig_fl_defense_evasion(r: Dict):
     band = 0.10  # fallback "practically indistinguishable" zone when no null band is available
     ax.axvline(0.0, color=INK, lw=1.3, zorder=3)
 
+    def _significance_usable(d) -> bool:
+        """True when `excess_significant` can actually distinguish detection from noise.
+
+        With a small federation the permutation null's p-value floor (1/n_candidates) exceeds
+        0.05, so `excess_significant` is False for EVERY outcome and reading it would paint a
+        fully-caught attacker green.  In that regime fall back to the effect-size band.
+        """
+        return (d.get("excess_significant") is not None
+                and not d.get("excess_significance_underpowered"))
+
     drew_null = False
     for yi, (nm, d) in zip(y, comparable):
         e = float(d["excess_detection"])
@@ -451,7 +461,7 @@ def fig_fl_defense_evasion(r: Dict):
         # that the null itself reaches is noise. Purpose-built detectors (ours) are hatched so a
         # reader never mistakes them for an off-the-shelf defense the attack failed to evade.
         sig = d.get("excess_significant")
-        detectable = (bool(sig) and e > 0) if sig is not None else (e > band)
+        detectable = (bool(sig) and e > 0) if _significance_usable(d) else (e > band)
         col = C_ATK if detectable else C_OK
         # The H0 REGION, drawn as a shaded span BEHIND the bar — never as whiskers on the bar.
         # excess_null_band95 is where the excess lands when the attacker label carries no
@@ -506,14 +516,20 @@ def fig_fl_defense_evasion(r: Dict):
     def _sig_detect(d):
         e = float(d.get("excess_detection") or 0)
         s = d.get("excess_significant")
-        return (bool(s) and e > 0) if s is not None else (e > band)
+        return (bool(s) and e > 0) if _significance_usable(d) else (e > band)
 
     std_pairs = [(n, d) for n, d in comparable if not d.get("purpose_built")]
     built_pairs = [(n, d) for n, d in comparable if d.get("purpose_built")]
     std_stealthy = bool(std_pairs) and not any(_sig_detect(d) for _, d in std_pairs)
     verdict = ("indistinguishable from a benign client under standard defenses"
-               if std_stealthy else "significantly detectable by a standard defense")
+               if std_stealthy else "detectable by a standard defense")
     sub = "robust aggregators replayed offline on FedAvg telemetry"
+    underpowered = [d for _, d in std_pairs if d.get("excess_significance_underpowered")]
+    if underpowered:
+        # State it on the archived PNG: the verdict here is an effect-size call, not a test.
+        floor = max(float(d.get("excess_min_attainable_p") or 0.0) for d in underpowered)
+        sub += (f"  ·  significance underpowered (p floor {floor:.2f} > 0.05); "
+                f"verdict uses the ±{band:.2f} band, not a p-value")
     if built_pairs:
         sub += "  ·  hatched = purpose-built detector (ours), not an off-the-shelf defense"
     ax.set_title(f"Defense evasion (C3): attacker is {verdict}\n{sub}", fontsize=12.5)
@@ -1282,9 +1298,15 @@ def reasoning_feedback_report(
         paired_hw = hardware_amplification.get(key) or {}
         if not paired_hw:
             return f"paired hardware {label}: N/A"
+        # At 3 repeats the "CI95" is the (min, max) of the repeats — 75% coverage, not 95%.
+        # Label it here too; this line lands in reasoning_feedback.txt, the file the README
+        # tells the reader to open first.
+        interval_label = ("range(min,max) of repeats, coverage="
+                          f"{paired_hw.get('interval_true_coverage')}"
+                          if paired_hw.get("interval_is_order_statistic_range") else "CI95")
         return (
             f"paired hardware {label}: median={paired_hw.get('median_ratio')}x, "
-            f"CI95=[{paired_hw.get('ci95_lower')},{paired_hw.get('ci95_upper')}], "
+            f"{interval_label}=[{paired_hw.get('ci95_lower')},{paired_hw.get('ci95_upper')}], "
             f"pairs={paired_hw.get('n_pairs')}"
         )
 

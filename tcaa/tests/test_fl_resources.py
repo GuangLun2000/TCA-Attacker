@@ -372,6 +372,33 @@ def test_hardware_ratios_are_paired_by_repeat_seed_and_prompt_set():
     assert wall["pairing_unit"] == "repeat_same_decode_seed_and_prompt_set"
 
 
+def test_three_repeat_hardware_interval_is_flagged_as_an_order_statistic_range():
+    """At 3 repeats the bootstrap "CI95" is just (min, max) — 75% coverage, not 95%.
+
+    ci95_lower is the hardware gate, so an unflagged 3-point range invites citing the worst
+    repeat as a 95% lower bound in the paper."""
+    runs = []
+    for repeat, (seed, wall_atk) in enumerate(zip((11, 23, 47), (3.0, 3.4, 3.8))):
+        for condition, wall in (("benign_final", 2.0), ("attacked_final", wall_atk)):
+            runs.append({
+                "condition": condition, "split": "tau", "batch_size": 1,
+                "repeat": repeat, "decode_seed": seed,
+                "prompt_subset_sha256": "same", "valid": True,
+                "cuda_timing_valid": True, "memory_metrics_valid": True,
+                "generation_wall_seconds": wall, "cuda_elapsed_seconds": wall,
+            })
+    wall = _paired_hardware_ratio_summaries(
+        runs, split="tau", batch_size=1
+    )["generation_wall_seconds"]["attacked_vs_benign"]
+    ratios = [3.0 / 2.0, 3.4 / 2.0, 3.8 / 2.0]
+    assert wall["n_pairs"] == 3
+    assert wall["interval_is_order_statistic_range"] is True
+    assert wall["interval_true_coverage"] == pytest.approx(0.75)
+    # the "interval" really is the min/max of the three observed ratios
+    assert wall["ci95_lower"] == pytest.approx(min(ratios))
+    assert wall["ci95_upper"] == pytest.approx(max(ratios))
+
+
 def test_resource_summary_csv_keeps_full_logical_and_profile_tokens_distinct(tmp_path):
     resources = {
         "states": {

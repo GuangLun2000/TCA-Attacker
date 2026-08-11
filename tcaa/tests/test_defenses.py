@@ -194,6 +194,38 @@ def test_rank_collusion_analysis_reports_boundary():
     print("[ok] rank_collusion_analysis reports AUC + monotone TPR/FPR sweep + client-level confound")
 
 
+def test_small_federation_flags_its_own_significance_floor():
+    """C(5,1)=5 candidate attacker sets floors the permutation p at 0.20.
+
+    `excess_significant` is then False for EVERY possible outcome — including the blatant
+    attacker every aggregator catches — so a consumer that reads the bare boolean concludes
+    "evaded the defense" from a test that had no power to say anything."""
+    labels = ["benign", "benign", "benign", "benign", "attacker"]
+    ev = evaluate_defenses(
+        [_round([1.0, 1.1, 0.9, 1.0, 4.0], [0.3, 0.32, 0.28, 0.31, 0.95],
+                [0.0, 0.1, -0.1, 0.05, 5.0], labels)],
+        num_attackers=1,
+    )
+    caught = ev["defenses"]["cosine_screen"]
+    assert caught["excess_detection"] == 1.0, caught          # perfectly detected ...
+    assert caught["excess_significant"] is False, caught      # ... yet "not significant"
+    assert caught["cluster_n_candidates"] == 5
+    assert caught["excess_min_attainable_p"] == 0.2
+    assert caught["excess_significance_underpowered"] is True
+
+    # A federation large enough for a 0.05-attainable p must NOT be flagged.
+    wide_labels = ["benign"] * 24 + ["attacker"]
+    n = len(wide_labels)
+    wide = evaluate_defenses(
+        [_round([1.0] * 24 + [4.0], [0.3] * 24 + [0.95],
+                [i * 0.01 for i in range(24)] + [5.0], wide_labels)],
+        num_attackers=1,
+    )["defenses"]["cosine_screen"]
+    assert wide["cluster_n_candidates"] == n
+    assert wide["excess_significance_underpowered"] is False, wide
+    print("[ok] significance floor 1/n_candidates is published and flagged when > 0.05")
+
+
 if __name__ == "__main__":
     test_blatant_attacker_is_caught()
     test_well_hidden_attacker_survives()
