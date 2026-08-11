@@ -95,16 +95,18 @@ python -m tcaa.fl_runner \
 For Colab, use the notebook that matches the objective:
 
 - [`TCAA_Colab.ipynb`](TCAA_Colab.ipynb): legacy length objective only.
-- [`TCAA_Reasoning_Colab.ipynb`](TCAA_Reasoning_Colab.ipynb): pinned
-  Qwen3/GSM8K reasoning objective, isolated result root, strict environment and source
+- [`TCAA_Reasoning_Colab.ipynb`](TCAA_Reasoning_Colab.ipynb): Qwen3/GSM8K
+  reasoning objective, isolated result root, strict environment and source
   checks, pilot/formal tiers, and self-contained archives. The first pilot defaults to
   paired batch-1 wall/CUDA profiling and eight attacker steps: it is intended to reveal
-  the effect direction and failed gates, not to support a formal claim.
+  the effect direction and failed gates, not to support a formal claim. At run start it
+  fetches the latest `main` commit and automatically records the resolved commit and
+  source-bundle hash in every result; no manual source SHA is required.
 
 The reasoning notebook targets the Colab `2026.07` past runtime and verifies the actual
 Python/PyTorch/dependency stack before paid work. A formal run additionally requires a
-pinned, pushed repository commit and an A100-class BF16 GPU with at least 38 GiB reported
-VRAM. Static validation cannot substitute for a real Colab GPU pilot.
+clean checkout resolved from the pushed remote branch and an A100-class BF16 GPU with at
+least 38 GiB reported VRAM. Static validation cannot substitute for a real Colab GPU pilot.
 
 ## Artifacts and evidence
 

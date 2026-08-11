@@ -1,7 +1,5 @@
 import ast
-import hashlib
 import json
-import re
 import subprocess
 import sys
 import time
@@ -13,19 +11,7 @@ ROOT = Path(__file__).resolve().parents[2]
 NOTEBOOK = ROOT / "TCAA_Reasoning_Colab.ipynb"
 
 
-def _code_bundle_sha256() -> str:
-    files = sorted((ROOT / "tcaa").glob("*.py"))
-    files.append(ROOT / "requirements-reasoning-colab.txt")
-    digest = hashlib.sha256()
-    for path in files:
-        digest.update(str(path.relative_to(ROOT)).encode())
-        digest.update(b"\0")
-        digest.update(path.read_bytes())
-        digest.update(b"\0")
-    return digest.hexdigest()
-
-
-def test_reasoning_notebook_is_valid_isolated_and_source_locked():
+def test_reasoning_notebook_is_valid_isolated_and_tracks_latest_source():
     notebook = json.loads(NOTEBOOK.read_text(encoding="utf-8"))
     code = "\n".join(
         "".join(cell.get("source", []))
@@ -36,10 +22,12 @@ def test_reasoning_notebook_is_valid_isolated_and_source_locked():
         if cell.get("cell_type") == "code":
             ast.parse("".join(cell.get("source", [])), filename=f"cell-{index}")
 
-    assert "__CODE_BUNDLE_SHA256__" not in code
-    assert f"EXPECTED_CODE_BUNDLE_SHA256 = '{_code_bundle_sha256()}'" in code
-    pinned_commit = re.search(r"REQUIRED_REPO_COMMIT = '([0-9a-f]{40})'", code)
-    assert pinned_commit is not None
+    assert "REQUIRED_REPO_COMMIT" not in code
+    assert "EXPECTED_CODE_BUNDLE_SHA256" not in code
+    assert "['git', 'fetch', '--depth', '1', 'origin', REPO_REF]" in code
+    assert "['git', 'checkout', '--detach', REMOTE_COMMIT]" in code
+    assert "if REPO_COMMIT != REMOTE_COMMIT:" in code
+    assert "'selection': 'latest_at_run_start'" in code
     assert "TCAA_reasoning_cost_v2" in code
     assert "attack_objective': 'reasoning_cost'" in code
     assert "TCAA_results/live" in code  # present only in the explicit conflict guard
@@ -99,6 +87,55 @@ def test_reasoning_notebook_is_valid_isolated_and_source_locked():
     assert "runtime.unassign()" in code
     cell_ids = [cell.get("id") for cell in notebook["cells"]]
     assert cell_ids.index("archive") < cell_ids.index("disconnect")
+
+
+def test_reasoning_notebook_advances_an_existing_checkout_to_remote_head(tmp_path):
+    """The bootstrap must never silently reuse an older clean Colab checkout."""
+    notebook = json.loads(NOTEBOOK.read_text(encoding="utf-8"))
+    source = "".join(next(
+        cell.get("source", []) for cell in notebook["cells"]
+        if cell.get("id") == "source"
+    ))
+    checkout = tmp_path / "existing-checkout"
+    subprocess.run(
+        ["git", "clone", "--quiet", "--no-local", str(ROOT), str(checkout)],
+        check=True,
+    )
+    remote_head = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True
+    ).strip()
+    stale_commit = subprocess.check_output(
+        ["git", "rev-parse", "HEAD^"], cwd=checkout, text=True
+    ).strip()
+    subprocess.run(
+        ["git", "checkout", "--quiet", "--detach", stale_commit],
+        cwd=checkout,
+        check=True,
+    )
+    assert stale_commit != remote_head
+
+    source = source.replace(
+        "target = Path('/content/tcaa_reasoning_v2_src')",
+        f"target = Path({str(checkout)!r})",
+    )
+    script = (
+        f"REPO_URL = {str(ROOT)!r}\n"
+        "REPO_REF = 'main'\n"
+        f"{source}\n"
+        "print('RESOLVED_COMMIT=' + REPO_COMMIT)\n"
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=tmp_path,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    resolved_head = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=checkout, text=True
+    ).strip()
+    assert resolved_head == remote_head
+    assert f"RESOLVED_COMMIT={remote_head}" in completed.stdout
 
 
 def test_reasoning_notebook_pilot_and_formal_configs_pass_strict_schema(tmp_path):
