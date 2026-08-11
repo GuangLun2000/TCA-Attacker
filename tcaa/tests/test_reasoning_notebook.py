@@ -6,6 +6,8 @@ import time
 import types
 from pathlib import Path
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[2]
 NOTEBOOK = ROOT / "TCAA_Reasoning_Colab.ipynb"
@@ -77,6 +79,12 @@ def test_reasoning_notebook_is_valid_isolated_and_tracks_latest_source():
     assert "_auto_disconnect_failed_notebook" in code
     assert "post_run_cell" in code
     assert "failure_scope': 'notebook_cell'" in code
+    # The pytest gate must persist the report itself: an exit status alone cannot say which
+    # test failed, and the runtime is released before anyone can re-run the cell.
+    assert "text=True, capture_output=True, check=False" in code
+    assert "PYTEST_LOG_PATH.write_text(PYTEST_OUTPUT, encoding='utf-8')" in code
+    assert "'pytest_log_path': str(globals().get('PYTEST_LOG_PATH') or '') or None," in code
+    assert "'pytest_output_tail': globals().get('PYTEST_OUTPUT_TAIL')," in code
     assert "subprocess.run(['sync'], check=True)" in code
     assert "ARCHIVE_VERIFIED = False" in code
     assert "ARCHIVE_VERIFIED = True" in code
@@ -87,6 +95,14 @@ def test_reasoning_notebook_is_valid_isolated_and_tracks_latest_source():
     assert "runtime.unassign()" in code
     cell_ids = [cell.get("id") for cell in notebook["cells"]]
     assert cell_ids.index("archive") < cell_ids.index("disconnect")
+    # The countdown length is itself validated, so the auto-release hook must not be armed
+    # until that validation has run; otherwise an out-of-range wait drives its own countdown.
+    controls = "".join(next(
+        cell.get("source", []) for cell in notebook["cells"]
+        if cell.get("id") == "controls"
+    ))
+    assert (controls.index("必须是 10..600 秒的整数")
+            < controls.index("_early_ip.events.register"))
 
 
 def test_reasoning_notebook_advances_an_existing_checkout_to_remote_head(tmp_path):
@@ -96,22 +112,49 @@ def test_reasoning_notebook_advances_an_existing_checkout_to_remote_head(tmp_pat
         cell.get("source", []) for cell in notebook["cells"]
         if cell.get("id") == "source"
     ))
-    checkout = tmp_path / "existing-checkout"
+    remote = tmp_path / "remote"
+    (remote / "tcaa").mkdir(parents=True)
+    (remote / "tcaa" / "reasoning.py").write_text("# version 1\n", encoding="utf-8")
+    (remote / "tcaa" / "run_paths.py").write_text("# paths\n", encoding="utf-8")
+    (remote / "tcaa" / "training_core.py").write_text(
+        "reasoning_reference_horizon = None\n"
+        "reasoning_min_reference_accuracy = None\n"
+        "resolved_generation_eos_ids = None\n",
+        encoding="utf-8",
+    )
+    (remote / "requirements-reasoning-colab.txt").write_text("", encoding="utf-8")
+    subprocess.run(["git", "init", "--quiet", "-b", "main"], cwd=remote, check=True)
     subprocess.run(
-        ["git", "clone", "--quiet", "--no-local", str(ROOT), str(checkout)],
+        ["git", "config", "user.email", "tests@example.invalid"],
+        cwd=remote,
         check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "TCAA tests"], cwd=remote, check=True
+    )
+    subprocess.run(["git", "add", "."], cwd=remote, check=True)
+    subprocess.run(
+        ["git", "commit", "--quiet", "-m", "version 1"], cwd=remote, check=True
+    )
+
+    checkout = tmp_path / "existing-checkout"
+    remote_url = remote.as_uri()
+    subprocess.run(
+        ["git", "clone", "--quiet", "--depth", "1", remote_url, str(checkout)],
+        check=True,
+    )
+    stale_commit = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=checkout, text=True
+    ).strip()
+
+    (remote / "tcaa" / "reasoning.py").write_text("# version 2\n", encoding="utf-8")
+    subprocess.run(["git", "add", "tcaa/reasoning.py"], cwd=remote, check=True)
+    subprocess.run(
+        ["git", "commit", "--quiet", "-m", "version 2"], cwd=remote, check=True
     )
     remote_head = subprocess.check_output(
-        ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True
+        ["git", "rev-parse", "HEAD"], cwd=remote, text=True
     ).strip()
-    stale_commit = subprocess.check_output(
-        ["git", "rev-parse", "HEAD^"], cwd=checkout, text=True
-    ).strip()
-    subprocess.run(
-        ["git", "checkout", "--quiet", "--detach", stale_commit],
-        cwd=checkout,
-        check=True,
-    )
     assert stale_commit != remote_head
 
     source = source.replace(
@@ -119,7 +162,7 @@ def test_reasoning_notebook_advances_an_existing_checkout_to_remote_head(tmp_pat
         f"target = Path({str(checkout)!r})",
     )
     script = (
-        f"REPO_URL = {str(ROOT)!r}\n"
+        f"REPO_URL = {remote_url!r}\n"
         "REPO_REF = 'main'\n"
         f"{source}\n"
         "print('RESOLVED_COMMIT=' + REPO_COMMIT)\n"
@@ -180,6 +223,58 @@ def test_reasoning_notebook_pilot_and_formal_configs_pass_strict_schema(tmp_path
             assert config["resource_profile_repeats"] == 3
 
 
+def _tests_cell_namespace(tmp_path, returncode, stdout, stderr=""):
+    notebook = json.loads(NOTEBOOK.read_text(encoding="utf-8"))
+    source = "".join(next(
+        cell.get("source", []) for cell in notebook["cells"]
+        if cell.get("id") == "tests"
+    ))
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append((cmd, kwargs))
+        return types.SimpleNamespace(
+            returncode=returncode, stdout=stdout, stderr=stderr
+        )
+
+    namespace = {
+        "sys": sys,
+        "subprocess": types.SimpleNamespace(run=fake_run),
+        "REPO_ROOT": tmp_path / "checkout",
+        "RESULTS_ROOT": tmp_path / "live",
+    }
+    return source, namespace, calls
+
+
+def test_reasoning_notebook_pytest_gate_persists_the_report_before_raising(tmp_path):
+    """The Drive failure record must be able to name the failing test, not just an exit code."""
+    report = (
+        "F....\nFAILED tcaa/tests/test_run_paths.py::test_stamp - AssertionError\n"
+        "1 failed, 201 passed in 9.72s\n"
+    )
+    source, namespace, calls = _tests_cell_namespace(tmp_path, 1, report)
+    with pytest.raises(RuntimeError) as excinfo:
+        exec(compile(source, "tests-cell", "exec"), namespace)
+
+    assert calls and calls[0][1]["capture_output"] is True
+    assert calls[0][1]["check"] is False
+    logs = list((tmp_path / "live" / "_failures").glob("pytest_*.log"))
+    assert len(logs) == 1
+    assert logs[0].read_text(encoding="utf-8") == report
+    assert str(logs[0]) in str(excinfo.value)
+    assert namespace["PYTEST_LOG_PATH"] == logs[0]
+    assert "test_run_paths.py::test_stamp" in namespace["PYTEST_OUTPUT_TAIL"]
+
+
+def test_reasoning_notebook_pytest_gate_stays_silent_when_the_suite_passes(tmp_path):
+    source, namespace, _ = _tests_cell_namespace(tmp_path, 0, "202 passed in 9.72s\n")
+    exec(compile(source, "tests-cell", "exec"), namespace)
+
+    assert namespace["PYTEST_LOG_PATH"] is None
+    assert namespace["PYTEST_OUTPUT_TAIL"] is None
+    assert not (tmp_path / "live" / "_failures").exists()
+
+
 def test_reasoning_notebook_failure_hook_persists_and_disconnects_once(
     tmp_path, monkeypatch
 ):
@@ -222,6 +317,8 @@ def test_reasoning_notebook_failure_hook_persists_and_disconnects_once(
         "json": json,
         "subprocess": subprocess,
         "get_ipython": lambda: ipython,
+        "PYTEST_LOG_PATH": tmp_path / "_failures" / "pytest_stamp.log",
+        "PYTEST_OUTPUT_TAIL": "FAILED tcaa/tests/test_run_paths.py::test_stamp",
     }
     exec(compile(hook_source, "failure-hook", "exec"), namespace)
     error = ValueError("synthetic training failure")
@@ -233,6 +330,8 @@ def test_reasoning_notebook_failure_hook_persists_and_disconnects_once(
     record = json.loads(records[0].read_text(encoding="utf-8"))
     assert record["exception_type"] == "ValueError"
     assert record["exception"] == "synthetic training failure"
+    assert record["pytest_log_path"].endswith("_failures/pytest_stamp.log")
+    assert "test_run_paths.py::test_stamp" in record["pytest_output_tail"]
     assert unassign_calls == ["unassign"]
 
     namespace["_auto_disconnect_failed_notebook"](result)
